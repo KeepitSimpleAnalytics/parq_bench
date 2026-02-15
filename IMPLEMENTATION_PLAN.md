@@ -134,3 +134,12 @@ Acceptance criteria:
 2. Run Phase 1 acceptance gate on representative large Parquet files (5GB target) and capture results. `COMPLETED` (sample result: first viewport `499ms`, Perspective `754ms`)
 3. Add Rust integration tests for Parquet read path and socket transport chunk delivery. `COMPLETED`
 4. Add benchmark/result export (JSON/CSV) for reproducible transport and viewport timing history. `COMPLETED`
+
+## 11) Phase 2 progress snapshot
+1. Workspace catalog commands (`register/list/remove`) for multi-file aliases. `COMPLETED`
+2. SQL query endpoint (`run_workspace_query`) with schema introspection, row-limit truncation, and telemetry. `COMPLETED`
+3. Workspace Explorer UI (register table aliases, run SQL, render query table). `COMPLETED`
+4. Add Monaco SQL editor with autocomplete from workspace catalog. `COMPLETED`
+5. Add chart configuration flow for query results in Perspective. `COMPLETED`
+6. Add schema diff workflow between workspace aliases. `COMPLETED`
+7. Add workspace SQL export actions (CSV + Parquet). `COMPLETED`

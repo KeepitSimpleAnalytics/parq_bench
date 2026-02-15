@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Editor, { type OnMount } from "@monaco-editor/react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { tableFromIPC } from "apache-arrow";
+import type * as Monaco from "monaco-editor";
 import "./App.css";
 
 const PAGE_SIZE = 256;
@@ -77,6 +79,7 @@ type ParquetRowsTransport = {
 
 type ViewMode = "virtual" | "perspective";
 type PerspectiveStatus = "idle" | "loading" | "ready" | "error";
+type PerspectiveContext = "preview" | "workspace";
 type GatePerspectiveStatus = "ready" | "error" | "timeout";
 
 type AcceptanceGateReport = {
@@ -89,6 +92,52 @@ type AcceptanceGateReport = {
   perspectiveStatus: GatePerspectiveStatus;
   passed: boolean;
   details: string;
+};
+
+type WorkspaceTableInfo = {
+  alias: string;
+  file_path: string;
+  is_glob: boolean;
+  file_size_bytes: number | null;
+};
+
+type WorkspaceSchemaByAlias = Record<string, PreviewColumn[]>;
+
+type WorkspaceQueryResponse = {
+  sql: string;
+  row_limit: number;
+  row_count: number;
+  truncated: boolean;
+  elapsed_ms: number;
+  schema: PreviewColumn[];
+  rows: Array<Array<string | null>>;
+};
+
+type WorkspaceChartPlugin = "Datagrid" | "Y Bar" | "X Bar" | "Line" | "Treemap";
+
+type WorkspaceSchemaDiffColumn = {
+  name: string;
+  left_type: string | null;
+  right_type: string | null;
+  change: "added" | "removed" | "type_changed" | "unchanged";
+};
+
+type WorkspaceSchemaDiffResponse = {
+  left_alias: string;
+  right_alias: string;
+  added_count: number;
+  removed_count: number;
+  type_changed_count: number;
+  unchanged_count: number;
+  columns: WorkspaceSchemaDiffColumn[];
+};
+
+type WorkspaceExportResponse = {
+  sql: string;
+  format: "csv" | "parquet";
+  output_path: string;
+  file_size_bytes: number;
+  elapsed_ms: number;
 };
 
 type ExportPayload = {
@@ -105,6 +154,12 @@ type ExportPayload = {
     perspective_ready_ms: number | null;
     perspective_status: PerspectiveStatus;
     perspective_stage: string;
+  };
+  workspace: {
+    table_count: number;
+    tables: WorkspaceTableInfo[];
+    last_query: WorkspaceQueryResponse | null;
+    last_schema_diff: WorkspaceSchemaDiffResponse | null;
   };
 };
 
@@ -127,11 +182,30 @@ function App() {
   const [perspectiveStatus, setPerspectiveStatus] = useState<PerspectiveStatus>("idle");
   const [perspectiveStage, setPerspectiveStage] = useState("idle");
   const [perspectiveError, setPerspectiveError] = useState<string | null>(null);
+  const [perspectiveContext, setPerspectiveContext] = useState<PerspectiveContext>("preview");
   const [perspectiveLoadedForFile, setPerspectiveLoadedForFile] = useState<string | null>(null);
   const [firstViewportMs, setFirstViewportMs] = useState<number | null>(null);
   const [perspectiveReadyMs, setPerspectiveReadyMs] = useState<number | null>(null);
   const [acceptanceGate, setAcceptanceGate] = useState<AcceptanceGateReport | null>(null);
   const [lastExportPath, setLastExportPath] = useState<string | null>(null);
+  const [workspaceTables, setWorkspaceTables] = useState<WorkspaceTableInfo[]>([]);
+  const [workspaceTableSchemas, setWorkspaceTableSchemas] = useState<WorkspaceSchemaByAlias>({});
+  const [workspaceAliasInput, setWorkspaceAliasInput] = useState("");
+  const [workspacePathInput, setWorkspacePathInput] = useState("");
+  const [workspaceIsGlob, setWorkspaceIsGlob] = useState(false);
+  const [workspaceEditorReady, setWorkspaceEditorReady] = useState(false);
+  const [workspaceSql, setWorkspaceSql] = useState(
+    "SELECT * FROM my_table LIMIT 100",
+  );
+  const [workspaceQueryResult, setWorkspaceQueryResult] = useState<WorkspaceQueryResponse | null>(null);
+  const [workspaceChartPlugin, setWorkspaceChartPlugin] = useState<WorkspaceChartPlugin>("Datagrid");
+  const [workspaceChartX, setWorkspaceChartX] = useState("");
+  const [workspaceChartY, setWorkspaceChartY] = useState("");
+  const [workspaceChartAgg, setWorkspaceChartAgg] = useState("sum");
+  const [workspaceDiffLeftAlias, setWorkspaceDiffLeftAlias] = useState("");
+  const [workspaceDiffRightAlias, setWorkspaceDiffRightAlias] = useState("");
+  const [workspaceSchemaDiff, setWorkspaceSchemaDiff] = useState<WorkspaceSchemaDiffResponse | null>(null);
+  const [workspaceExport, setWorkspaceExport] = useState<WorkspaceExportResponse | null>(null);
   const perspectiveViewerRef = useRef<HTMLElement | null>(null);
   const perspectiveTableRef = useRef<{ delete?: () => Promise<void> | void } | null>(null);
   const memoryGuardRef = useRef(false);
@@ -141,6 +215,9 @@ function App() {
   const perspectiveReadyMsRef = useRef<number | null>(null);
   const perspectiveRuntimeInitRef = useRef<Promise<void> | null>(null);
   const perspectiveCoreRef = useRef<any>(null);
+  const workspaceEditorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
+  const workspaceMonacoRef = useRef<typeof Monaco | null>(null);
+  const workspaceCompletionRef = useRef<Monaco.IDisposable | null>(null);
 
   async function withTimeout<T>(label: string, promise: Promise<T>, ms = 8000): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -177,6 +254,426 @@ function App() {
     return selected;
   }
 
+  async function pickWorkspaceTablePath(): Promise<void> {
+    const selected = await open({
+      title: "Select Workspace Table Source",
+      multiple: false,
+      filters: [{ name: "Parquet", extensions: ["parquet"] }],
+    });
+    if (selected && !Array.isArray(selected)) {
+      setWorkspacePathInput(selected);
+    }
+  }
+
+  async function refreshWorkspaceTables() {
+    const tables = await invoke<WorkspaceTableInfo[]>("list_workspace_tables");
+    setWorkspaceTables(tables);
+    if (tables.length === 0) {
+      setWorkspaceTableSchemas({});
+      return;
+    }
+
+    const schemaResults = await Promise.allSettled(
+      tables.map(async (table) => {
+        const schema = await invoke<PreviewColumn[]>("describe_workspace_table", {
+          alias: table.alias,
+        });
+        return { alias: table.alias, schema };
+      }),
+    );
+
+    const nextSchemas: WorkspaceSchemaByAlias = {};
+    const schemaErrors: string[] = [];
+    schemaResults.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        nextSchemas[result.value.alias] = result.value.schema;
+        return;
+      }
+      schemaErrors.push(`Schema unavailable for ${tables[index]?.alias ?? "unknown"}: ${String(result.reason)}`);
+    });
+
+    setWorkspaceTableSchemas(nextSchemas);
+    if (schemaErrors.length > 0) {
+      setError((previous) => previous ?? schemaErrors.join(" | "));
+    }
+  }
+
+  function readWorkspaceSql(): string {
+    const editor = workspaceEditorRef.current;
+    if (editor) {
+      const text = editor.getValue();
+      if (text !== workspaceSql) {
+        setWorkspaceSql(text);
+      }
+      return text;
+    }
+    return workspaceSql;
+  }
+
+  function replaceWorkspaceSql(nextSql: string): void {
+    setWorkspaceSql(nextSql);
+    const editor = workspaceEditorRef.current;
+    if (editor) {
+      editor.setValue(nextSql);
+    }
+  }
+
+  async function registerWorkspaceTable() {
+    if (!workspaceAliasInput.trim() || !workspacePathInput.trim()) {
+      setError("Workspace alias and file path are required.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    try {
+      await invoke<WorkspaceTableInfo>("register_workspace_table", {
+        alias: workspaceAliasInput.trim(),
+        filePath: workspacePathInput.trim(),
+        isGlob: workspaceIsGlob,
+      });
+      await refreshWorkspaceTables();
+      const alias = workspaceAliasInput.trim();
+      if (!readWorkspaceSql().includes(alias)) {
+        replaceWorkspaceSql(`SELECT * FROM ${alias} LIMIT 100`);
+      }
+      setWorkspaceAliasInput("");
+      setWorkspacePathInput("");
+      setWorkspaceIsGlob(false);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function removeWorkspaceTable(alias: string) {
+    setLoading(true);
+    setError(null);
+    try {
+      await invoke("remove_workspace_table", { alias });
+      await refreshWorkspaceTables();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runWorkspaceSchemaDiff() {
+    if (!workspaceDiffLeftAlias || !workspaceDiffRightAlias) {
+      setError("Select two workspace aliases before running schema diff.");
+      return;
+    }
+    if (workspaceDiffLeftAlias === workspaceDiffRightAlias) {
+      setError("Select two different workspace aliases for schema diff.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<WorkspaceSchemaDiffResponse>("diff_workspace_schema", {
+        leftAlias: workspaceDiffLeftAlias,
+        rightAlias: workspaceDiffRightAlias,
+      });
+      setWorkspaceSchemaDiff(result);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function exportWorkspaceQuery(format: "csv" | "parquet") {
+    const sqlText = readWorkspaceSql();
+    if (!sqlText.trim()) {
+      setError("Workspace SQL query is required before export.");
+      return;
+    }
+
+    const nowIso = new Date().toISOString().replace(/[:.]/g, "-");
+    const selected = await save({
+      title: `Export Workspace Query (${format.toUpperCase()})`,
+      defaultPath: `workspace_query_${nowIso}.${format}`,
+      filters: [
+        {
+          name: format.toUpperCase(),
+          extensions: [format],
+        },
+      ],
+    });
+    if (!selected) {
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<WorkspaceExportResponse>("export_workspace_query", {
+        sql: sqlText,
+        outputPath: selected,
+        format,
+      });
+      setWorkspaceExport(result);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runWorkspaceQuery() {
+    const sqlText = readWorkspaceSql();
+    if (!sqlText.trim()) {
+      setError("Workspace SQL query is required.");
+      return;
+    }
+
+    await refreshRuntimeHealth();
+    if (memoryGuardRef.current) {
+      setError("Memory panic circuit is active; workspace query is blocked.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<WorkspaceQueryResponse>("run_workspace_query", {
+        sql: sqlText,
+        rowLimit: 200,
+      });
+      setWorkspaceQueryResult(result);
+    } catch (err) {
+      const message = String(err);
+      if (message.includes("Referenced column")) {
+        const availableColumns = Array.from(
+          new Set(
+            Object.values(workspaceTableSchemas)
+              .flat()
+              .map((column) => column.name),
+          ),
+        );
+        const sample = availableColumns.slice(0, 18);
+        const hint =
+          sample.length === 0
+            ? ""
+            : ` Available columns: ${sample.join(", ")}${availableColumns.length > sample.length ? ", ..." : ""}`;
+        setError(`${message}${hint}`);
+      } else {
+        setError(message);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function visualizeWorkspaceChart() {
+    if (!workspaceQueryResult || workspaceQueryResult.rows.length === 0) {
+      setError("Run a workspace query with rows before charting.");
+      return;
+    }
+
+    const dataset = workspaceQueryResult.rows.map((row) => {
+      const item: Record<string, string | number | null> = {};
+      workspaceQueryResult.schema.forEach((column, index) => {
+        item[column.name] = coerceWorkspaceCell(row[index] ?? null, column.duckdb_type);
+      });
+      return item;
+    });
+
+    let restoreConfig: Record<string, unknown> = { plugin: workspaceChartPlugin };
+    if (workspaceChartPlugin !== "Datagrid") {
+      if (!workspaceChartX || !workspaceChartY) {
+        setError("Select X and Y columns for chart visualization.");
+        return;
+      }
+      restoreConfig = {
+        plugin: workspaceChartPlugin,
+        group_by: [workspaceChartX],
+        columns: [workspaceChartY],
+        aggregates: {
+          [workspaceChartY]: workspaceChartAgg,
+        },
+      };
+    }
+
+    await loadPerspectiveDataset(dataset, restoreConfig, { context: "workspace" });
+  }
+
+  const onWorkspaceEditorMount: OnMount = (editor, monaco) => {
+    workspaceEditorRef.current = editor;
+    workspaceMonacoRef.current = monaco;
+    const model = editor.getModel();
+    if (model) {
+      monaco.editor.setModelLanguage(model, "sql");
+    }
+    setWorkspaceEditorReady(true);
+  };
+
+  function sqlIdentifierInsertText(identifier: string): string {
+    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
+      return identifier;
+    }
+    return `"${identifier.replace(/"/g, "\"\"")}"`;
+  }
+
+  function isNumericDuckType(duckType: string): boolean {
+    const upper = duckType.toUpperCase();
+    return (
+      upper.includes("INT") ||
+      upper.includes("DECIMAL") ||
+      upper.includes("DOUBLE") ||
+      upper.includes("FLOAT") ||
+      upper.includes("REAL") ||
+      upper.includes("HUGEINT")
+    );
+  }
+
+  function coerceWorkspaceCell(value: string | null, duckType: string): string | number | null {
+    if (value === null) {
+      return null;
+    }
+    if (isNumericDuckType(duckType)) {
+      const numeric = Number(value);
+      return Number.isFinite(numeric) ? numeric : null;
+    }
+    return value;
+  }
+
+  async function ensurePerspectiveRuntime(setStage: (stage: string) => void) {
+    if (!perspectiveRuntimeInitRef.current) {
+      perspectiveRuntimeInitRef.current = (async () => {
+        const perspective = await withTimeout("perspective core import", import("@finos/perspective"));
+        const perspectiveViewer = await withTimeout(
+          "perspective-viewer import",
+          import("@finos/perspective-viewer"),
+        );
+        const perspectiveServerWasmUrl = (
+          await withTimeout(
+            "perspective-server wasm url",
+            import("@finos/perspective/dist/wasm/perspective-server.wasm?url"),
+          )
+        ).default;
+        setStage("core.init_server");
+        await withTimeout(
+          "perspective init_server()",
+          Promise.resolve(perspective.init_server(fetch(perspectiveServerWasmUrl))),
+        );
+        const viewerWasmUrl = (
+          await withTimeout(
+            "perspective-viewer wasm url",
+            import("@finos/perspective-viewer/dist/wasm/perspective-viewer.wasm?url"),
+          )
+        ).default;
+        setStage("viewer.init_client");
+        await withTimeout(
+          "perspective-viewer init_client()",
+          perspectiveViewer.init_client(fetch(viewerWasmUrl)),
+        );
+        setStage("datagrid.import");
+        await withTimeout(
+          "perspective-viewer-datagrid import",
+          import("@finos/perspective-viewer-datagrid"),
+        );
+        setStage("custom-element");
+        await withTimeout(
+          "perspective-viewer define",
+          customElements.whenDefined("perspective-viewer"),
+        );
+        perspectiveCoreRef.current = perspective;
+      })().catch((err) => {
+        perspectiveRuntimeInitRef.current = null;
+        throw err;
+      });
+    }
+    await withTimeout("perspective runtime init", perspectiveRuntimeInitRef.current);
+  }
+
+  async function loadPerspectiveDataset(
+    dataset: Array<Record<string, unknown>>,
+    restoreConfig: Record<string, unknown>,
+    options?: { loadedForFile?: string; trackOpenTiming?: boolean; context?: PerspectiveContext },
+  ) {
+    let stage = "runtime";
+    setPerspectiveStatus("loading");
+    setPerspectiveStage(stage);
+    setPerspectiveError(null);
+
+    try {
+      if (dataset.length === 0) {
+        throw new Error("No rows available to visualize.");
+      }
+      if (options?.context) {
+        setPerspectiveContext(options.context);
+        await waitForNextPaint();
+      }
+
+      await ensurePerspectiveRuntime((next) => {
+        stage = next;
+        setPerspectiveStage(next);
+      });
+
+      const perspective = perspectiveCoreRef.current;
+      if (!perspective) {
+        throw new Error("Perspective runtime is unavailable after initialization.");
+      }
+
+      const viewer = perspectiveViewerRef.current as
+        | (HTMLElement & {
+            load?: (table: unknown) => Promise<void>;
+            restore?: (config: unknown) => Promise<void>;
+          })
+        | null;
+
+      if (!viewer || !viewer.load || !viewer.restore) {
+        throw new Error("Perspective viewer did not initialize.");
+      }
+
+      const previousTable = perspectiveTableRef.current;
+
+      stage = "worker";
+      setPerspectiveStage(stage);
+      const worker: any = await withTimeout("perspective worker()", perspective.worker());
+      stage = "table";
+      setPerspectiveStage(stage);
+      const table = await withTimeout("worker.table()", worker.table(dataset));
+      perspectiveTableRef.current = table as { delete?: () => Promise<void> | void };
+      stage = "viewer.load";
+      setPerspectiveStage(stage);
+      await withTimeout("viewer.load()", viewer.load(table));
+      stage = "viewer.restore";
+      setPerspectiveStage(stage);
+      await withTimeout("viewer.restore()", viewer.restore(restoreConfig));
+      if (previousTable?.delete) {
+        try {
+          await previousTable.delete();
+        } catch (cleanupErr) {
+          const message = String(cleanupErr);
+          if (!message.includes("Cannot delete table with views")) {
+            throw cleanupErr;
+          }
+        }
+      }
+
+      setPerspectiveStatus("ready");
+      setPerspectiveStage("ready");
+      if (options?.loadedForFile) {
+        setPerspectiveLoadedForFile(options.loadedForFile);
+      }
+      if (options?.trackOpenTiming && openStartRef.current !== null) {
+        setPerspectiveReadyMs(performance.now() - openStartRef.current);
+      }
+      setViewMode("perspective");
+    } catch (err) {
+      setPerspectiveStatus("error");
+      setPerspectiveStage("error");
+      setPerspectiveError(`stage=${stage} ${String(err)}`);
+      setError(`Perspective error: stage=${stage} ${String(err)}`);
+      setViewMode("virtual");
+    }
+  }
+
   async function loadPreviewFromPath(filePath: string): Promise<number> {
     openStartRef.current = performance.now();
     setFirstViewportMs(null);
@@ -187,6 +684,7 @@ function App() {
       rowLimit: PAGE_SIZE,
     });
     setPreview(data);
+    setPerspectiveContext("preview");
     setViewMode("virtual");
     setPerspectiveStatus("idle");
     setPerspectiveStage("idle");
@@ -253,6 +751,12 @@ function App() {
         perspective_ready_ms: perspectiveReadyMs,
         perspective_status: perspectiveStatus,
         perspective_stage: perspectiveStage,
+      },
+      workspace: {
+        table_count: workspaceTables.length,
+        tables: workspaceTables,
+        last_query: workspaceQueryResult,
+        last_schema_diff: workspaceSchemaDiff,
       },
     };
   }
@@ -431,6 +935,187 @@ function App() {
   useEffect(() => {
     perspectiveReadyMsRef.current = perspectiveReadyMs;
   }, [perspectiveReadyMs]);
+
+  useEffect(() => {
+    const monaco = workspaceMonacoRef.current;
+    if (!workspaceEditorReady || !monaco) {
+      return;
+    }
+
+    const sqlKeywords = [
+      "SELECT",
+      "FROM",
+      "WHERE",
+      "JOIN",
+      "LEFT JOIN",
+      "RIGHT JOIN",
+      "INNER JOIN",
+      "GROUP BY",
+      "ORDER BY",
+      "LIMIT",
+      "HAVING",
+      "AS",
+      "ON",
+      "UNION ALL",
+      "COUNT",
+      "SUM",
+      "AVG",
+      "MIN",
+      "MAX",
+      "DISTINCT",
+    ];
+    const tableAliases = workspaceTables.map((table) => table.alias);
+    const aliasSchemaMap = new Map<string, { alias: string; schema: PreviewColumn[] }>();
+    const workspaceColumnMap = new Map<string, { aliases: Set<string>; types: Set<string> }>();
+    const qualifiedColumns: Array<{ alias: string; column: PreviewColumn }> = [];
+    Object.entries(workspaceTableSchemas).forEach(([alias, schema]) => {
+      aliasSchemaMap.set(alias.toLowerCase(), { alias, schema });
+      schema.forEach((column) => {
+        qualifiedColumns.push({ alias, column });
+        const existing = workspaceColumnMap.get(column.name) ?? {
+          aliases: new Set<string>(),
+          types: new Set<string>(),
+        };
+        existing.aliases.add(alias);
+        existing.types.add(column.duckdb_type);
+        workspaceColumnMap.set(column.name, existing);
+      });
+    });
+    const queryColumns = (workspaceQueryResult?.schema ?? []).map((column) => column.name);
+
+    const provider = monaco.languages.registerCompletionItemProvider("sql", {
+      triggerCharacters: ["."],
+      provideCompletionItems: (model, position) => {
+        const word = model.getWordUntilPosition(position);
+        const range = {
+          startLineNumber: position.lineNumber,
+          endLineNumber: position.lineNumber,
+          startColumn: word.startColumn,
+          endColumn: word.endColumn,
+        };
+        const linePrefix = model.getLineContent(position.lineNumber).slice(0, position.column - 1);
+        const aliasDotMatch = linePrefix.match(/([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]*)$/);
+
+        if (aliasDotMatch) {
+          const aliasToken = aliasDotMatch[1];
+          const partialColumn = aliasDotMatch[2] ?? "";
+          const aliasEntry = aliasSchemaMap.get(aliasToken.toLowerCase());
+          if (aliasEntry) {
+            const columnRange = {
+              startLineNumber: position.lineNumber,
+              endLineNumber: position.lineNumber,
+              startColumn: position.column - partialColumn.length,
+              endColumn: position.column,
+            };
+            return {
+              suggestions: aliasEntry.schema.map((column) => ({
+                label: column.name,
+                kind: monaco.languages.CompletionItemKind.Field,
+                insertText: sqlIdentifierInsertText(column.name),
+                detail: `${aliasEntry.alias}.${column.name} (${column.duckdb_type})`,
+                range: columnRange,
+              })),
+            };
+          }
+        }
+
+        const keywordSuggestions = sqlKeywords.map((keyword) => ({
+          label: keyword,
+          kind: monaco.languages.CompletionItemKind.Keyword,
+          insertText: keyword,
+          range,
+        }));
+        const tableSuggestions = tableAliases.map((alias) => ({
+          label: alias,
+          kind: monaco.languages.CompletionItemKind.Class,
+          insertText: alias,
+          detail: "Workspace table alias",
+          range,
+        }));
+        const workspaceColumnSuggestions = Array.from(workspaceColumnMap.entries()).map(
+          ([columnName, info]) => ({
+            label: columnName,
+            kind: monaco.languages.CompletionItemKind.Field,
+            insertText: sqlIdentifierInsertText(columnName),
+            detail: `Workspace column (${Array.from(info.aliases).join(", ")})`,
+            documentation: `Types: ${Array.from(info.types).join(" | ")}`,
+            range,
+          }),
+        );
+        const qualifiedColumnSuggestions = qualifiedColumns.map(({ alias, column }) => ({
+          label: `${alias}.${column.name}`,
+          kind: monaco.languages.CompletionItemKind.Field,
+          insertText: `${sqlIdentifierInsertText(alias)}.${sqlIdentifierInsertText(column.name)}`,
+          detail: `Qualified workspace column (${column.duckdb_type})`,
+          range,
+        }));
+        const columnSuggestions = queryColumns.map((column) => ({
+          label: column,
+          kind: monaco.languages.CompletionItemKind.Field,
+          insertText: sqlIdentifierInsertText(column),
+          detail: "Column from last query result",
+          range,
+        }));
+
+        return {
+          suggestions: [
+            ...keywordSuggestions,
+            ...tableSuggestions,
+            ...workspaceColumnSuggestions,
+            ...qualifiedColumnSuggestions,
+            ...columnSuggestions,
+          ],
+        };
+      },
+    });
+
+    workspaceCompletionRef.current = provider;
+    return () => {
+      provider.dispose();
+      if (workspaceCompletionRef.current === provider) {
+        workspaceCompletionRef.current = null;
+      }
+    };
+  }, [workspaceEditorReady, workspaceQueryResult, workspaceTableSchemas, workspaceTables]);
+
+  useEffect(() => {
+    const columns = workspaceQueryResult?.schema ?? [];
+    const numericColumns = columns.filter((column) => isNumericDuckType(column.duckdb_type));
+
+    if (columns.length === 0) {
+      setWorkspaceChartX("");
+      setWorkspaceChartY("");
+      return;
+    }
+
+    const firstColumn = columns[0]?.name ?? "";
+    const firstNumeric = numericColumns[0]?.name ?? firstColumn;
+
+    setWorkspaceChartX((prev) =>
+      prev && columns.some((column) => column.name === prev) ? prev : firstColumn,
+    );
+    setWorkspaceChartY((prev) =>
+      prev && columns.some((column) => column.name === prev) ? prev : firstNumeric,
+    );
+  }, [workspaceQueryResult]);
+
+  useEffect(() => {
+    if (workspaceTables.length < 2) {
+      setWorkspaceDiffLeftAlias(workspaceTables[0]?.alias ?? "");
+      setWorkspaceDiffRightAlias("");
+      setWorkspaceSchemaDiff(null);
+      return;
+    }
+
+    const aliases = workspaceTables.map((table) => table.alias);
+    const defaultLeft = aliases[0] ?? "";
+    const defaultRight = aliases[1] ?? aliases[0] ?? "";
+
+    setWorkspaceDiffLeftAlias((prev) => (aliases.includes(prev) ? prev : defaultLeft));
+    setWorkspaceDiffRightAlias((prev) =>
+      aliases.includes(prev) && prev !== (workspaceDiffLeftAlias || defaultLeft) ? prev : defaultRight,
+    );
+  }, [workspaceTables, workspaceDiffLeftAlias]);
 
   async function runSmokeQuery() {
     const response = await invoke<SmokeQueryResponse>("duckdb_smoke_query");
@@ -695,6 +1380,10 @@ function App() {
   const canExportResults = true;
   const memoryGuardActive = runtimeHealth?.memory_guard_tripped ?? false;
   const memoryUsagePct = runtimeHealth ? runtimeHealth.usage_ratio * 100 : null;
+  const workspaceColumns = workspaceQueryResult?.schema ?? [];
+  const workspaceNumericColumns = workspaceColumns.filter((column) =>
+    isNumericDuckType(column.duckdb_type),
+  );
   const gridContentWidth = preview ? preview.schema.length * COLUMN_WIDTH : 0;
   const columnGridTemplate = preview ? `repeat(${preview.schema.length}, ${COLUMN_WIDTH}px)` : "";
   const visibleStart = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
@@ -749,124 +1438,20 @@ function App() {
       return;
     }
 
-    const initPerspective = async () => {
-      let stage = "imports";
-      setPerspectiveStatus("loading");
-      setPerspectiveStage(stage);
-      setPerspectiveError(null);
+    const dataset = rowIndexes.map((rowIndex) => {
+      const row = loadedRows.get(rowIndex) ?? [];
+      const item: Record<string, string | null> = {};
+      preview.schema.forEach((col, colIndex) => {
+        item[col.name] = row[colIndex] ?? null;
+      });
+      return item;
+    });
 
-      try {
-        if (!perspectiveRuntimeInitRef.current) {
-          perspectiveRuntimeInitRef.current = (async () => {
-            const perspective = await withTimeout("perspective core import", import("@finos/perspective"));
-            const perspectiveViewer = await withTimeout(
-              "perspective-viewer import",
-              import("@finos/perspective-viewer"),
-            );
-            const perspectiveServerWasmUrl = (
-              await withTimeout(
-                "perspective-server wasm url",
-                import("@finos/perspective/dist/wasm/perspective-server.wasm?url"),
-              )
-            ).default;
-            stage = "core.init_server";
-            setPerspectiveStage(stage);
-            await withTimeout(
-              "perspective init_server()",
-              Promise.resolve(perspective.init_server(fetch(perspectiveServerWasmUrl))),
-            );
-            const viewerWasmUrl = (
-              await withTimeout(
-                "perspective-viewer wasm url",
-                import("@finos/perspective-viewer/dist/wasm/perspective-viewer.wasm?url"),
-              )
-            ).default;
-            stage = "viewer.init_client";
-            setPerspectiveStage(stage);
-            await withTimeout(
-              "perspective-viewer init_client()",
-              perspectiveViewer.init_client(fetch(viewerWasmUrl)),
-            );
-            stage = "datagrid.import";
-            setPerspectiveStage(stage);
-            await withTimeout(
-              "perspective-viewer-datagrid import",
-              import("@finos/perspective-viewer-datagrid"),
-            );
-            stage = "custom-element";
-            setPerspectiveStage(stage);
-            await withTimeout(
-              "perspective-viewer define",
-              customElements.whenDefined("perspective-viewer"),
-            );
-            perspectiveCoreRef.current = perspective;
-          })().catch((err) => {
-            perspectiveRuntimeInitRef.current = null;
-            throw err;
-          });
-        }
-
-        await withTimeout("perspective runtime init", perspectiveRuntimeInitRef.current);
-        const perspective = perspectiveCoreRef.current;
-        if (!perspective) {
-          throw new Error("Perspective runtime is unavailable after initialization.");
-        }
-
-        const viewer = perspectiveViewerRef.current as
-          | (HTMLElement & {
-              load?: (table: unknown) => Promise<void>;
-              restore?: (config: unknown) => Promise<void>;
-            })
-          | null;
-
-        if (!viewer || !viewer.load || !viewer.restore) {
-          throw new Error("Perspective viewer did not initialize.");
-        }
-
-        if (perspectiveTableRef.current?.delete) {
-          await perspectiveTableRef.current.delete();
-          perspectiveTableRef.current = null;
-        }
-
-        const dataset = rowIndexes.map((rowIndex) => {
-          const row = loadedRows.get(rowIndex) ?? [];
-          const item: Record<string, string | null> = {};
-          preview.schema.forEach((col, colIndex) => {
-            item[col.name] = row[colIndex] ?? null;
-          });
-          return item;
-        });
-
-        stage = "worker";
-        setPerspectiveStage(stage);
-        const worker: any = await withTimeout("perspective worker()", perspective.worker());
-        stage = "table";
-        setPerspectiveStage(stage);
-        const table = await withTimeout("worker.table()", worker.table(dataset));
-        perspectiveTableRef.current = table as { delete?: () => Promise<void> | void };
-        stage = "viewer.load";
-        setPerspectiveStage(stage);
-        await withTimeout("viewer.load()", viewer.load(table));
-        stage = "viewer.restore";
-        setPerspectiveStage(stage);
-        await withTimeout("viewer.restore()", viewer.restore({ plugin: "Datagrid" }));
-
-        setPerspectiveStatus("ready");
-        setPerspectiveStage("ready");
-        setPerspectiveLoadedForFile(preview.file_path);
-        if (openStartRef.current !== null) {
-          setPerspectiveReadyMs(performance.now() - openStartRef.current);
-        }
-        setViewMode("perspective");
-      } catch (err) {
-        setPerspectiveStatus("error");
-        setPerspectiveStage("error");
-        setPerspectiveError(`stage=${stage} ${String(err)}`);
-        setViewMode("virtual");
-      }
-    };
-
-    void initPerspective();
+    void loadPerspectiveDataset(dataset, { plugin: "Datagrid" }, {
+      loadedForFile: preview.file_path,
+      trackOpenTiming: true,
+      context: "preview",
+    });
   }, [loadedRows, perspectiveLoadedForFile, perspectiveStatus, preview]);
 
   useEffect(() => {
@@ -876,6 +1461,7 @@ function App() {
       try {
         await runSmokeQuery();
         await runArrowIpcSmoke();
+        await refreshWorkspaceTables();
       } catch (err) {
         setError(String(err));
       } finally {
@@ -1096,14 +1682,325 @@ function App() {
                 </div>
               </>
             ) : null}
+            {perspectiveContext === "preview" ? (
+              <div
+                className={viewMode === "perspective" ? "perspective-wrap" : "perspective-wrap hidden"}
+                style={{ height: `${viewportHeight}px` }}
+              >
+                <perspective-viewer ref={perspectiveViewerRef} className="perspective-viewer" />
+              </div>
+            ) : null}
+          </>
+        ) : null}
+
+        <section className="workspace-panel">
+          <h3>Workspace Explorer</h3>
+          <div className="workspace-register-row">
+            <input
+              type="text"
+              placeholder="alias (e.g. my_table)"
+              value={workspaceAliasInput}
+              onChange={(event) => setWorkspaceAliasInput(event.currentTarget.value)}
+            />
+            <input
+              type="text"
+              className="workspace-path-input"
+              placeholder="parquet file path or glob"
+              value={workspacePathInput}
+              onChange={(event) => setWorkspacePathInput(event.currentTarget.value)}
+            />
+            <label className="workspace-checkbox">
+              <input
+                type="checkbox"
+                checked={workspaceIsGlob}
+                onChange={(event) => setWorkspaceIsGlob(event.currentTarget.checked)}
+              />
+              glob
+            </label>
+            <button type="button" onClick={() => void pickWorkspaceTablePath()} disabled={loading}>
+              Browse
+            </button>
+            <button type="button" onClick={() => void registerWorkspaceTable()} disabled={loading}>
+              Register
+            </button>
+          </div>
+
+          <div className="workspace-list">
+            <strong>Tables:</strong>{" "}
+            {workspaceTables.length === 0
+              ? "none"
+              : workspaceTables.map((table) => (
+                  <span key={`workspace-${table.alias}`} className="workspace-table-pill">
+                    {table.alias}
+                    <button
+                      type="button"
+                      className="workspace-pill-remove"
+                      onClick={() => void removeWorkspaceTable(table.alias)}
+                      disabled={loading}
+                    >
+                      x
+                    </button>
+                  </span>
+                ))}
+          </div>
+          {workspaceTables.length > 0 ? (
+            <div className="workspace-schema-summary">
+              {workspaceTables.map((table) => {
+                const schema = workspaceTableSchemas[table.alias] ?? [];
+                const columnsPreview = schema
+                  .slice(0, 6)
+                  .map((column) => column.name)
+                  .join(", ");
+                const suffix = schema.length > 6 ? ", ..." : "";
+                return (
+                  <span
+                    key={`workspace-schema-${table.alias}`}
+                    className="workspace-schema-pill"
+                    title={
+                      schema.length === 0
+                        ? `${table.alias}: schema unavailable`
+                        : `${table.alias}: ${schema.map((column) => `${column.name} (${column.duckdb_type})`).join(", ")}`
+                    }
+                  >
+                    <strong>{table.alias}</strong>:{" "}
+                    {schema.length === 0 ? "schema unavailable" : `${columnsPreview}${suffix}`}
+                  </span>
+                );
+              })}
+            </div>
+          ) : null}
+
+          <div className="workspace-diff-row">
+            <label>
+              Diff Left
+              <select
+                value={workspaceDiffLeftAlias}
+                onChange={(event) => setWorkspaceDiffLeftAlias(event.currentTarget.value)}
+              >
+                <option value="">Select table</option>
+                {workspaceTables.map((table) => (
+                  <option key={`diff-left-${table.alias}`} value={table.alias}>
+                    {table.alias}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Diff Right
+              <select
+                value={workspaceDiffRightAlias}
+                onChange={(event) => setWorkspaceDiffRightAlias(event.currentTarget.value)}
+              >
+                <option value="">Select table</option>
+                {workspaceTables.map((table) => (
+                  <option key={`diff-right-${table.alias}`} value={table.alias}>
+                    {table.alias}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => void runWorkspaceSchemaDiff()}
+              disabled={loading || workspaceTables.length < 2}
+            >
+              Run Schema Diff
+            </button>
+          </div>
+
+          {workspaceSchemaDiff ? (
+            <>
+              <p className="meta-line">
+                <span>
+                  <strong>Added:</strong> {workspaceSchemaDiff.added_count}
+                </span>
+                <span>
+                  <strong>Removed:</strong> {workspaceSchemaDiff.removed_count}
+                </span>
+                <span>
+                  <strong>Type Changed:</strong> {workspaceSchemaDiff.type_changed_count}
+                </span>
+                <span>
+                  <strong>Unchanged:</strong> {workspaceSchemaDiff.unchanged_count}
+                </span>
+              </p>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Column</th>
+                      <th>{workspaceSchemaDiff.left_alias}</th>
+                      <th>{workspaceSchemaDiff.right_alias}</th>
+                      <th>Change</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {workspaceSchemaDiff.columns.map((column) => (
+                      <tr key={`schema-diff-${column.name}`}>
+                        <td>{column.name}</td>
+                        <td>{column.left_type ?? "-"}</td>
+                        <td>{column.right_type ?? "-"}</td>
+                        <td>{column.change}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : null}
+
+          <div className="workspace-sql-row">
+            <div className="workspace-editor">
+              <Editor
+                height="180px"
+                defaultLanguage="sql"
+                defaultValue={workspaceSql}
+                onMount={onWorkspaceEditorMount}
+                onChange={(value) => setWorkspaceSql(value ?? "")}
+                options={{
+                  automaticLayout: true,
+                  minimap: { enabled: false },
+                  wordWrap: "on",
+                  fontSize: 13,
+                  scrollBeyondLastLine: false,
+                  lineNumbers: "on",
+                }}
+              />
+            </div>
+            <button type="button" onClick={() => void runWorkspaceQuery()} disabled={loading}>
+              Run SQL
+            </button>
+            <div className="workspace-export-row">
+              <button type="button" onClick={() => void exportWorkspaceQuery("csv")} disabled={loading}>
+                Export Query CSV
+              </button>
+              <button type="button" onClick={() => void exportWorkspaceQuery("parquet")} disabled={loading}>
+                Export Query Parquet
+              </button>
+            </div>
+          </div>
+
+          {workspaceExport ? (
+            <p className="meta-line">
+              <span>
+                <strong>Last Export:</strong> {workspaceExport.format.toUpperCase()}
+              </span>
+              <span className="path-text" title={workspaceExport.output_path}>
+                <strong>Path:</strong> {workspaceExport.output_path}
+              </span>
+              <span>
+                <strong>Size:</strong> {(workspaceExport.file_size_bytes / 1024).toFixed(1)} KB
+              </span>
+              <span>
+                <strong>Elapsed:</strong> {workspaceExport.elapsed_ms.toFixed(0)}ms
+              </span>
+            </p>
+          ) : null}
+
+          <div className="workspace-chart-row">
+            <label>
+              Plugin
+              <select
+                value={workspaceChartPlugin}
+                onChange={(event) => setWorkspaceChartPlugin(event.currentTarget.value as WorkspaceChartPlugin)}
+              >
+                <option value="Datagrid">Datagrid</option>
+                <option value="Y Bar">Y Bar</option>
+                <option value="X Bar">X Bar</option>
+                <option value="Line">Line</option>
+                <option value="Treemap">Treemap</option>
+              </select>
+            </label>
+            <label>
+              X
+              <select value={workspaceChartX} onChange={(event) => setWorkspaceChartX(event.currentTarget.value)}>
+                {workspaceColumns.map((column) => (
+                  <option key={`chart-x-${column.name}`} value={column.name}>
+                    {column.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Y
+              <select value={workspaceChartY} onChange={(event) => setWorkspaceChartY(event.currentTarget.value)}>
+                {workspaceColumns.map((column) => (
+                  <option key={`chart-y-${column.name}`} value={column.name}>
+                    {column.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Agg
+              <select value={workspaceChartAgg} onChange={(event) => setWorkspaceChartAgg(event.currentTarget.value)}>
+                <option value="sum">sum</option>
+                <option value="avg">avg</option>
+                <option value="count">count</option>
+                <option value="min">min</option>
+                <option value="max">max</option>
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => void visualizeWorkspaceChart()}
+              disabled={loading || workspaceQueryResult === null}
+            >
+              Chart In Perspective
+            </button>
+            {workspaceNumericColumns.length === 0 && workspaceQueryResult ? (
+              <span className="phase">No numeric columns detected; use Datagrid.</span>
+            ) : null}
+          </div>
+
+          {perspectiveContext === "workspace" ? (
             <div
               className={viewMode === "perspective" ? "perspective-wrap" : "perspective-wrap hidden"}
-              style={{ height: `${viewportHeight}px` }}
+              style={{ height: `${Math.max(360, Math.floor(viewportHeight * 0.8))}px`, marginBottom: "8px" }}
             >
               <perspective-viewer ref={perspectiveViewerRef} className="perspective-viewer" />
             </div>
-          </>
-        ) : null}
+          ) : null}
+
+          {workspaceQueryResult ? (
+            <>
+              <p className="meta-line">
+                <span>
+                  <strong>Rows:</strong> {workspaceQueryResult.row_count}
+                  {workspaceQueryResult.truncated ? ` (truncated to ${workspaceQueryResult.row_limit})` : ""}
+                </span>
+                <span>
+                  <strong>Elapsed:</strong> {workspaceQueryResult.elapsed_ms.toFixed(0)}ms
+                </span>
+                <span>
+                  <strong>Columns:</strong> {workspaceQueryResult.schema.length}
+                </span>
+              </p>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      {workspaceQueryResult.schema.map((col) => (
+                        <th key={`workspace-col-${col.name}`} title={col.duckdb_type}>
+                          {col.name}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {workspaceQueryResult.rows.map((row, rowIndex) => (
+                      <tr key={`workspace-row-${rowIndex}`}>
+                        {row.map((value, colIndex) => (
+                          <td key={`workspace-cell-${rowIndex}-${colIndex}`}>{value ?? "NULL"}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : null}
+        </section>
 
         <details className="diagnostics">
           <summary>Diagnostics</summary>

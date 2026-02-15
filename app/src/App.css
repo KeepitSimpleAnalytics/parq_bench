@@ -248,3 +248,156 @@ td {
   text-align: left;
   padding: 8px;
 }
+
+.workspace-panel {
+  margin-top: 12px;
+  border: 1px solid #d8e0d8;
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.workspace-panel h3 {
+  margin: 0 0 8px;
+}
+
+.workspace-register-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.workspace-register-row input[type="text"] {
+  border: 1px solid #cbd5cb;
+  border-radius: 6px;
+  padding: 6px 8px;
+  min-width: 180px;
+}
+
+.workspace-path-input {
+  flex: 1 1 320px;
+}
+
+.workspace-checkbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.84rem;
+}
+
+.workspace-list {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 0.88rem;
+}
+
+.workspace-schema-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+
+.workspace-schema-pill {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  border: 1px solid #d6ded6;
+  background: #f5f8f5;
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 0.8rem;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.workspace-diff-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.workspace-diff-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.82rem;
+  color: #314031;
+}
+
+.workspace-diff-row select {
+  border: 1px solid #cbd5cb;
+  border-radius: 6px;
+  padding: 6px 8px;
+  min-width: 140px;
+  font-size: 0.84rem;
+}
+
+.workspace-table-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid #cfd9cf;
+  background: #f8fbf8;
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.workspace-pill-remove {
+  border: none;
+  background: transparent;
+  color: #8d2d2d;
+  padding: 0 2px;
+  line-height: 1;
+}
+
+.workspace-sql-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.workspace-editor {
+  border: 1px solid #cbd5cb;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.workspace-export-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.workspace-chart-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.workspace-chart-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.82rem;
+  color: #314031;
+}
+
+.workspace-chart-row select {
+  border: 1px solid #cbd5cb;
+  border-radius: 6px;
+  padding: 6px 8px;
+  min-width: 120px;
+  font-size: 0.84rem;
+}

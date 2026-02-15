@@ -4,10 +4,11 @@ use arrow_schema::{DataType, Field, Schema};
 use duckdb::Connection;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::System;
@@ -68,6 +69,60 @@ struct ParquetRowsTransportResponse {
     socket_url: Option<String>,
 }
 
+#[derive(Clone)]
+struct WorkspaceTableRegistration {
+    alias: String,
+    file_path: String,
+    is_glob: bool,
+}
+
+#[derive(Serialize)]
+struct WorkspaceTableInfo {
+    alias: String,
+    file_path: String,
+    is_glob: bool,
+    file_size_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceQueryResponse {
+    sql: String,
+    row_limit: u32,
+    row_count: usize,
+    truncated: bool,
+    elapsed_ms: u128,
+    schema: Vec<ParquetSchemaColumn>,
+    rows: Vec<Vec<Option<String>>>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceExportResponse {
+    sql: String,
+    format: String,
+    output_path: String,
+    file_size_bytes: u64,
+    elapsed_ms: u128,
+}
+
+#[derive(Serialize)]
+struct WorkspaceSchemaDiffColumn {
+    name: String,
+    left_type: Option<String>,
+    right_type: Option<String>,
+    change: String,
+}
+
+#[derive(Serialize)]
+struct WorkspaceSchemaDiffResponse {
+    left_alias: String,
+    right_alias: String,
+    added_count: usize,
+    removed_count: usize,
+    type_changed_count: usize,
+    unchanged_count: usize,
+    columns: Vec<WorkspaceSchemaDiffColumn>,
+}
+
 const INLINE_IPC_MAX_BYTES: usize = 1_000_000;
 const PANIC_RSS_RATIO: f64 = 0.85;
 const DUCKDB_MEMORY_CAP_BYTES: u64 = 24 * 1024 * 1024 * 1024;
@@ -77,6 +132,7 @@ struct AppRuntimeState {
     memory_guard_tripped: AtomicBool,
     process_rss_bytes: AtomicU64,
     total_memory_bytes: AtomicU64,
+    workspace_tables: Mutex<Vec<WorkspaceTableRegistration>>,
 }
 
 impl AppRuntimeState {
@@ -85,6 +141,7 @@ impl AppRuntimeState {
             memory_guard_tripped: AtomicBool::new(false),
             process_rss_bytes: AtomicU64::new(0),
             total_memory_bytes: AtomicU64::new(0),
+            workspace_tables: Mutex::new(Vec::new()),
         }
     }
 }
@@ -232,6 +289,219 @@ fn parquet_rows_page(
     preview_iter
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("collect preview rows: {e}"))
+}
+
+fn normalize_single_sql_statement(sql: &str) -> Result<String, String> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err("SQL query is required.".to_string());
+    }
+
+    let normalized = trimmed.trim_end_matches(';').trim().to_string();
+    if normalized.is_empty() {
+        return Err("SQL query is required.".to_string());
+    }
+    if normalized.contains(';') {
+        return Err("Only a single SQL statement is supported.".to_string());
+    }
+    Ok(normalized)
+}
+
+fn is_valid_workspace_alias(alias: &str) -> bool {
+    let mut chars = alias.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn workspace_table_info(entry: &WorkspaceTableRegistration) -> WorkspaceTableInfo {
+    let file_size_bytes = if entry.is_glob {
+        None
+    } else {
+        fs::metadata(&entry.file_path).ok().map(|meta| meta.len())
+    };
+    WorkspaceTableInfo {
+        alias: entry.alias.clone(),
+        file_path: entry.file_path.clone(),
+        is_glob: entry.is_glob,
+        file_size_bytes,
+    }
+}
+
+fn apply_workspace_tables(
+    conn: &Connection,
+    tables: &[WorkspaceTableRegistration],
+) -> Result<(), String> {
+    for table in tables {
+        let ident = escape_sql_ident(&table.alias);
+        let path = escape_sql_string_literal(&table.file_path);
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE VIEW \"{ident}\" AS SELECT * FROM read_parquet('{path}');"
+        ))
+        .map_err(|e| format!("register workspace table '{}': {e}", table.alias))?;
+    }
+    Ok(())
+}
+
+fn query_schema(conn: &Connection, sql: &str) -> Result<Vec<ParquetSchemaColumn>, String> {
+    let describe_sql = format!("DESCRIBE SELECT * FROM ({sql}) AS _q");
+    let mut schema_stmt = conn
+        .prepare(&describe_sql)
+        .map_err(|e| format!("prepare workspace schema query: {e}"))?;
+    let schema_iter = schema_stmt
+        .query_map([], |row| {
+            Ok(ParquetSchemaColumn {
+                name: row.get(0)?,
+                duckdb_type: row.get(1)?,
+            })
+        })
+        .map_err(|e| format!("run workspace schema query: {e}"))?;
+    schema_iter
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("collect workspace schema rows: {e}"))
+}
+
+fn query_rows_with_limit(
+    conn: &Connection,
+    sql: &str,
+    schema: &[ParquetSchemaColumn],
+    row_limit: u32,
+) -> Result<(Vec<Vec<Option<String>>>, bool), String> {
+    let projection = schema
+        .iter()
+        .map(|col| {
+            let ident = escape_sql_ident(&col.name);
+            format!("CAST(\"{ident}\" AS VARCHAR) AS \"{ident}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let safe_limit = row_limit.max(1) as usize;
+    let fetch_limit = safe_limit.saturating_add(1);
+    let query_sql = format!("SELECT {projection} FROM ({sql}) AS _q LIMIT {fetch_limit}");
+    let mut stmt = conn
+        .prepare(&query_sql)
+        .map_err(|e| format!("prepare workspace query rows: {e}"))?;
+    let col_count = schema.len();
+    let row_iter = stmt
+        .query_map([], |row| {
+            let mut values = Vec::with_capacity(col_count);
+            for idx in 0..col_count {
+                let value: Option<String> = row.get(idx)?;
+                values.push(value);
+            }
+            Ok(values)
+        })
+        .map_err(|e| format!("run workspace query rows: {e}"))?;
+    let mut rows = row_iter
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("collect workspace query rows: {e}"))?;
+    let truncated = rows.len() > safe_limit;
+    if truncated {
+        rows.truncate(safe_limit);
+    }
+    Ok((rows, truncated))
+}
+
+fn export_workspace_query_to_file(
+    conn: &Connection,
+    sql: &str,
+    output_path: &str,
+    format: &str,
+) -> Result<(), String> {
+    let normalized_format = format.trim().to_ascii_lowercase();
+    if normalized_format != "csv" && normalized_format != "parquet" {
+        return Err("Unsupported export format. Use 'csv' or 'parquet'.".to_string());
+    }
+    let escaped_path = escape_sql_string_literal(output_path);
+    let copy_sql = if normalized_format == "csv" {
+        format!("COPY (SELECT * FROM ({sql}) AS _q) TO '{escaped_path}' (FORMAT CSV, HEADER TRUE);")
+    } else {
+        format!("COPY (SELECT * FROM ({sql}) AS _q) TO '{escaped_path}' (FORMAT PARQUET);")
+    };
+    conn.execute_batch(&copy_sql)
+        .map_err(|e| format!("export workspace query: {e}"))?;
+    Ok(())
+}
+
+fn table_schema_for_alias(conn: &Connection, alias: &str) -> Result<Vec<ParquetSchemaColumn>, String> {
+    let ident = escape_sql_ident(alias);
+    query_schema(conn, &format!("SELECT * FROM \"{ident}\""))
+}
+
+fn build_workspace_schema_diff(
+    left_alias: &str,
+    left_schema: &[ParquetSchemaColumn],
+    right_alias: &str,
+    right_schema: &[ParquetSchemaColumn],
+) -> WorkspaceSchemaDiffResponse {
+    let left_map: BTreeMap<String, String> = left_schema
+        .iter()
+        .map(|column| (column.name.clone(), column.duckdb_type.clone()))
+        .collect();
+    let right_map: BTreeMap<String, String> = right_schema
+        .iter()
+        .map(|column| (column.name.clone(), column.duckdb_type.clone()))
+        .collect();
+
+    let names = left_map
+        .keys()
+        .chain(right_map.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut added_count = 0_usize;
+    let mut removed_count = 0_usize;
+    let mut type_changed_count = 0_usize;
+    let mut unchanged_count = 0_usize;
+
+    let columns = names
+        .into_iter()
+        .map(|name| {
+            let left_type = left_map.get(&name).cloned();
+            let right_type = right_map.get(&name).cloned();
+            let change = match (&left_type, &right_type) {
+                (None, Some(_)) => {
+                    added_count += 1;
+                    "added"
+                }
+                (Some(_), None) => {
+                    removed_count += 1;
+                    "removed"
+                }
+                (Some(l), Some(r)) if l != r => {
+                    type_changed_count += 1;
+                    "type_changed"
+                }
+                _ => {
+                    unchanged_count += 1;
+                    "unchanged"
+                }
+            }
+            .to_string();
+
+            WorkspaceSchemaDiffColumn {
+                name,
+                left_type,
+                right_type,
+                change,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    WorkspaceSchemaDiffResponse {
+        left_alias: left_alias.to_string(),
+        right_alias: right_alias.to_string(),
+        added_count,
+        removed_count,
+        type_changed_count,
+        unchanged_count,
+        columns,
+    }
 }
 
 fn rows_to_arrow_ipc(
@@ -697,12 +967,283 @@ fn write_text_report(path: String, contents: String) -> Result<(), String> {
     fs::write(&path, contents).map_err(|e| format!("write report file: {e}"))
 }
 
+#[tauri::command]
+fn register_workspace_table(
+    alias: String,
+    file_path: String,
+    is_glob: Option<bool>,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<WorkspaceTableInfo, String> {
+    ensure_memory_guard_clear(state.as_ref())?;
+
+    let trimmed_alias = alias.trim();
+    if !is_valid_workspace_alias(trimmed_alias) {
+        return Err(
+            "Alias must start with a letter/underscore and only contain letters, numbers, and underscores."
+                .to_string(),
+        );
+    }
+    let trimmed_path = file_path.trim();
+    if trimmed_path.is_empty() {
+        return Err("File path is required.".to_string());
+    }
+
+    let use_glob = is_glob.unwrap_or(false);
+    if !use_glob && fs::metadata(trimmed_path).is_err() {
+        return Err("Workspace file path does not exist.".to_string());
+    }
+
+    let mut tables = state
+        .workspace_tables
+        .lock()
+        .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+    let next_entry = WorkspaceTableRegistration {
+        alias: trimmed_alias.to_string(),
+        file_path: trimmed_path.to_string(),
+        is_glob: use_glob,
+    };
+    if let Some(existing) = tables
+        .iter_mut()
+        .find(|entry| entry.alias.eq_ignore_ascii_case(trimmed_alias))
+    {
+        *existing = next_entry.clone();
+    } else {
+        tables.push(next_entry.clone());
+    }
+    Ok(workspace_table_info(&next_entry))
+}
+
+#[tauri::command]
+fn list_workspace_tables(
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<WorkspaceTableInfo>, String> {
+    let tables = state
+        .workspace_tables
+        .lock()
+        .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+    let mut infos = tables.iter().map(workspace_table_info).collect::<Vec<_>>();
+    infos.sort_by(|a, b| a.alias.cmp(&b.alias));
+    Ok(infos)
+}
+
+#[tauri::command]
+fn remove_workspace_table(
+    alias: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<(), String> {
+    let mut tables = state
+        .workspace_tables
+        .lock()
+        .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+    let initial = tables.len();
+    tables.retain(|entry| !entry.alias.eq_ignore_ascii_case(alias.trim()));
+    if tables.len() == initial {
+        return Err("Workspace alias not found.".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn run_workspace_query(
+    sql: String,
+    row_limit: u32,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<WorkspaceQueryResponse, String> {
+    ensure_memory_guard_clear(state.as_ref())?;
+    let started = Instant::now();
+    let normalized_sql = normalize_single_sql_statement(&sql)?;
+
+    let tables = {
+        let lock = state
+            .workspace_tables
+            .lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+
+    let conn = open_configured_duckdb(state.as_ref())?;
+    apply_workspace_tables(&conn, &tables)?;
+    let safe_limit = row_limit.max(1);
+    let schema = query_schema(&conn, &normalized_sql)?;
+    let (rows, truncated) = query_rows_with_limit(&conn, &normalized_sql, &schema, safe_limit)?;
+    let elapsed_ms = started.elapsed().as_millis();
+    log_perf(
+        "run_workspace_query",
+        &format!(
+            "duration_ms={} row_limit={} row_count={} truncated={} workspace_tables={}",
+            elapsed_ms,
+            safe_limit,
+            rows.len(),
+            truncated,
+            tables.len()
+        ),
+    );
+
+    Ok(WorkspaceQueryResponse {
+        sql: normalized_sql,
+        row_limit: safe_limit,
+        row_count: rows.len(),
+        truncated,
+        elapsed_ms,
+        schema,
+        rows,
+    })
+}
+
+#[tauri::command]
+fn describe_workspace_table(
+    alias: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<ParquetSchemaColumn>, String> {
+    ensure_memory_guard_clear(state.as_ref())?;
+    let alias_trimmed = alias.trim();
+    if alias_trimmed.is_empty() {
+        return Err("Workspace alias is required.".to_string());
+    }
+
+    let tables = {
+        let lock = state
+            .workspace_tables
+            .lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+    let exists = tables
+        .iter()
+        .any(|entry| entry.alias.eq_ignore_ascii_case(alias_trimmed));
+    if !exists {
+        return Err(format!("Workspace alias not found: {alias_trimmed}"));
+    }
+
+    let conn = open_configured_duckdb(state.as_ref())?;
+    apply_workspace_tables(&conn, &tables)?;
+    table_schema_for_alias(&conn, alias_trimmed)
+}
+
+#[tauri::command]
+fn export_workspace_query(
+    sql: String,
+    output_path: String,
+    format: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<WorkspaceExportResponse, String> {
+    ensure_memory_guard_clear(state.as_ref())?;
+    let started = Instant::now();
+    let normalized_sql = normalize_single_sql_statement(&sql)?;
+    let trimmed_path = output_path.trim();
+    if trimmed_path.is_empty() {
+        return Err("Output path is required.".to_string());
+    }
+
+    let tables = {
+        let lock = state
+            .workspace_tables
+            .lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+
+    let conn = open_configured_duckdb(state.as_ref())?;
+    apply_workspace_tables(&conn, &tables)?;
+    export_workspace_query_to_file(&conn, &normalized_sql, trimmed_path, &format)?;
+
+    let file_size_bytes = fs::metadata(trimmed_path).map(|meta| meta.len()).unwrap_or(0);
+    let elapsed_ms = started.elapsed().as_millis();
+    let normalized_format = format.trim().to_ascii_lowercase();
+    log_perf(
+        "export_workspace_query",
+        &format!(
+            "duration_ms={} format={} output_path={} file_size_bytes={} workspace_tables={}",
+            elapsed_ms,
+            normalized_format,
+            trimmed_path,
+            file_size_bytes,
+            tables.len()
+        ),
+    );
+
+    Ok(WorkspaceExportResponse {
+        sql: normalized_sql,
+        format: normalized_format,
+        output_path: trimmed_path.to_string(),
+        file_size_bytes,
+        elapsed_ms,
+    })
+}
+
+#[tauri::command]
+fn diff_workspace_schema(
+    left_alias: String,
+    right_alias: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<WorkspaceSchemaDiffResponse, String> {
+    ensure_memory_guard_clear(state.as_ref())?;
+    let left_trimmed = left_alias.trim();
+    let right_trimmed = right_alias.trim();
+    if left_trimmed.is_empty() || right_trimmed.is_empty() {
+        return Err("Both workspace aliases are required.".to_string());
+    }
+    if left_trimmed.eq_ignore_ascii_case(right_trimmed) {
+        return Err("Choose two different workspace aliases for schema diff.".to_string());
+    }
+
+    let tables = {
+        let lock = state
+            .workspace_tables
+            .lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+    let has_left = tables
+        .iter()
+        .any(|entry| entry.alias.eq_ignore_ascii_case(left_trimmed));
+    let has_right = tables
+        .iter()
+        .any(|entry| entry.alias.eq_ignore_ascii_case(right_trimmed));
+    if !has_left {
+        return Err(format!("Workspace alias not found: {left_trimmed}"));
+    }
+    if !has_right {
+        return Err(format!("Workspace alias not found: {right_trimmed}"));
+    }
+
+    let conn = open_configured_duckdb(state.as_ref())?;
+    apply_workspace_tables(&conn, &tables)?;
+    let left_schema = table_schema_for_alias(&conn, left_trimmed)?;
+    let right_schema = table_schema_for_alias(&conn, right_trimmed)?;
+    let diff = build_workspace_schema_diff(
+        left_trimmed,
+        &left_schema,
+        right_trimmed,
+        &right_schema,
+    );
+    log_perf(
+        "diff_workspace_schema",
+        &format!(
+            "left_alias={} right_alias={} added={} removed={} type_changed={} unchanged={}",
+            left_trimmed,
+            right_trimmed,
+            diff.added_count,
+            diff.removed_count,
+            diff.type_changed_count,
+            diff.unchanged_count
+        ),
+    );
+    Ok(diff)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        build_workspace_schema_diff,
         compute_duckdb_memory_limit_bytes, compute_duckdb_threads, escape_sql_string_literal,
+        export_workspace_query_to_file,
+        normalize_single_sql_statement,
         open_configured_duckdb, parquet_rows_page, parquet_schema, parquet_total_rows,
-        start_socket_server_for_payload, AppRuntimeState, DUCKDB_MEMORY_CAP_BYTES,
+        query_rows_with_limit, query_schema, start_socket_server_for_payload,
+        table_schema_for_alias,
+        apply_workspace_tables, AppRuntimeState, DUCKDB_MEMORY_CAP_BYTES,
+        WorkspaceTableRegistration, ParquetSchemaColumn,
     };
     use futures_util::StreamExt;
     use std::fs;
@@ -731,6 +1272,14 @@ mod tests {
 
     fn six_gib() -> u64 {
         6_u64 * 1024 * 1024 * 1024
+    }
+
+    #[test]
+    fn normalize_sql_trims_semicolon_and_blocks_multi_statement() {
+        let normalized = normalize_single_sql_statement(" SELECT 1; ").expect("normalize sql");
+        assert_eq!(normalized, "SELECT 1");
+        assert!(normalize_single_sql_statement("SELECT 1; SELECT 2").is_err());
+        assert!(normalize_single_sql_statement("   ").is_err());
     }
 
     #[test]
@@ -813,6 +1362,161 @@ mod tests {
         });
     }
 
+    #[test]
+    fn workspace_query_supports_cross_file_join() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+
+        let left_path = unique_test_parquet_path();
+        let right_path = unique_test_parquet_path();
+        let left_escaped = escape_sql_string_literal(&left_path);
+        let right_escaped = escape_sql_string_literal(&right_path);
+
+        conn.execute_batch(&format!(
+            "COPY (
+                SELECT 1::BIGINT AS id, 'a'::VARCHAR AS tag
+                UNION ALL
+                SELECT 2::BIGINT AS id, 'b'::VARCHAR AS tag
+            ) TO '{left_escaped}' (FORMAT PARQUET);
+            COPY (
+                SELECT 1::BIGINT AS id, 10::BIGINT AS score
+                UNION ALL
+                SELECT 2::BIGINT AS id, 20::BIGINT AS score
+            ) TO '{right_escaped}' (FORMAT PARQUET);"
+        ))
+        .expect("write workspace fixtures");
+
+        let tables = vec![
+            WorkspaceTableRegistration {
+                alias: "left_tbl".to_string(),
+                file_path: left_path.clone(),
+                is_glob: false,
+            },
+            WorkspaceTableRegistration {
+                alias: "right_tbl".to_string(),
+                file_path: right_path.clone(),
+                is_glob: false,
+            },
+        ];
+        apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
+
+        let sql = "SELECT l.id, l.tag, r.score FROM left_tbl l JOIN right_tbl r USING (id) ORDER BY l.id";
+        let schema = query_schema(&conn, sql).expect("workspace schema");
+        let (rows, truncated) =
+            query_rows_with_limit(&conn, sql, &schema, 10).expect("workspace query rows");
+        assert!(!truncated);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_deref(), Some("1"));
+        assert_eq!(rows[0][1].as_deref(), Some("a"));
+        assert_eq!(rows[0][2].as_deref(), Some("10"));
+
+        let _ = fs::remove_file(&left_path);
+        let _ = fs::remove_file(&right_path);
+    }
+
+    #[test]
+    fn table_schema_for_alias_returns_registered_columns() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+
+        let source_path = unique_test_parquet_path();
+        let source_escaped = escape_sql_string_literal(&source_path);
+        conn.execute_batch(&format!(
+            "COPY (
+                SELECT 443::BIGINT AS destination_port, 1200::BIGINT AS flow_duration
+            ) TO '{source_escaped}' (FORMAT PARQUET);"
+        ))
+        .expect("write schema source parquet");
+
+        let tables = vec![WorkspaceTableRegistration {
+            alias: "traffic_tbl".to_string(),
+            file_path: source_path.clone(),
+            is_glob: false,
+        }];
+        apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
+
+        let schema = table_schema_for_alias(&conn, "traffic_tbl").expect("table schema");
+        let column_names: Vec<String> = schema.into_iter().map(|column| column.name).collect();
+        assert_eq!(column_names, vec!["destination_port", "flow_duration"]);
+
+        let _ = fs::remove_file(&source_path);
+    }
+
+    #[test]
+    fn schema_diff_detects_added_and_type_changed_columns() {
+        let left_schema = vec![
+            ParquetSchemaColumn {
+                name: "id".to_string(),
+                duckdb_type: "BIGINT".to_string(),
+            },
+            ParquetSchemaColumn {
+                name: "qty".to_string(),
+                duckdb_type: "INTEGER".to_string(),
+            },
+        ];
+        let right_schema = vec![
+            ParquetSchemaColumn {
+                name: "id".to_string(),
+                duckdb_type: "BIGINT".to_string(),
+            },
+            ParquetSchemaColumn {
+                name: "qty".to_string(),
+                duckdb_type: "DOUBLE".to_string(),
+            },
+            ParquetSchemaColumn {
+                name: "extra".to_string(),
+                duckdb_type: "VARCHAR".to_string(),
+            },
+        ];
+
+        let diff = build_workspace_schema_diff("left_tbl", &left_schema, "right_tbl", &right_schema);
+        assert_eq!(diff.added_count, 1);
+        assert_eq!(diff.removed_count, 0);
+        assert_eq!(diff.type_changed_count, 1);
+        assert_eq!(diff.unchanged_count, 1);
+        assert_eq!(diff.columns.len(), 3);
+    }
+
+    #[test]
+    fn workspace_query_export_writes_csv_and_parquet_files() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+
+        let source_path = unique_test_parquet_path();
+        let source_escaped = escape_sql_string_literal(&source_path);
+        conn.execute_batch(&format!(
+            "COPY (
+                SELECT 1::BIGINT AS id, 'alpha'::VARCHAR AS label
+                UNION ALL
+                SELECT 2::BIGINT AS id, 'beta'::VARCHAR AS label
+            ) TO '{source_escaped}' (FORMAT PARQUET);"
+        ))
+        .expect("write source parquet");
+
+        let tables = vec![WorkspaceTableRegistration {
+            alias: "exp_tbl".to_string(),
+            file_path: source_path.clone(),
+            is_glob: false,
+        }];
+        apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
+
+        let sql = "SELECT id, label FROM exp_tbl ORDER BY id";
+        let csv_path = unique_test_output_path("csv");
+        let parquet_path = unique_test_output_path("parquet");
+
+        export_workspace_query_to_file(&conn, sql, &csv_path, "csv").expect("export csv");
+        export_workspace_query_to_file(&conn, sql, &parquet_path, "parquet").expect("export parquet");
+
+        let csv_contents = fs::read_to_string(&csv_path).expect("read csv");
+        assert!(csv_contents.contains("id,label"));
+        assert!(csv_contents.contains("1,alpha"));
+        assert!(fs::metadata(&parquet_path).expect("parquet metadata").len() > 0);
+
+        let _ = fs::remove_file(&source_path);
+        let _ = fs::remove_file(&csv_path);
+        let _ = fs::remove_file(&parquet_path);
+    }
+
     fn unique_test_parquet_path() -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -821,6 +1525,17 @@ mod tests {
         let thread_id = format!("{:?}", std::thread::current().id());
         let mut path = std::env::temp_dir();
         path.push(format!("parq_bench_test_{nanos}_{thread_id}.parquet"));
+        path.to_string_lossy().to_string()
+    }
+
+    fn unique_test_output_path(extension: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let mut path = std::env::temp_dir();
+        path.push(format!("parq_bench_test_export_{nanos}_{thread_id}.{extension}"));
         path.to_string_lossy().to_string()
     }
 }
@@ -847,7 +1562,14 @@ pub fn run() {
             fetch_parquet_rows,
             fetch_parquet_rows_transport,
             start_arrow_socket_server,
-            write_text_report
+            write_text_report,
+            register_workspace_table,
+            list_workspace_tables,
+            remove_workspace_table,
+            run_workspace_query,
+            describe_workspace_table,
+            export_workspace_query,
+            diff_workspace_schema
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
