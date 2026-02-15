@@ -54,6 +54,29 @@ body {
   margin-bottom: 12px;
 }
 
+.perf-sweep-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d6ded6;
+  border-radius: 6px;
+  padding: 4px 6px;
+  background: #f8fbf8;
+}
+
+.perf-sweep-controls label {
+  font-size: 0.8rem;
+  color: #314031;
+}
+
+.perf-sweep-input {
+  width: 64px;
+  border: 1px solid #cbd5cb;
+  border-radius: 6px;
+  padding: 5px 6px;
+  font-size: 0.82rem;
+}
+
 button {
   border: 1px solid #153d23;
   background: #1e5c32;
@@ -136,9 +159,8 @@ button:disabled {
   padding: 6px 10px;
   font-size: 0.82rem;
   margin-bottom: 8px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .gate-pass {
@@ -235,6 +257,10 @@ table {
 
 .diagnostics {
   margin-top: 12px;
+}
+
+.sweep-runs {
+  margin: 0 0 8px;
 }
 
 .diagnostics summary {

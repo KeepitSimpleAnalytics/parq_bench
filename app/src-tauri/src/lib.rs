@@ -70,6 +70,13 @@ struct ParquetRowsTransportResponse {
 }
 
 #[derive(Clone)]
+struct FlattenedColumn {
+    name: String,
+    duckdb_type: String,
+    select_expr: String,
+}
+
+#[derive(Clone)]
 struct WorkspaceTableRegistration {
     alias: String,
     file_path: String,
@@ -219,11 +226,151 @@ fn escape_sql_ident(value: &str) -> String {
     value.replace('"', "\"\"")
 }
 
-fn parquet_schema(conn: &Connection, source: &str) -> Result<Vec<ParquetSchemaColumn>, String> {
-    let schema_sql = format!("DESCRIBE SELECT * FROM {source}");
+fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn is_struct_duckdb_type(duckdb_type: &str) -> bool {
+    duckdb_type
+        .trim()
+        .to_ascii_uppercase()
+        .starts_with("STRUCT(")
+}
+
+fn is_collection_duckdb_type(duckdb_type: &str) -> bool {
+    let upper = duckdb_type.trim().to_ascii_uppercase();
+    upper.starts_with("LIST(")
+        || upper.starts_with("MAP(")
+        || upper.starts_with("ARRAY(")
+        || upper.starts_with("UNION(")
+        || upper.contains("[]")
+}
+
+fn split_top_level(input: &str, separator: char) -> Vec<String> {
+    let mut parts = Vec::<String>::new();
+    let mut current = String::new();
+    let mut paren_depth = 0_i32;
+    let mut angle_depth = 0_i32;
+    let mut bracket_depth = 0_i32;
+    let mut in_quotes = false;
+    let chars = input.chars().peekable();
+
+    for ch in chars {
+        if in_quotes {
+            current.push(ch);
+            if ch == '"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_quotes = true;
+                current.push(ch);
+            }
+            '(' => {
+                paren_depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                paren_depth -= 1;
+                current.push(ch);
+            }
+            '<' => {
+                angle_depth += 1;
+                current.push(ch);
+            }
+            '>' => {
+                angle_depth -= 1;
+                current.push(ch);
+            }
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth -= 1;
+                current.push(ch);
+            }
+            _ if ch == separator && paren_depth == 0 && angle_depth == 0 && bracket_depth == 0 => {
+                parts.push(current.trim().to_string());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if !current.trim().is_empty() {
+        parts.push(current.trim().to_string());
+    }
+    parts
+}
+
+fn parse_struct_fields(duckdb_type: &str) -> Option<Vec<(String, String)>> {
+    let trimmed = duckdb_type.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    if !upper.starts_with("STRUCT(") || !trimmed.ends_with(')') {
+        return None;
+    }
+    let inner = &trimmed[7..trimmed.len() - 1];
+    let parts = split_top_level(inner, ',');
+    let mut fields = Vec::<(String, String)>::new();
+
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        let part_trimmed = part.trim();
+        if part_trimmed.starts_with('"') {
+            let mut name = String::new();
+            let mut chars = part_trimmed[1..].chars().peekable();
+            let mut consumed = 1_usize;
+            while let Some(ch) = chars.next() {
+                consumed += ch.len_utf8();
+                if ch == '"' {
+                    if chars.peek() == Some(&'"') {
+                        name.push('"');
+                        chars.next();
+                        consumed += 1;
+                        continue;
+                    }
+                    break;
+                }
+                name.push(ch);
+            }
+            if consumed >= part_trimmed.len() {
+                return None;
+            }
+            let field_type = part_trimmed[consumed..].trim();
+            if field_type.is_empty() {
+                return None;
+            }
+            fields.push((name, field_type.to_string()));
+            continue;
+        }
+
+        let split_idx = part_trimmed
+            .find(char::is_whitespace)
+            .unwrap_or(part_trimmed.len());
+        if split_idx == part_trimmed.len() {
+            return None;
+        }
+        let field_name = part_trimmed[..split_idx].trim();
+        let field_type = part_trimmed[split_idx..].trim();
+        if field_name.is_empty() || field_type.is_empty() {
+            return None;
+        }
+        fields.push((field_name.to_string(), field_type.to_string()));
+    }
+
+    Some(fields)
+}
+
+fn describe_columns(conn: &Connection, describe_sql: &str, context: &str) -> Result<Vec<ParquetSchemaColumn>, String> {
     let mut schema_stmt = conn
-        .prepare(&schema_sql)
-        .map_err(|e| format!("prepare schema query: {e}"))?;
+        .prepare(describe_sql)
+        .map_err(|e| format!("prepare {context}: {e}"))?;
     let schema_iter = schema_stmt
         .query_map([], |row| {
             Ok(ParquetSchemaColumn {
@@ -231,10 +378,106 @@ fn parquet_schema(conn: &Connection, source: &str) -> Result<Vec<ParquetSchemaCo
                 duckdb_type: row.get(1)?,
             })
         })
-        .map_err(|e| format!("run schema query: {e}"))?;
+        .map_err(|e| format!("run {context}: {e}"))?;
     schema_iter
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("collect schema rows: {e}"))
+        .map_err(|e| format!("collect {context}: {e}"))
+}
+
+fn append_flattened_column(
+    conn: &Connection,
+    source: &str,
+    column_expr: &str,
+    column_name: &str,
+    duckdb_type: &str,
+    flattened: &mut Vec<FlattenedColumn>,
+) -> Result<(), String> {
+    if is_struct_duckdb_type(duckdb_type) {
+        let Some(children) = parse_struct_fields(duckdb_type) else {
+            flattened.push(FlattenedColumn {
+                name: column_name.to_string(),
+                duckdb_type: "VARCHAR".to_string(),
+                select_expr: format!("CAST({column_expr} AS VARCHAR)"),
+            });
+            return Ok(());
+        };
+
+        for (child_name, child_type) in children {
+            let child_literal = escape_sql_literal(&child_name);
+            let child_expr = format!("struct_extract({column_expr}, '{child_literal}')");
+            let child_qualified_name = format!("{column_name}.{child_name}");
+            append_flattened_column(
+                conn,
+                source,
+                &child_expr,
+                &child_qualified_name,
+                &child_type,
+                flattened,
+            )?;
+        }
+        return Ok(());
+    }
+
+    if is_collection_duckdb_type(duckdb_type) {
+        flattened.push(FlattenedColumn {
+            name: column_name.to_string(),
+            duckdb_type: "VARCHAR".to_string(),
+            select_expr: format!("CAST({column_expr} AS VARCHAR)"),
+        });
+        return Ok(());
+    }
+
+    flattened.push(FlattenedColumn {
+        name: column_name.to_string(),
+        duckdb_type: duckdb_type.to_string(),
+        select_expr: column_expr.to_string(),
+    });
+    Ok(())
+}
+
+fn flattened_columns_for_source(conn: &Connection, source: &str) -> Result<Vec<FlattenedColumn>, String> {
+    let root_describe_sql = format!("DESCRIBE SELECT * FROM {source}");
+    let root_schema = describe_columns(conn, &root_describe_sql, "source schema query")?;
+    let mut flattened = Vec::<FlattenedColumn>::new();
+    for column in root_schema {
+        let root_ident = escape_sql_ident(&column.name);
+        let root_expr = format!("\"{root_ident}\"");
+        append_flattened_column(
+            conn,
+            source,
+            &root_expr,
+            &column.name,
+            &column.duckdb_type,
+            &mut flattened,
+        )?;
+    }
+    Ok(flattened)
+}
+
+fn flattened_projection_sql(columns: &[FlattenedColumn], cast_to_varchar: bool) -> String {
+    columns
+        .iter()
+        .map(|column| {
+            let ident = escape_sql_ident(&column.name);
+            if cast_to_varchar {
+                format!("CAST({} AS VARCHAR) AS \"{ident}\"", column.select_expr)
+            } else {
+                format!("{} AS \"{ident}\"", column.select_expr)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn parquet_schema(conn: &Connection, source: &str) -> Result<Vec<ParquetSchemaColumn>, String> {
+    let flattened = flattened_columns_for_source(conn, source)?;
+    Ok(flattened
+        .into_iter()
+        .map(|column| ParquetSchemaColumn {
+            name: column.name,
+            duckdb_type: column.duckdb_type,
+        })
+        .collect::<Vec<_>>())
 }
 
 fn parquet_total_rows(conn: &Connection, normalized_path: &str, source: &str) -> u64 {
@@ -257,11 +500,20 @@ fn parquet_rows_page(
     row_offset: u64,
     row_limit: u32,
 ) -> Result<Vec<Vec<Option<String>>>, String> {
+    let flattened = flattened_columns_for_source(conn, source)?;
+    let flattened_map = flattened
+        .iter()
+        .map(|column| (column.name.clone(), column.select_expr.clone()))
+        .collect::<BTreeMap<_, _>>();
     let projection = schema
         .iter()
         .map(|col| {
             let ident = escape_sql_ident(&col.name);
-            format!("CAST(\"{ident}\" AS VARCHAR) AS \"{ident}\"")
+            let expr = flattened_map
+                .get(&col.name)
+                .cloned()
+                .unwrap_or_else(|| format!("\"{ident}\""));
+            format!("CAST({expr} AS VARCHAR) AS \"{ident}\"")
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -339,8 +591,11 @@ fn apply_workspace_tables(
     for table in tables {
         let ident = escape_sql_ident(&table.alias);
         let path = escape_sql_string_literal(&table.file_path);
+        let source = format!("read_parquet('{path}')");
+        let flattened = flattened_columns_for_source(conn, &source)?;
+        let projection = flattened_projection_sql(&flattened, false);
         conn.execute_batch(&format!(
-            "CREATE OR REPLACE VIEW \"{ident}\" AS SELECT * FROM read_parquet('{path}');"
+            "CREATE OR REPLACE VIEW \"{ident}\" AS SELECT {projection} FROM {source};"
         ))
         .map_err(|e| format!("register workspace table '{}': {e}", table.alias))?;
     }
@@ -1320,6 +1575,60 @@ mod tests {
     }
 
     #[test]
+    fn parquet_schema_flattens_nested_struct_and_serializes_lists() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let temp_file = unique_test_parquet_path();
+        let escaped_path = escape_sql_string_literal(&temp_file);
+
+        conn.execute_batch(&format!(
+            "COPY (
+                SELECT
+                    {{'src_port': 443::BIGINT, 'meta': {{'duration_ms': 120::BIGINT}}}} AS flow,
+                    [1, 2, 3]::INTEGER[] AS ports
+            ) TO '{escaped_path}' (FORMAT PARQUET);"
+        ))
+        .expect("write nested parquet fixture");
+
+        let source = format!("read_parquet('{escaped_path}')");
+        let schema = parquet_schema(&conn, &source).expect("load flattened parquet schema");
+        let names = schema.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "flow.src_port"));
+        assert!(names
+            .iter()
+            .any(|name| name == "flow.meta.duration_ms"));
+        assert!(names.iter().any(|name| name == "ports"));
+        let ports_col = schema
+            .iter()
+            .find(|column| column.name == "ports")
+            .expect("ports column present");
+        assert_eq!(ports_col.duckdb_type, "VARCHAR");
+
+        let rows = parquet_rows_page(&conn, &source, &schema, 0, 10).expect("load flattened rows");
+        assert_eq!(rows.len(), 1);
+        let src_port_idx = names
+            .iter()
+            .position(|name| name == "flow.src_port")
+            .expect("src_port column index");
+        let duration_idx = names
+            .iter()
+            .position(|name| name == "flow.meta.duration_ms")
+            .expect("duration column index");
+        let ports_idx = names
+            .iter()
+            .position(|name| name == "ports")
+            .expect("ports column index");
+        assert_eq!(rows[0][src_port_idx].as_deref(), Some("443"));
+        assert_eq!(rows[0][duration_idx].as_deref(), Some("120"));
+        assert!(rows[0][ports_idx]
+            .as_deref()
+            .unwrap_or_default()
+            .contains('1'));
+
+        let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
     fn socket_transport_delivers_full_payload_integrity() {
         let payload_size = 3 * 1024 * 1024 + 17;
         let payload: Vec<u8> = (0..payload_size).map(|idx| (idx % 251) as u8).collect();
@@ -1438,6 +1747,52 @@ mod tests {
         let schema = table_schema_for_alias(&conn, "traffic_tbl").expect("table schema");
         let column_names: Vec<String> = schema.into_iter().map(|column| column.name).collect();
         assert_eq!(column_names, vec!["destination_port", "flow_duration"]);
+
+        let _ = fs::remove_file(&source_path);
+    }
+
+    #[test]
+    fn workspace_alias_schema_flattens_nested_columns() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+
+        let source_path = unique_test_parquet_path();
+        let source_escaped = escape_sql_string_literal(&source_path);
+        conn.execute_batch(&format!(
+            "COPY (
+                SELECT
+                    {{'destination_port': 443::BIGINT, 'metrics': {{'flow_duration': 900::BIGINT}}}} AS flow,
+                    [7, 8]::INTEGER[] AS tags
+            ) TO '{source_escaped}' (FORMAT PARQUET);"
+        ))
+        .expect("write nested workspace parquet");
+
+        let tables = vec![WorkspaceTableRegistration {
+            alias: "traffic_tbl".to_string(),
+            file_path: source_path.clone(),
+            is_glob: false,
+        }];
+        apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
+
+        let schema = table_schema_for_alias(&conn, "traffic_tbl").expect("table schema");
+        let names = schema.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
+        assert!(names
+            .iter()
+            .any(|name| name == "flow.destination_port"));
+        assert!(names
+            .iter()
+            .any(|name| name == "flow.metrics.flow_duration"));
+        assert!(names.iter().any(|name| name == "tags"));
+
+        let sql = r#"SELECT "flow.destination_port", "flow.metrics.flow_duration", tags FROM traffic_tbl"#;
+        let result_schema = query_schema(&conn, sql).expect("workspace flattened schema");
+        let (rows, truncated) =
+            query_rows_with_limit(&conn, sql, &result_schema, 10).expect("workspace flattened rows");
+        assert!(!truncated);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_deref(), Some("443"));
+        assert_eq!(rows[0][1].as_deref(), Some("900"));
+        assert!(rows[0][2].as_deref().unwrap_or_default().contains('7'));
 
         let _ = fs::remove_file(&source_path);
     }

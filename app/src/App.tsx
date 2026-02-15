@@ -15,6 +15,9 @@ const COLUMN_WIDTH = 180;
 const FIRST_VIEWPORT_TARGET_MS = 500;
 const PERSPECTIVE_READY_TARGET_MS = 3000;
 const ACCEPTANCE_GATE_TIMEOUT_MS = 15000;
+const PERF_SWEEP_MIN_RUNS = 2;
+const PERF_SWEEP_MAX_RUNS = 25;
+const PERF_SWEEP_DEFAULT_RUNS = 5;
 
 type SmokeRow = {
   id: number;
@@ -94,6 +97,21 @@ type AcceptanceGateReport = {
   details: string;
 };
 
+type PerfSweepSummary = {
+  filePath: string;
+  evaluatedAt: string;
+  runCount: number;
+  completedRuns: number;
+  passCount: number;
+  failCount: number;
+  firstViewportP50: number | null;
+  firstViewportP95: number | null;
+  perspectiveReadyP50: number | null;
+  perspectiveReadyP95: number | null;
+  perspectiveReadySamples: number;
+  runs: AcceptanceGateReport[];
+};
+
 type WorkspaceTableInfo = {
   alias: string;
   file_path: string;
@@ -161,6 +179,7 @@ type ExportPayload = {
     last_query: WorkspaceQueryResponse | null;
     last_schema_diff: WorkspaceSchemaDiffResponse | null;
   };
+  perf_sweep: PerfSweepSummary | null;
 };
 
 function App() {
@@ -187,6 +206,8 @@ function App() {
   const [firstViewportMs, setFirstViewportMs] = useState<number | null>(null);
   const [perspectiveReadyMs, setPerspectiveReadyMs] = useState<number | null>(null);
   const [acceptanceGate, setAcceptanceGate] = useState<AcceptanceGateReport | null>(null);
+  const [perfSweepReport, setPerfSweepReport] = useState<PerfSweepSummary | null>(null);
+  const [perfSweepRunsInput, setPerfSweepRunsInput] = useState(String(PERF_SWEEP_DEFAULT_RUNS));
   const [lastExportPath, setLastExportPath] = useState<string | null>(null);
   const [workspaceTables, setWorkspaceTables] = useState<WorkspaceTableInfo[]>([]);
   const [workspaceTableSchemas, setWorkspaceTableSchemas] = useState<WorkspaceSchemaByAlias>({});
@@ -239,6 +260,50 @@ function App() {
 
   async function sleepMs(ms: number) {
     await new Promise<void>((resolve) => setTimeout(resolve, ms));
+  }
+
+  function clampPerfSweepRuns(input: string): number {
+    const parsed = Number.parseInt(input.trim(), 10);
+    if (!Number.isFinite(parsed)) {
+      return PERF_SWEEP_DEFAULT_RUNS;
+    }
+    return Math.min(PERF_SWEEP_MAX_RUNS, Math.max(PERF_SWEEP_MIN_RUNS, parsed));
+  }
+
+  function percentile(values: number[], fraction: number): number | null {
+    if (values.length === 0) {
+      return null;
+    }
+    const sorted = [...values].sort((a, b) => a - b);
+    const clamped = Math.max(0, Math.min(1, fraction));
+    const index = (sorted.length - 1) * clamped;
+    const lower = Math.floor(index);
+    const upper = Math.ceil(index);
+    if (lower === upper) {
+      return sorted[lower];
+    }
+    const weight = index - lower;
+    return sorted[lower] + (sorted[upper] - sorted[lower]) * weight;
+  }
+
+  function buildFailedGateReport(
+    filePath: string,
+    message: string,
+    fallback?: { firstViewportMs?: number | null; perspectiveReadyMs?: number | null },
+  ): AcceptanceGateReport {
+    const firstMs = fallback?.firstViewportMs ?? firstViewportMs;
+    const perspectiveMs = fallback?.perspectiveReadyMs ?? perspectiveReadyMs;
+    return {
+      filePath,
+      evaluatedAt: new Date().toISOString(),
+      firstViewportMs: firstMs ?? null,
+      perspectiveReadyMs: perspectiveMs ?? null,
+      firstViewportPass: firstMs !== null && firstMs !== undefined && firstMs <= FIRST_VIEWPORT_TARGET_MS,
+      perspectivePass: false,
+      perspectiveStatus: "error",
+      passed: false,
+      details: message,
+    };
   }
 
   async function pickParquetFile(): Promise<string | null> {
@@ -758,6 +823,7 @@ function App() {
         last_query: workspaceQueryResult,
         last_schema_diff: workspaceSchemaDiff,
       },
+      perf_sweep: perfSweepReport,
     };
   }
 
@@ -820,6 +886,62 @@ function App() {
           .map((cell) => escapeCsvCell(String(cell)))
           .join(","),
       );
+    }
+
+    if (payload.perf_sweep) {
+      rows.push(
+        [
+          "perf_sweep_summary",
+          payload.perf_sweep.evaluatedAt,
+          payload.perf_sweep.filePath,
+          "",
+          "",
+          "",
+          "",
+          "",
+          payload.perf_sweep.firstViewportP95 === null
+            ? ""
+            : payload.perf_sweep.firstViewportP95.toFixed(3),
+          String(FIRST_VIEWPORT_TARGET_MS),
+          String(payload.perf_sweep.passCount === payload.perf_sweep.completedRuns),
+          payload.perf_sweep.perspectiveReadyP95 === null
+            ? ""
+            : payload.perf_sweep.perspectiveReadyP95.toFixed(3),
+          String(PERSPECTIVE_READY_TARGET_MS),
+          payload.perf_sweep.failCount === 0 ? "ready" : "error",
+          String(payload.perf_sweep.failCount === 0),
+          String(payload.perf_sweep.failCount === 0),
+          `runs=${payload.perf_sweep.completedRuns}/${payload.perf_sweep.runCount}; pass=${payload.perf_sweep.passCount}; fail=${payload.perf_sweep.failCount}; first_p50=${payload.perf_sweep.firstViewportP50?.toFixed(1) ?? "n/a"}; perspective_p50=${payload.perf_sweep.perspectiveReadyP50?.toFixed(1) ?? "n/a"}`,
+        ]
+          .map((cell) => escapeCsvCell(String(cell)))
+          .join(","),
+      );
+
+      payload.perf_sweep.runs.forEach((run) => {
+        rows.push(
+          [
+            "perf_sweep_run",
+            run.evaluatedAt,
+            run.filePath,
+            "",
+            "",
+            "",
+            "",
+            "",
+            run.firstViewportMs === null ? "" : run.firstViewportMs.toFixed(3),
+            String(FIRST_VIEWPORT_TARGET_MS),
+            String(run.firstViewportPass),
+            run.perspectiveReadyMs === null ? "" : run.perspectiveReadyMs.toFixed(3),
+            String(PERSPECTIVE_READY_TARGET_MS),
+            run.perspectiveStatus,
+            String(run.perspectivePass),
+            String(run.passed),
+            run.details,
+          ]
+            .map((cell) => escapeCsvCell(String(cell)))
+            .join(","),
+        );
+      });
     }
 
     for (const entry of payload.benchmarks) {
@@ -1317,6 +1439,27 @@ function App() {
     }
   }
 
+  async function evaluateAcceptanceGateForFile(targetFile: string): Promise<AcceptanceGateReport> {
+    const firstMs = await loadPreviewFromPath(targetFile);
+    const perspectiveResult = await waitForPerspectiveResult(ACCEPTANCE_GATE_TIMEOUT_MS);
+    const firstViewportPass = firstMs <= FIRST_VIEWPORT_TARGET_MS;
+    const perspectivePass =
+      perspectiveResult.status === "ready" &&
+      perspectiveResult.readyMs !== null &&
+      perspectiveResult.readyMs <= PERSPECTIVE_READY_TARGET_MS;
+    return {
+      filePath: targetFile,
+      evaluatedAt: new Date().toISOString(),
+      firstViewportMs: firstMs,
+      perspectiveReadyMs: perspectiveResult.readyMs,
+      firstViewportPass,
+      perspectivePass,
+      perspectiveStatus: perspectiveResult.status,
+      passed: firstViewportPass && perspectivePass,
+      details: perspectiveResult.error ?? "",
+    };
+  }
+
   async function runAcceptanceGate() {
     await refreshRuntimeHealth();
     if (memoryGuardRef.current) {
@@ -1337,40 +1480,83 @@ function App() {
         return;
       }
 
-      const firstMs = await loadPreviewFromPath(targetFile);
-      const perspectiveResult = await waitForPerspectiveResult(ACCEPTANCE_GATE_TIMEOUT_MS);
-      const firstViewportPass = firstMs <= FIRST_VIEWPORT_TARGET_MS;
-      const perspectivePass =
-        perspectiveResult.status === "ready" &&
-        perspectiveResult.readyMs !== null &&
-        perspectiveResult.readyMs <= PERSPECTIVE_READY_TARGET_MS;
-      const passed = firstViewportPass && perspectivePass;
-
-      setAcceptanceGate({
-        filePath: targetFile,
-        evaluatedAt: new Date().toISOString(),
-        firstViewportMs: firstMs,
-        perspectiveReadyMs: perspectiveResult.readyMs,
-        firstViewportPass,
-        perspectivePass,
-        perspectiveStatus: perspectiveResult.status,
-        passed,
-        details: perspectiveResult.error ?? "",
-      });
+      const report = await evaluateAcceptanceGateForFile(targetFile);
+      setAcceptanceGate(report);
     } catch (err) {
       const message = String(err);
       setError(message);
-      setAcceptanceGate({
-        filePath: preview?.file_path ?? "unknown",
+      setAcceptanceGate(buildFailedGateReport(preview?.file_path ?? "unknown", message));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function runPerfSweep() {
+    await refreshRuntimeHealth();
+    if (memoryGuardRef.current) {
+      setError("Memory panic circuit is active; perf sweep is blocked.");
+      return;
+    }
+
+    const runCount = clampPerfSweepRuns(perfSweepRunsInput);
+    setPerfSweepRunsInput(String(runCount));
+    setLoading(true);
+    setError(null);
+    setPerfSweepReport(null);
+
+    try {
+      let targetFile = preview?.file_path ?? null;
+      if (!targetFile) {
+        targetFile = await pickParquetFile();
+      }
+      if (!targetFile) {
+        return;
+      }
+
+      const runs: AcceptanceGateReport[] = [];
+      for (let index = 0; index < runCount; index += 1) {
+        try {
+          const report = await evaluateAcceptanceGateForFile(targetFile);
+          runs.push(report);
+          setAcceptanceGate(report);
+        } catch (err) {
+          const failed = buildFailedGateReport(targetFile, String(err));
+          runs.push(failed);
+          setAcceptanceGate(failed);
+        }
+
+        await refreshRuntimeHealth();
+        if (memoryGuardRef.current) {
+          setError("Memory panic circuit tripped during perf sweep. Sweep stopped early.");
+          break;
+        }
+      }
+
+      const firstViewportSamples = runs
+        .map((run) => run.firstViewportMs)
+        .filter((value): value is number => value !== null);
+      const perspectiveSamples = runs
+        .map((run) => run.perspectiveReadyMs)
+        .filter((value): value is number => value !== null);
+      const passCount = runs.filter((run) => run.passed).length;
+      const failCount = runs.length - passCount;
+      const summary: PerfSweepSummary = {
+        filePath: targetFile,
         evaluatedAt: new Date().toISOString(),
-        firstViewportMs: firstViewportMs,
-        perspectiveReadyMs: perspectiveReadyMs,
-        firstViewportPass: firstViewportMs !== null && firstViewportMs <= FIRST_VIEWPORT_TARGET_MS,
-        perspectivePass: false,
-        perspectiveStatus: "error",
-        passed: false,
-        details: message,
-      });
+        runCount,
+        completedRuns: runs.length,
+        passCount,
+        failCount,
+        firstViewportP50: percentile(firstViewportSamples, 0.5),
+        firstViewportP95: percentile(firstViewportSamples, 0.95),
+        perspectiveReadyP50: percentile(perspectiveSamples, 0.5),
+        perspectiveReadyP95: percentile(perspectiveSamples, 0.95),
+        perspectiveReadySamples: perspectiveSamples.length,
+        runs,
+      };
+      setPerfSweepReport(summary);
+    } catch (err) {
+      setError(String(err));
     } finally {
       setLoading(false);
     }
@@ -1474,7 +1660,7 @@ function App() {
     <main className="app-shell">
       <header className="topbar">
         <h1>Parq-Bench</h1>
-        <span className="phase">Phase 1 Viewer</span>
+        <span className="phase">Phase 3 Hardening</span>
       </header>
 
       <section className="card">
@@ -1485,6 +1671,22 @@ function App() {
           <button type="button" onClick={() => void runAcceptanceGate()} disabled={loading || memoryGuardActive}>
             {loading ? "Running..." : "Run Acceptance Gate"}
           </button>
+          <div className="perf-sweep-controls">
+            <label htmlFor="perf-sweep-runs">Runs</label>
+            <input
+              id="perf-sweep-runs"
+              type="number"
+              className="perf-sweep-input"
+              min={PERF_SWEEP_MIN_RUNS}
+              max={PERF_SWEEP_MAX_RUNS}
+              value={perfSweepRunsInput}
+              onChange={(event) => setPerfSweepRunsInput(event.currentTarget.value)}
+              disabled={loading || memoryGuardActive}
+            />
+            <button type="button" onClick={() => void runPerfSweep()} disabled={loading || memoryGuardActive}>
+              {loading ? "Running..." : "Run Perf Sweep"}
+            </button>
+          </div>
           <button
             type="button"
             onClick={() =>
@@ -1557,6 +1759,52 @@ function App() {
             | File: {acceptanceGate.filePath}
             {acceptanceGate.details ? ` | Detail: ${acceptanceGate.details}` : ""}
           </div>
+        ) : null}
+        {perfSweepReport ? (
+          <div className={perfSweepReport.failCount === 0 ? "gate-report gate-pass" : "gate-report gate-fail"}>
+            Perf Sweep {perfSweepReport.failCount === 0 ? "PASS" : "FAIL"} | Runs:{" "}
+            {perfSweepReport.completedRuns}/{perfSweepReport.runCount} | Pass: {perfSweepReport.passCount} | First
+            p50/p95:{" "}
+            {perfSweepReport.firstViewportP50 === null
+              ? "n/a"
+              : `${perfSweepReport.firstViewportP50.toFixed(0)}ms / ${perfSweepReport.firstViewportP95?.toFixed(0) ?? "n/a"}ms`}{" "}
+            | Perspective p50/p95:{" "}
+            {perfSweepReport.perspectiveReadyP50 === null
+              ? "n/a"
+              : `${perfSweepReport.perspectiveReadyP50.toFixed(0)}ms / ${perfSweepReport.perspectiveReadyP95?.toFixed(0) ?? "n/a"}ms`}{" "}
+            | File: {perfSweepReport.filePath}
+          </div>
+        ) : null}
+        {perfSweepReport ? (
+          <details className="sweep-runs">
+            <summary>Perf Sweep Runs</summary>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Run</th>
+                    <th>First viewport (ms)</th>
+                    <th>Perspective (ms)</th>
+                    <th>Status</th>
+                    <th>Gate</th>
+                    <th>Detail</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {perfSweepReport.runs.map((run, index) => (
+                    <tr key={`perf-run-${run.evaluatedAt}-${index}`}>
+                      <td>{index + 1}</td>
+                      <td>{run.firstViewportMs === null ? "n/a" : run.firstViewportMs.toFixed(1)}</td>
+                      <td>{run.perspectiveReadyMs === null ? "n/a" : run.perspectiveReadyMs.toFixed(1)}</td>
+                      <td>{run.perspectiveStatus}</td>
+                      <td>{run.passed ? "PASS" : "FAIL"}</td>
+                      <td>{run.details || "-"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
         ) : null}
 
         {error ? <p className="error">{error}</p> : null}

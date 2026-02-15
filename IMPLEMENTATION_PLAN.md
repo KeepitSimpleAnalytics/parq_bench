@@ -143,3 +143,14 @@ Acceptance criteria:
 5. Add chart configuration flow for query results in Perspective. `COMPLETED`
 6. Add schema diff workflow between workspace aliases. `COMPLETED`
 7. Add workspace SQL export actions (CSV + Parquet). `COMPLETED`
+
+## 12) Phase 3 kickoff snapshot
+1. Add repeatable perf sweep harness in UI (`Run Perf Sweep`) with configurable run count and per-run gate telemetry. `COMPLETED`
+2. Add p50/p95 summary metrics and pass-rate reporting for first viewport and Perspective readiness. `COMPLETED`
+3. Extend JSON/CSV export payloads with perf sweep summary + run history rows. `COMPLETED`
+4. Run perf sweeps on representative files and set regression thresholds from observed p95 values (`first viewport p95 <= 400ms`, `Perspective p95 <= 1000ms`, `failCount = 0`). `COMPLETED`
+5. Implement deterministic nested-column flattening in backend (`struct.field` expansion, collection fallback as string) for preview/workspace schema paths. `COMPLETED`
+6. Build DuckDB compatibility matrix runner over fixture corpus with schema/read/query/export checks and JSON report output. `COMPLETED`
+7. Wire compatibility matrix into release gate command + CI workflow (`npm run release:gate`, GitHub Actions on push/PR to `main`). `COMPLETED`
+8. Pin and document explicit DuckDB upgrade policy with matrix revalidation requirements (`docs/duckdb-upgrade-policy.md`). `COMPLETED`
+9. Next: cut Phase 3 hardening release candidate and run final manual UX regression before Phase 4/UI iteration. `PENDING`

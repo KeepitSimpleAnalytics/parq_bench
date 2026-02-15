@@ -1,0 +1,263 @@
+{
+  "generated_at": "unix:1771173649s",
+  "duckdb_version": "v1.4.4",
+  "fixtures_dir": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet",
+  "total_files": 5,
+  "pass_count": 5,
+  "fail_count": 0,
+  "results": [
+    {
+      "file_name": "flat_small.parquet",
+      "file_path": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\flat_small.parquet",
+      "file_size_bytes": 422388,
+      "row_count": 50000,
+      "column_count": 7,
+      "nested_column_count": 0,
+      "schema_check_pass": true,
+      "read_count_pass": true,
+      "sample_query_pass": true,
+      "export_csv_pass": true,
+      "export_parquet_pass": true,
+      "passed": true,
+      "error": null,
+      "schema": [
+        {
+          "name": "row_id",
+          "duckdb_type": "BIGINT"
+        },
+        {
+          "name": "flow_id",
+          "duckdb_type": "VARCHAR"
+        },
+        {
+          "name": "destination_port",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "flow_duration",
+          "duckdb_type": "BIGINT"
+        },
+        {
+          "name": "score",
+          "duckdb_type": "DOUBLE"
+        },
+        {
+          "name": "is_attack",
+          "duckdb_type": "BOOLEAN"
+        },
+        {
+          "name": "event_ts",
+          "duckdb_type": "TIMESTAMP"
+        }
+      ]
+    },
+    {
+      "file_name": "flat_wide.parquet",
+      "file_path": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\flat_wide.parquet",
+      "file_size_bytes": 65881,
+      "row_count": 30000,
+      "column_count": 22,
+      "nested_column_count": 0,
+      "schema_check_pass": true,
+      "read_count_pass": true,
+      "sample_query_pass": true,
+      "export_csv_pass": true,
+      "export_parquet_pass": true,
+      "passed": true,
+      "error": null,
+      "schema": [
+        {
+          "name": "row_id",
+          "duckdb_type": "BIGINT"
+        },
+        {
+          "name": "c01",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c02",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c03",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c04",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c05",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c06",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c07",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c08",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c09",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c10",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c11",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c12",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c13",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c14",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c15",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c16",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c17",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c18",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c19",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "c20",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "payload",
+          "duckdb_type": "VARCHAR"
+        }
+      ]
+    },
+    {
+      "file_name": "nested_collections.parquet",
+      "file_path": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\nested_collections.parquet",
+      "file_size_bytes": 143669,
+      "row_count": 15000,
+      "column_count": 3,
+      "nested_column_count": 2,
+      "schema_check_pass": true,
+      "read_count_pass": true,
+      "sample_query_pass": true,
+      "export_csv_pass": true,
+      "export_parquet_pass": true,
+      "passed": true,
+      "error": null,
+      "schema": [
+        {
+          "name": "row_id",
+          "duckdb_type": "BIGINT"
+        },
+        {
+          "name": "tag_map",
+          "duckdb_type": "MAP(VARCHAR, BIGINT)"
+        },
+        {
+          "name": "events",
+          "duckdb_type": "STRUCT(code VARCHAR, \"value\" BIGINT)[]"
+        }
+      ]
+    },
+    {
+      "file_name": "nested_struct.parquet",
+      "file_path": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\nested_struct.parquet",
+      "file_size_bytes": 207560,
+      "row_count": 40000,
+      "column_count": 3,
+      "nested_column_count": 2,
+      "schema_check_pass": true,
+      "read_count_pass": true,
+      "sample_query_pass": true,
+      "export_csv_pass": true,
+      "export_parquet_pass": true,
+      "passed": true,
+      "error": null,
+      "schema": [
+        {
+          "name": "row_id",
+          "duckdb_type": "BIGINT"
+        },
+        {
+          "name": "flow",
+          "duckdb_type": "STRUCT(src_ip VARCHAR, src_port BIGINT, metrics STRUCT(flow_duration BIGINT, packet_count INTEGER, score DOUBLE))"
+        },
+        {
+          "name": "hops",
+          "duckdb_type": "INTEGER[]"
+        }
+      ]
+    },
+    {
+      "file_name": "perf_medium.parquet",
+      "file_path": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\perf_medium.parquet",
+      "file_size_bytes": 3227278,
+      "row_count": 500000,
+      "column_count": 7,
+      "nested_column_count": 1,
+      "schema_check_pass": true,
+      "read_count_pass": true,
+      "sample_query_pass": true,
+      "export_csv_pass": true,
+      "export_parquet_pass": true,
+      "passed": true,
+      "error": null,
+      "schema": [
+        {
+          "name": "row_id",
+          "duckdb_type": "BIGINT"
+        },
+        {
+          "name": "user_id",
+          "duckdb_type": "VARCHAR"
+        },
+        {
+          "name": "destination_port",
+          "duckdb_type": "INTEGER"
+        },
+        {
+          "name": "flow_duration",
+          "duckdb_type": "BIGINT"
+        },
+        {
+          "name": "anomaly_score",
+          "duckdb_type": "DOUBLE"
+        },
+        {
+          "name": "bins",
+          "duckdb_type": "INTEGER[]"
+        },
+        {
+          "name": "event_ts",
+          "duckdb_type": "TIMESTAMP"
+        }
+      ]
+    }
+  ]
+}
