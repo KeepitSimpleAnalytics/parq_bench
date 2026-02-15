@@ -253,6 +253,12 @@ table {
 .perspective-viewer {
   width: 100%;
   height: 100%;
+  --plugin--background: #f7faf7;
+  --d3fc-series: #1f77b4;
+  --d3fc-gridline--color: #d5dfd5;
+  --d3fc-full--gradient: linear-gradient(#1f77b4 0%, #9ecae1 100%);
+  --d3fc-positive--gradient: linear-gradient(#2ca02c 0%, #98df8a 100%);
+  --d3fc-negative--gradient: linear-gradient(#d62728 0%, #ff9896 100%);
 }
 
 .diagnostics {

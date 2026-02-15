@@ -15,6 +15,8 @@ const COLUMN_WIDTH = 180;
 const FIRST_VIEWPORT_TARGET_MS = 500;
 const PERSPECTIVE_READY_TARGET_MS = 3000;
 const ACCEPTANCE_GATE_TIMEOUT_MS = 15000;
+const PERSPECTIVE_RESTORE_TIMEOUT_DEFAULT_MS = 8000;
+const PERSPECTIVE_RESTORE_TIMEOUT_CHART_MS = 20000;
 const PERF_SWEEP_MIN_RUNS = 2;
 const PERF_SWEEP_MAX_RUNS = 25;
 const PERF_SWEEP_DEFAULT_RUNS = 5;
@@ -131,7 +133,7 @@ type WorkspaceQueryResponse = {
   rows: Array<Array<string | null>>;
 };
 
-type WorkspaceChartPlugin = "Datagrid" | "Y Bar" | "X Bar" | "Line" | "Treemap";
+type WorkspaceChartPlugin = "Datagrid" | "Y Bar" | "X Bar" | "Y Line" | "Treemap";
 
 type WorkspaceSchemaDiffColumn = {
   name: string;
@@ -606,6 +608,20 @@ function App() {
     return value;
   }
 
+  function perspectiveRestoreTimeoutMs(restoreConfig: Record<string, unknown>): number {
+    const plugin = String(restoreConfig.plugin ?? "");
+    if (
+      plugin === "Treemap" ||
+      plugin === "Y Bar" ||
+      plugin === "X Bar" ||
+      plugin === "Y Line" ||
+      plugin === "Line"
+    ) {
+      return PERSPECTIVE_RESTORE_TIMEOUT_CHART_MS;
+    }
+    return PERSPECTIVE_RESTORE_TIMEOUT_DEFAULT_MS;
+  }
+
   async function ensurePerspectiveRuntime(setStage: (stage: string) => void) {
     if (!perspectiveRuntimeInitRef.current) {
       perspectiveRuntimeInitRef.current = (async () => {
@@ -640,6 +656,11 @@ function App() {
         await withTimeout(
           "perspective-viewer-datagrid import",
           import("@finos/perspective-viewer-datagrid"),
+        );
+        setStage("d3fc.import");
+        await withTimeout(
+          "perspective-viewer-d3fc import",
+          import("@finos/perspective-viewer-d3fc"),
         );
         setStage("custom-element");
         await withTimeout(
@@ -709,7 +730,8 @@ function App() {
       await withTimeout("viewer.load()", viewer.load(table));
       stage = "viewer.restore";
       setPerspectiveStage(stage);
-      await withTimeout("viewer.restore()", viewer.restore(restoreConfig));
+      const restoreTimeoutMs = perspectiveRestoreTimeoutMs(restoreConfig);
+      await withTimeout("viewer.restore()", viewer.restore(restoreConfig), restoreTimeoutMs);
       if (previousTable?.delete) {
         try {
           await previousTable.delete();
@@ -731,10 +753,15 @@ function App() {
       }
       setViewMode("perspective");
     } catch (err) {
+      const plugin = String(restoreConfig.plugin ?? "");
+      const timeoutHint =
+        stage === "viewer.restore" && String(err).includes("timed out")
+          ? ` Try a lower-cardinality X column or reduce row count before using ${plugin}.`
+          : "";
       setPerspectiveStatus("error");
       setPerspectiveStage("error");
-      setPerspectiveError(`stage=${stage} ${String(err)}`);
-      setError(`Perspective error: stage=${stage} ${String(err)}`);
+      setPerspectiveError(`stage=${stage} ${String(err)}${timeoutHint}`);
+      setError(`Perspective error: stage=${stage} ${String(err)}${timeoutHint}`);
       setViewMode("virtual");
     }
   }
@@ -2155,7 +2182,7 @@ function App() {
                 <option value="Datagrid">Datagrid</option>
                 <option value="Y Bar">Y Bar</option>
                 <option value="X Bar">X Bar</option>
-                <option value="Line">Line</option>
+                <option value="Y Line">Y Line</option>
                 <option value="Treemap">Treemap</option>
               </select>
             </label>
