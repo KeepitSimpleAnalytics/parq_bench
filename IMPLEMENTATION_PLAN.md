@@ -175,3 +175,23 @@ Goal: improve day-to-day usability and layout reliability while preserving perfo
    - Manual regression checklist passes (preview/virtual/perspective, workspace SQL/chart/export, gate/perf sweep, layout persistence).
    - No new regressions in Rust tests, compatibility matrix, or release gate.
    - Plan docs updated with measured results and RC notes. `COMPLETED`
+
+## 14) Phase 5 reliability and release-readiness slice
+Goal: convert Phase 4 hardening baseline into repeatable release confidence across longer sessions and larger datasets.
+
+1. Long-session reliability soak:
+   - Run 30-60 minute interactive soak with repeated layout switches (`default`, `pq-view`, `pq-sql`, `slo-mo`) and perspective toggles.
+   - Track and classify any transient perspective restore/init errors. `PENDING`
+2. Extended performance coverage:
+   - Run 5-run perf sweeps on at least two additional representative large files.
+   - Record p50/p95/failCount results in this plan for trend tracking. `PENDING`
+3. Startup and dev-loop efficiency:
+   - Document expected first-run compile/link behavior for `tauri dev` and release gate stages.
+   - Add practical guidance to avoid duplicate cargo lock contention during local validation. `PENDING`
+4. Release artifact readiness:
+   - Verify app metadata and identity consistency (`Parq-Bench` title/productName/identifier/package names).
+   - Ensure release-gate outputs are reproducible from a clean shell session. `PENDING`
+5. Phase 5 exit criteria:
+   - Soak run completes without unhandled runtime failures.
+   - Perf thresholds remain green across expanded file set.
+   - Release gate passes from clean session and docs are updated with measured results. `PENDING`
