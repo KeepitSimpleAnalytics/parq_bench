@@ -1253,6 +1253,31 @@ function App() {
     return PERSPECTIVE_RESTORE_TIMEOUT_DEFAULT_MS;
   }
 
+  async function waitForPerspectiveViewerReady(timeoutMs = 3000): Promise<
+    HTMLElement & {
+      load: (table: unknown) => Promise<void>;
+      restore: (config: unknown) => Promise<void>;
+    }
+  > {
+    const started = performance.now();
+    while (performance.now() - started < timeoutMs) {
+      const viewer = perspectiveViewerRef.current as
+        | (HTMLElement & {
+            load?: (table: unknown) => Promise<void>;
+            restore?: (config: unknown) => Promise<void>;
+          })
+        | null;
+      if (viewer && typeof viewer.load === "function" && typeof viewer.restore === "function") {
+        return viewer as HTMLElement & {
+          load: (table: unknown) => Promise<void>;
+          restore: (config: unknown) => Promise<void>;
+        };
+      }
+      await waitForNextPaint();
+    }
+    throw new Error("Perspective viewer did not initialize.");
+  }
+
   async function ensurePerspectiveRuntime(setStage: (stage: string) => void) {
     if (!perspectiveRuntimeInitRef.current) {
       perspectiveRuntimeInitRef.current = (async () => {
@@ -1340,16 +1365,9 @@ function App() {
         throw new Error("Perspective runtime is unavailable after initialization.");
       }
 
-      const viewer = perspectiveViewerRef.current as
-        | (HTMLElement & {
-            load?: (table: unknown) => Promise<void>;
-            restore?: (config: unknown) => Promise<void>;
-          })
-        | null;
-
-      if (!viewer || !viewer.load || !viewer.restore) {
-        throw new Error("Perspective viewer did not initialize.");
-      }
+      stage = "viewer.ready";
+      setPerspectiveStage(stage);
+      const viewer = await withTimeout("viewer.ready()", waitForPerspectiveViewerReady(), 5000);
 
       const previousTable = perspectiveTableRef.current;
 

@@ -181,7 +181,7 @@ Goal: convert Phase 4 hardening baseline into repeatable release confidence acro
 
 1. Long-session reliability soak:
    - Run 30-60 minute interactive soak with repeated layout switches (`default`, `pq-view`, `pq-sql`, `slo-mo`) and perspective toggles.
-   - Track and classify any transient perspective restore/init errors. `PENDING`
+   - Track and classify any transient perspective restore/init errors. `IN PROGRESS` (fixed transient `Perspective viewer did not initialize` race; post-fix gate PASS on `perf_medium.parquet`: first viewport `135ms`, Perspective `463ms`)
 2. Extended performance coverage:
    - Run 5-run perf sweeps on at least two additional representative large files.
    - Record p50/p95/failCount results in this plan for trend tracking. `PENDING`
