@@ -184,7 +184,7 @@ Goal: convert Phase 4 hardening baseline into repeatable release confidence acro
    - Track and classify any transient perspective restore/init errors. `IN PROGRESS` (fixed transient `Perspective viewer did not initialize` race; post-fix gate PASS on `perf_medium.parquet`: first viewport `135ms`, Perspective `463ms`)
 2. Extended performance coverage:
    - Run 5-run perf sweeps on at least two additional representative large files.
-   - Record p50/p95/failCount results in this plan for trend tracking. `IN PROGRESS` (representative run set shows single cold-start outlier: run1 first `919ms`, Perspective `1349ms`; runs 2-5 passed. `praxis_2023_data.parquet` sweep PASS: first p95 `353ms`, Perspective p95 `720ms`, failCount `0`)
+   - Record p50/p95/failCount results in this plan for trend tracking. `COMPLETED` (`praxis_2023_data.parquet` sweep PASS: first p95 `353ms`, Perspective p95 `720ms`, failCount `0`; `2017_raw_data.parquet` sweep PASS: first p95 `384ms`, Perspective p95 `650ms`, failCount `0`; earlier cold-start outlier retained as caveat)
 3. Startup and dev-loop efficiency:
    - Document expected first-run compile/link behavior for `tauri dev` and release gate stages.
    - Add practical guidance to avoid duplicate cargo lock contention during local validation. `COMPLETED` (documented operational guidance: avoid overlapping `cargo` runs, prefer single staged gate execution, expect long first link stage on Windows + bundled DuckDB)
