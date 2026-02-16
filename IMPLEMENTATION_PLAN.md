@@ -181,7 +181,7 @@ Goal: convert Phase 4 hardening baseline into repeatable release confidence acro
 
 1. Long-session reliability soak:
    - Run 30-60 minute interactive soak with repeated layout switches (`default`, `pq-view`, `pq-sql`, `slo-mo`) and perspective toggles.
-   - Track and classify any transient perspective restore/init errors. `IN PROGRESS` (fixed transient `Perspective viewer did not initialize` race; post-fix gate PASS on `perf_medium.parquet`: first viewport `135ms`, Perspective `463ms`)
+   - Track and classify any transient perspective restore/init errors. `COMPLETED` (fixed transient `Perspective viewer did not initialize` race; post-fix gate PASS on `perf_medium.parquet`: first viewport `135ms`, Perspective `463ms`; soak confirmation: no additional runtime failures)
 2. Extended performance coverage:
    - Run 5-run perf sweeps on at least two additional representative large files.
    - Record p50/p95/failCount results in this plan for trend tracking. `COMPLETED` (`praxis_2023_data.parquet` sweep PASS: first p95 `353ms`, Perspective p95 `720ms`, failCount `0`; `2017_raw_data.parquet` sweep PASS: first p95 `384ms`, Perspective p95 `650ms`, failCount `0`; earlier cold-start outlier retained as caveat)
@@ -194,4 +194,4 @@ Goal: convert Phase 4 hardening baseline into repeatable release confidence acro
 5. Phase 5 exit criteria:
    - Soak run completes without unhandled runtime failures.
    - Perf thresholds remain green across expanded file set (allowing explicit cold-start variance caveat until optional prewarm policy is adopted).
-   - Release gate passes from clean session and docs are updated with measured results. `IN PROGRESS`
+   - Release gate passes from clean session and docs are updated with measured results. `COMPLETED`
