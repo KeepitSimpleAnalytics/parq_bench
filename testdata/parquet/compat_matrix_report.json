@@ -1,5 +1,5 @@
 {
-  "generated_at": "unix:1771173649s",
+  "generated_at": "unix:1771210399s",
   "duckdb_version": "v1.4.4",
   "fixtures_dir": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet",
   "total_files": 5,

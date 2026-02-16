@@ -76,11 +76,28 @@ struct FlattenedColumn {
     select_expr: String,
 }
 
+#[derive(Clone, Copy)]
+enum WorkspaceSourceKind {
+    Parquet,
+    Delimited,
+}
+
+impl WorkspaceSourceKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Parquet => "parquet",
+            Self::Delimited => "delimited",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct WorkspaceTableRegistration {
     alias: String,
     file_path: String,
     is_glob: bool,
+    source_kind: WorkspaceSourceKind,
+    delimiter: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -88,6 +105,8 @@ struct WorkspaceTableInfo {
     alias: String,
     file_path: String,
     is_glob: bool,
+    source_kind: String,
+    delimiter: Option<String>,
     file_size_bytes: Option<u64>,
 }
 
@@ -367,7 +386,11 @@ fn parse_struct_fields(duckdb_type: &str) -> Option<Vec<(String, String)>> {
     Some(fields)
 }
 
-fn describe_columns(conn: &Connection, describe_sql: &str, context: &str) -> Result<Vec<ParquetSchemaColumn>, String> {
+fn describe_columns(
+    conn: &Connection,
+    describe_sql: &str,
+    context: &str,
+) -> Result<Vec<ParquetSchemaColumn>, String> {
     let mut schema_stmt = conn
         .prepare(describe_sql)
         .map_err(|e| format!("prepare {context}: {e}"))?;
@@ -435,7 +458,10 @@ fn append_flattened_column(
     Ok(())
 }
 
-fn flattened_columns_for_source(conn: &Connection, source: &str) -> Result<Vec<FlattenedColumn>, String> {
+fn flattened_columns_for_source(
+    conn: &Connection,
+    source: &str,
+) -> Result<Vec<FlattenedColumn>, String> {
     let root_describe_sql = format!("DESCRIBE SELECT * FROM {source}");
     let root_schema = describe_columns(conn, &root_describe_sql, "source schema query")?;
     let mut flattened = Vec::<FlattenedColumn>::new();
@@ -570,6 +596,90 @@ fn is_valid_workspace_alias(alias: &str) -> bool {
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn parse_workspace_source_kind(source_kind: Option<String>) -> Result<WorkspaceSourceKind, String> {
+    let normalized = source_kind
+        .unwrap_or_else(|| "parquet".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "parquet" => Ok(WorkspaceSourceKind::Parquet),
+        "delimited" => Ok(WorkspaceSourceKind::Delimited),
+        _ => Err("Unsupported workspace source type. Use 'parquet' or 'delimited'.".to_string()),
+    }
+}
+
+fn default_delimiter_for_path(path: &str) -> char {
+    let lower = path.trim().to_ascii_lowercase();
+    if lower.ends_with(".tsv") {
+        '\t'
+    } else {
+        ','
+    }
+}
+
+fn parse_delimiter_char(raw: &str) -> Result<char, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Delimiter cannot be empty.".to_string());
+    }
+    match trimmed {
+        "\\t" => Ok('\t'),
+        "\\n" => Ok('\n'),
+        "\\r" => Ok('\r'),
+        _ => {
+            let mut chars = trimmed.chars();
+            let Some(first) = chars.next() else {
+                return Err("Delimiter cannot be empty.".to_string());
+            };
+            if chars.next().is_some() {
+                return Err(
+                    "Delimiter must be exactly one character (or escape: \\t, \\n, \\r)."
+                        .to_string(),
+                );
+            }
+            Ok(first)
+        }
+    }
+}
+
+fn resolve_workspace_delimiter(
+    source_kind: &WorkspaceSourceKind,
+    file_path: &str,
+    delimiter: Option<String>,
+) -> Result<Option<String>, String> {
+    match source_kind {
+        WorkspaceSourceKind::Parquet => Ok(None),
+        WorkspaceSourceKind::Delimited => {
+            let resolved = if let Some(raw) = delimiter {
+                if raw.trim().is_empty() {
+                    default_delimiter_for_path(file_path)
+                } else {
+                    parse_delimiter_char(&raw)?
+                }
+            } else {
+                default_delimiter_for_path(file_path)
+            };
+            Ok(Some(resolved.to_string()))
+        }
+    }
+}
+
+fn workspace_source_sql(table: &WorkspaceTableRegistration) -> String {
+    let path = escape_sql_string_literal(&table.file_path);
+    match table.source_kind {
+        WorkspaceSourceKind::Parquet => format!("read_parquet('{path}')"),
+        WorkspaceSourceKind::Delimited => {
+            let delimiter = table
+                .delimiter
+                .as_deref()
+                .and_then(|value| value.chars().next())
+                .unwrap_or_else(|| default_delimiter_for_path(&table.file_path));
+            let escaped_delim = escape_sql_literal(&delimiter.to_string());
+            format!("read_csv_auto('{path}', delim='{escaped_delim}')")
+        }
+    }
+}
+
 fn workspace_table_info(entry: &WorkspaceTableRegistration) -> WorkspaceTableInfo {
     let file_size_bytes = if entry.is_glob {
         None
@@ -580,6 +690,8 @@ fn workspace_table_info(entry: &WorkspaceTableRegistration) -> WorkspaceTableInf
         alias: entry.alias.clone(),
         file_path: entry.file_path.clone(),
         is_glob: entry.is_glob,
+        source_kind: entry.source_kind.as_str().to_string(),
+        delimiter: entry.delimiter.clone(),
         file_size_bytes,
     }
 }
@@ -590,8 +702,7 @@ fn apply_workspace_tables(
 ) -> Result<(), String> {
     for table in tables {
         let ident = escape_sql_ident(&table.alias);
-        let path = escape_sql_string_literal(&table.file_path);
-        let source = format!("read_parquet('{path}')");
+        let source = workspace_source_sql(table);
         let flattened = flattened_columns_for_source(conn, &source)?;
         let projection = flattened_projection_sql(&flattened, false);
         conn.execute_batch(&format!(
@@ -683,7 +794,10 @@ fn export_workspace_query_to_file(
     Ok(())
 }
 
-fn table_schema_for_alias(conn: &Connection, alias: &str) -> Result<Vec<ParquetSchemaColumn>, String> {
+fn table_schema_for_alias(
+    conn: &Connection,
+    alias: &str,
+) -> Result<Vec<ParquetSchemaColumn>, String> {
     let ident = escape_sql_ident(alias);
     query_schema(conn, &format!("SELECT * FROM \"{ident}\""))
 }
@@ -772,7 +886,9 @@ fn rows_to_arrow_ipc(
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.len());
     for col_idx in 0..schema.len() {
-        let values = rows.iter().map(|row| row.get(col_idx).and_then(|value| value.as_deref()));
+        let values = rows
+            .iter()
+            .map(|row| row.get(col_idx).and_then(|value| value.as_deref()));
         let array = StringArray::from_iter(values);
         columns.push(Arc::new(array) as ArrayRef);
     }
@@ -888,13 +1004,17 @@ fn build_arrow_ipc_payload(size_mb: u32) -> Result<Vec<u8>, String> {
     writer
         .write(&batch)
         .map_err(|e| format!("write IPC batch: {e}"))?;
-    writer.finish().map_err(|e| format!("finish IPC stream: {e}"))?;
+    writer
+        .finish()
+        .map_err(|e| format!("finish IPC stream: {e}"))?;
 
     Ok(cursor.into_inner())
 }
 
 #[tauri::command]
-fn duckdb_smoke_query(state: tauri::State<'_, Arc<AppRuntimeState>>) -> Result<SmokeQueryResponse, String> {
+fn duckdb_smoke_query(
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<SmokeQueryResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
     let started = Instant::now();
     let conn = open_configured_duckdb(state.as_ref())?;
@@ -903,7 +1023,9 @@ fn duckdb_smoke_query(state: tauri::State<'_, Arc<AppRuntimeState>>) -> Result<S
         .map_err(|e| format!("query DuckDB version: {e}"))?;
 
     let mut stmt = conn
-        .prepare("SELECT id, label FROM (VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')) t(id, label)")
+        .prepare(
+            "SELECT id, label FROM (VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')) t(id, label)",
+        )
         .map_err(|e| format!("prepare smoke query: {e}"))?;
 
     let mapped_rows = stmt
@@ -957,7 +1079,9 @@ fn arrow_ipc_smoke_batch(state: tauri::State<'_, Arc<AppRuntimeState>>) -> Resul
     writer
         .write(&batch)
         .map_err(|e| format!("write IPC batch: {e}"))?;
-    writer.finish().map_err(|e| format!("finish IPC stream: {e}"))?;
+    writer
+        .finish()
+        .map_err(|e| format!("finish IPC stream: {e}"))?;
     let payload = cursor.into_inner();
     log_perf(
         "arrow_ipc_smoke_batch",
@@ -1227,6 +1351,8 @@ fn register_workspace_table(
     alias: String,
     file_path: String,
     is_glob: Option<bool>,
+    source_kind: Option<String>,
+    delimiter: Option<String>,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<WorkspaceTableInfo, String> {
     ensure_memory_guard_clear(state.as_ref())?;
@@ -1247,6 +1373,9 @@ fn register_workspace_table(
     if !use_glob && fs::metadata(trimmed_path).is_err() {
         return Err("Workspace file path does not exist.".to_string());
     }
+    let parsed_source_kind = parse_workspace_source_kind(source_kind)?;
+    let resolved_delimiter =
+        resolve_workspace_delimiter(&parsed_source_kind, trimmed_path, delimiter)?;
 
     let mut tables = state
         .workspace_tables
@@ -1256,6 +1385,8 @@ fn register_workspace_table(
         alias: trimmed_alias.to_string(),
         file_path: trimmed_path.to_string(),
         is_glob: use_glob,
+        source_kind: parsed_source_kind,
+        delimiter: resolved_delimiter,
     };
     if let Some(existing) = tables
         .iter_mut()
@@ -1402,7 +1533,9 @@ fn export_workspace_query(
     apply_workspace_tables(&conn, &tables)?;
     export_workspace_query_to_file(&conn, &normalized_sql, trimmed_path, &format)?;
 
-    let file_size_bytes = fs::metadata(trimmed_path).map(|meta| meta.len()).unwrap_or(0);
+    let file_size_bytes = fs::metadata(trimmed_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
     let elapsed_ms = started.elapsed().as_millis();
     let normalized_format = format.trim().to_ascii_lowercase();
     log_perf(
@@ -1466,12 +1599,8 @@ fn diff_workspace_schema(
     apply_workspace_tables(&conn, &tables)?;
     let left_schema = table_schema_for_alias(&conn, left_trimmed)?;
     let right_schema = table_schema_for_alias(&conn, right_trimmed)?;
-    let diff = build_workspace_schema_diff(
-        left_trimmed,
-        &left_schema,
-        right_trimmed,
-        &right_schema,
-    );
+    let diff =
+        build_workspace_schema_diff(left_trimmed, &left_schema, right_trimmed, &right_schema);
     log_perf(
         "diff_workspace_schema",
         &format!(
@@ -1490,15 +1619,12 @@ fn diff_workspace_schema(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_workspace_schema_diff,
-        compute_duckdb_memory_limit_bytes, compute_duckdb_threads, escape_sql_string_literal,
-        export_workspace_query_to_file,
-        normalize_single_sql_statement,
-        open_configured_duckdb, parquet_rows_page, parquet_schema, parquet_total_rows,
-        query_rows_with_limit, query_schema, start_socket_server_for_payload,
-        table_schema_for_alias,
-        apply_workspace_tables, AppRuntimeState, DUCKDB_MEMORY_CAP_BYTES,
-        WorkspaceTableRegistration, ParquetSchemaColumn,
+        apply_workspace_tables, build_workspace_schema_diff, compute_duckdb_memory_limit_bytes,
+        compute_duckdb_threads, escape_sql_string_literal, export_workspace_query_to_file,
+        normalize_single_sql_statement, open_configured_duckdb, parquet_rows_page, parquet_schema,
+        parquet_total_rows, query_rows_with_limit, query_schema, start_socket_server_for_payload,
+        table_schema_for_alias, AppRuntimeState, ParquetSchemaColumn, WorkspaceSourceKind,
+        WorkspaceTableRegistration, DUCKDB_MEMORY_CAP_BYTES,
     };
     use futures_util::StreamExt;
     use std::fs;
@@ -1592,11 +1718,12 @@ mod tests {
 
         let source = format!("read_parquet('{escaped_path}')");
         let schema = parquet_schema(&conn, &source).expect("load flattened parquet schema");
-        let names = schema.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
-        assert!(names.iter().any(|name| name == "flow.src_port"));
-        assert!(names
+        let names = schema
             .iter()
-            .any(|name| name == "flow.meta.duration_ms"));
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "flow.src_port"));
+        assert!(names.iter().any(|name| name == "flow.meta.duration_ms"));
         assert!(names.iter().any(|name| name == "ports"));
         let ports_col = schema
             .iter()
@@ -1700,16 +1827,21 @@ mod tests {
                 alias: "left_tbl".to_string(),
                 file_path: left_path.clone(),
                 is_glob: false,
+                source_kind: WorkspaceSourceKind::Parquet,
+                delimiter: None,
             },
             WorkspaceTableRegistration {
                 alias: "right_tbl".to_string(),
                 file_path: right_path.clone(),
                 is_glob: false,
+                source_kind: WorkspaceSourceKind::Parquet,
+                delimiter: None,
             },
         ];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
 
-        let sql = "SELECT l.id, l.tag, r.score FROM left_tbl l JOIN right_tbl r USING (id) ORDER BY l.id";
+        let sql =
+            "SELECT l.id, l.tag, r.score FROM left_tbl l JOIN right_tbl r USING (id) ORDER BY l.id";
         let schema = query_schema(&conn, sql).expect("workspace schema");
         let (rows, truncated) =
             query_rows_with_limit(&conn, sql, &schema, 10).expect("workspace query rows");
@@ -1741,6 +1873,8 @@ mod tests {
             alias: "traffic_tbl".to_string(),
             file_path: source_path.clone(),
             is_glob: false,
+            source_kind: WorkspaceSourceKind::Parquet,
+            delimiter: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
 
@@ -1771,14 +1905,17 @@ mod tests {
             alias: "traffic_tbl".to_string(),
             file_path: source_path.clone(),
             is_glob: false,
+            source_kind: WorkspaceSourceKind::Parquet,
+            delimiter: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
 
         let schema = table_schema_for_alias(&conn, "traffic_tbl").expect("table schema");
-        let names = schema.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
-        assert!(names
+        let names = schema
             .iter()
-            .any(|name| name == "flow.destination_port"));
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "flow.destination_port"));
         assert!(names
             .iter()
             .any(|name| name == "flow.metrics.flow_duration"));
@@ -1786,8 +1923,8 @@ mod tests {
 
         let sql = r#"SELECT "flow.destination_port", "flow.metrics.flow_duration", tags FROM traffic_tbl"#;
         let result_schema = query_schema(&conn, sql).expect("workspace flattened schema");
-        let (rows, truncated) =
-            query_rows_with_limit(&conn, sql, &result_schema, 10).expect("workspace flattened rows");
+        let (rows, truncated) = query_rows_with_limit(&conn, sql, &result_schema, 10)
+            .expect("workspace flattened rows");
         assert!(!truncated);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0].as_deref(), Some("443"));
@@ -1824,7 +1961,8 @@ mod tests {
             },
         ];
 
-        let diff = build_workspace_schema_diff("left_tbl", &left_schema, "right_tbl", &right_schema);
+        let diff =
+            build_workspace_schema_diff("left_tbl", &left_schema, "right_tbl", &right_schema);
         assert_eq!(diff.added_count, 1);
         assert_eq!(diff.removed_count, 0);
         assert_eq!(diff.type_changed_count, 1);
@@ -1852,6 +1990,8 @@ mod tests {
             alias: "exp_tbl".to_string(),
             file_path: source_path.clone(),
             is_glob: false,
+            source_kind: WorkspaceSourceKind::Parquet,
+            delimiter: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
 
@@ -1860,7 +2000,8 @@ mod tests {
         let parquet_path = unique_test_output_path("parquet");
 
         export_workspace_query_to_file(&conn, sql, &csv_path, "csv").expect("export csv");
-        export_workspace_query_to_file(&conn, sql, &parquet_path, "parquet").expect("export parquet");
+        export_workspace_query_to_file(&conn, sql, &parquet_path, "parquet")
+            .expect("export parquet");
 
         let csv_contents = fs::read_to_string(&csv_path).expect("read csv");
         assert!(csv_contents.contains("id,label"));
@@ -1870,6 +2011,68 @@ mod tests {
         let _ = fs::remove_file(&source_path);
         let _ = fs::remove_file(&csv_path);
         let _ = fs::remove_file(&parquet_path);
+    }
+
+    #[test]
+    fn workspace_query_reads_delimited_csv_with_default_comma() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+
+        let csv_path = unique_test_output_path("csv");
+        fs::write(&csv_path, "id,label\n1,alpha\n2,beta\n").expect("write csv fixture");
+
+        let tables = vec![WorkspaceTableRegistration {
+            alias: "csv_tbl".to_string(),
+            file_path: csv_path.clone(),
+            is_glob: false,
+            source_kind: WorkspaceSourceKind::Delimited,
+            delimiter: None,
+        }];
+        apply_workspace_tables(&conn, &tables).expect("apply csv workspace table");
+
+        let sql = "SELECT id, label FROM csv_tbl ORDER BY id";
+        let schema = query_schema(&conn, sql).expect("csv schema");
+        let (rows, truncated) =
+            query_rows_with_limit(&conn, sql, &schema, 10).expect("csv query rows");
+        assert!(!truncated);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_deref(), Some("1"));
+        assert_eq!(rows[0][1].as_deref(), Some("alpha"));
+        assert_eq!(rows[1][0].as_deref(), Some("2"));
+        assert_eq!(rows[1][1].as_deref(), Some("beta"));
+
+        let _ = fs::remove_file(&csv_path);
+    }
+
+    #[test]
+    fn workspace_query_reads_delimited_tsv_with_tab_delimiter() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+
+        let tsv_path = unique_test_output_path("tsv");
+        fs::write(&tsv_path, "id\tlabel\n1\talpha\n2\tbeta\n").expect("write tsv fixture");
+
+        let tables = vec![WorkspaceTableRegistration {
+            alias: "tsv_tbl".to_string(),
+            file_path: tsv_path.clone(),
+            is_glob: false,
+            source_kind: WorkspaceSourceKind::Delimited,
+            delimiter: Some("\t".to_string()),
+        }];
+        apply_workspace_tables(&conn, &tables).expect("apply tsv workspace table");
+
+        let sql = "SELECT id, label FROM tsv_tbl ORDER BY id";
+        let schema = query_schema(&conn, sql).expect("tsv schema");
+        let (rows, truncated) =
+            query_rows_with_limit(&conn, sql, &schema, 10).expect("tsv query rows");
+        assert!(!truncated);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_deref(), Some("1"));
+        assert_eq!(rows[0][1].as_deref(), Some("alpha"));
+        assert_eq!(rows[1][0].as_deref(), Some("2"));
+        assert_eq!(rows[1][1].as_deref(), Some("beta"));
+
+        let _ = fs::remove_file(&tsv_path);
     }
 
     fn unique_test_parquet_path() -> String {
@@ -1890,7 +2093,9 @@ mod tests {
             .unwrap_or(0);
         let thread_id = format!("{:?}", std::thread::current().id());
         let mut path = std::env::temp_dir();
-        path.push(format!("parq_bench_test_export_{nanos}_{thread_id}.{extension}"));
+        path.push(format!(
+            "parq_bench_test_export_{nanos}_{thread_id}.{extension}"
+        ));
         path.to_string_lossy().to_string()
     }
 }

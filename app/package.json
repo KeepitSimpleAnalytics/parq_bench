@@ -1,5 +1,5 @@
 {
-  "name": "app",
+  "name": "parq-bench",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -20,6 +20,7 @@
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-opener": "^2",
     "apache-arrow": "^21.1.0",
+    "flexlayout-react": "^0.8.18",
     "monaco-editor": "^0.55.1",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"

@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Editor, { type OnMount } from "@monaco-editor/react";
+import { Actions, Layout, Model, type Action, type IJsonModel, type TabNode } from "flexlayout-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { tableFromIPC } from "apache-arrow";
 import type * as Monaco from "monaco-editor";
+import "flexlayout-react/style/combined.css";
 import "./App.css";
 
 const PAGE_SIZE = 256;
@@ -118,10 +120,13 @@ type WorkspaceTableInfo = {
   alias: string;
   file_path: string;
   is_glob: boolean;
+  source_kind: "parquet" | "delimited";
+  delimiter: string | null;
   file_size_bytes: number | null;
 };
 
 type WorkspaceSchemaByAlias = Record<string, PreviewColumn[]>;
+type WorkspaceSourceKind = "parquet" | "delimited";
 
 type WorkspaceQueryResponse = {
   sql: string;
@@ -184,7 +189,604 @@ type ExportPayload = {
   perf_sweep: PerfSweepSummary | null;
 };
 
+type ThemeMode = "system" | "light" | "dark";
+type ResolvedTheme = "light" | "dark";
+type DockPanelComponent = "actions" | "preview" | "workspace" | "diagnostics";
+type ImportedLayoutPreview = {
+  sourceFile: string;
+  name: string;
+  model: IJsonModel;
+  tabCount: number;
+  panelCounts: Array<{ component: string; count: number }>;
+  unknownPanels: string[];
+};
+type SavedLayout = {
+  id: string;
+  name: string;
+  model: IJsonModel;
+};
+type StoredLayoutPrefs = {
+  version: 1;
+  active_layout_id: string;
+  layouts: SavedLayout[];
+};
+
+const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";
+const UI_LAYOUT_STORAGE_KEY = "parqbench.ui.layouts.v1";
+const UI_LAYOUT_RECOVERY_STORAGE_KEY = "parqbench.ui.layouts.recovery.v1";
+const UI_LAYOUT_EDIT_STORAGE_KEY = "parqbench.ui.layout_edit_enabled";
+const UI_WORKSPACE_SLOW_MODE_STORAGE_KEY = "parqbench.ui.workspace_slow_mode_enabled";
+const DEFAULT_LAYOUT_ID = "default";
+const PQ_VIEW_LAYOUT_ID = "pq_view";
+const PQ_SQL_LAYOUT_ID = "pq_sql";
+const SLO_MO_LAYOUT_ID = "slo_mo";
+
+const DEFAULT_LAYOUT_MODEL: IJsonModel = {
+  global: {
+    rootOrientationVertical: true,
+    tabSetEnableClose: false,
+    tabSetEnableDeleteWhenEmpty: true,
+    tabSetEnableDrag: true,
+    tabSetEnableDrop: true,
+    tabSetEnableDivide: true,
+    tabSetEnableSingleTabStretch: false,
+    tabSetEnableTabStrip: true,
+    tabEnableClose: false,
+    tabEnableDrag: true,
+    tabEnablePopout: false,
+    tabEnableRenderOnDemand: false,
+  },
+  borders: [],
+  layout: {
+    type: "row",
+    children: [
+      {
+        type: "tabset",
+        weight: 16,
+        enableClose: false,
+        enableDeleteWhenEmpty: true,
+        enableMaximize: false,
+        children: [{ type: "tab", component: "actions", name: "Actions", enableClose: false, enableDrag: true }],
+      },
+      {
+        type: "tabset",
+        weight: 40,
+        enableClose: false,
+        enableDeleteWhenEmpty: true,
+        children: [{ type: "tab", component: "preview", name: "Preview", enableClose: false }],
+      },
+      {
+        type: "tabset",
+        weight: 30,
+        enableClose: false,
+        enableDeleteWhenEmpty: true,
+        children: [{ type: "tab", component: "workspace", name: "Workspace", enableClose: false }],
+      },
+      {
+        type: "tabset",
+        weight: 14,
+        enableDeleteWhenEmpty: true,
+        children: [{ type: "tab", component: "diagnostics", name: "Diagnostics", enableClose: true }],
+      },
+    ],
+  },
+};
+
+const PQ_VIEW_LAYOUT_MODEL: IJsonModel = {
+  global: {
+    rootOrientationVertical: true,
+    tabSetEnableClose: false,
+    tabSetEnableDeleteWhenEmpty: true,
+    tabSetEnableDrag: true,
+    tabSetEnableDrop: true,
+    tabSetEnableDivide: true,
+    tabSetEnableSingleTabStretch: false,
+    tabSetEnableTabStrip: true,
+    tabEnableClose: false,
+    tabEnableDrag: true,
+    tabEnablePopout: false,
+    tabEnableRenderOnDemand: false,
+  },
+  borders: [],
+  layout: {
+    type: "row",
+    children: [
+      {
+        type: "tabset",
+        weight: 18,
+        enableClose: false,
+        enableDeleteWhenEmpty: true,
+        enableMaximize: false,
+        children: [{ type: "tab", component: "actions", name: "Actions", enableClose: false, enableDrag: true }],
+      },
+      {
+        type: "tabset",
+        weight: 68,
+        enableClose: false,
+        enableDeleteWhenEmpty: true,
+        children: [{ type: "tab", component: "preview", name: "Preview", enableClose: false }],
+      },
+      {
+        type: "tabset",
+        weight: 14,
+        enableDeleteWhenEmpty: true,
+        children: [{ type: "tab", component: "diagnostics", name: "Diagnostics", enableClose: true }],
+      },
+    ],
+  },
+};
+
+const PQ_SQL_LAYOUT_MODEL: IJsonModel = {
+  global: {
+    rootOrientationVertical: true,
+    tabSetEnableClose: false,
+    tabSetEnableDeleteWhenEmpty: true,
+    tabSetEnableDrag: true,
+    tabSetEnableDrop: true,
+    tabSetEnableDivide: true,
+    tabSetEnableSingleTabStretch: false,
+    tabSetEnableTabStrip: true,
+    tabEnableClose: false,
+    tabEnableDrag: true,
+    tabEnablePopout: false,
+    tabEnableRenderOnDemand: false,
+  },
+  borders: [],
+  layout: {
+    type: "row",
+    children: [
+      {
+        type: "tabset",
+        weight: 16,
+        enableClose: false,
+        enableDeleteWhenEmpty: true,
+        enableMaximize: false,
+        children: [{ type: "tab", component: "actions", name: "Actions", enableClose: false, enableDrag: true }],
+      },
+      {
+        type: "tabset",
+        weight: 68,
+        enableClose: false,
+        enableDeleteWhenEmpty: true,
+        children: [{ type: "tab", component: "workspace", name: "Workspace", enableClose: false }],
+      },
+      {
+        type: "tabset",
+        weight: 16,
+        enableDeleteWhenEmpty: true,
+        children: [{ type: "tab", component: "diagnostics", name: "Diagnostics", enableClose: true }],
+      },
+    ],
+  },
+};
+
+const SLO_MO_LAYOUT_MODEL: IJsonModel = {
+  global: {
+    rootOrientationVertical: true,
+    tabSetEnableClose: false,
+    tabSetEnableDeleteWhenEmpty: true,
+    tabSetEnableDrag: true,
+    tabSetEnableDrop: true,
+    tabSetEnableDivide: true,
+    tabSetEnableSingleTabStretch: false,
+    tabSetEnableTabStrip: true,
+    tabEnableClose: false,
+    tabEnableDrag: true,
+    tabEnablePopout: false,
+    tabEnableRenderOnDemand: false,
+  },
+  borders: [],
+  layout: {
+    type: "row",
+    children: [
+      {
+        type: "tabset",
+        weight: 100,
+        enableClose: false,
+        enableDeleteWhenEmpty: true,
+        children: [{ type: "tab", component: "workspace", name: "Workspace", enableClose: false }],
+      },
+    ],
+  },
+};
+
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function pruneEmptyLayoutNode(node: unknown): Record<string, unknown> | null {
+  if (!isRecord(node)) {
+    return null;
+  }
+
+  if (Array.isArray(node.children)) {
+    const children = node.children
+      .map((child) => pruneEmptyLayoutNode(child))
+      .filter((child): child is Record<string, unknown> => child !== null);
+    node.children = children;
+  }
+
+  if (node.type === "tabset") {
+    return Array.isArray(node.children) && node.children.length > 0 ? node : null;
+  }
+
+  if (node.type === "row" || node.type === "column") {
+    return Array.isArray(node.children) && node.children.length > 0 ? node : null;
+  }
+
+  return node;
+}
+
+function normalizeLayoutModel(model: IJsonModel): IJsonModel {
+  const normalized = cloneJson(model);
+  const globalAttrs = (isRecord(normalized.global) ? normalized.global : {}) as Record<string, unknown>;
+  globalAttrs.tabSetEnableDeleteWhenEmpty = true;
+  globalAttrs.tabSetEnableDrag = true;
+  globalAttrs.tabSetEnableDrop = true;
+  globalAttrs.tabSetEnableDivide = true;
+  globalAttrs.tabSetEnableSingleTabStretch = false;
+  globalAttrs.tabSetEnableTabStrip = true;
+  globalAttrs.tabEnableDrag = true;
+  normalized.global = globalAttrs;
+
+  const walk = (node: unknown) => {
+    if (!isRecord(node)) {
+      return;
+    }
+    if (node.type === "tabset") {
+      node.enableDeleteWhenEmpty = true;
+      node.enableDrag = true;
+      node.enableDrop = true;
+      node.enableDivide = true;
+      node.enableTabStrip = true;
+    } else if (node.type === "tab" && typeof node.component === "string") {
+      node.enableDrag = true;
+    }
+    if (Array.isArray(node.children)) {
+      node.children.forEach(walk);
+    }
+  };
+
+  const normalizedLayout = pruneEmptyLayoutNode(normalized.layout);
+  normalized.layout = (normalizedLayout ?? cloneJson(DEFAULT_LAYOUT_MODEL.layout)) as IJsonModel["layout"];
+  walk(normalized.layout);
+  if (Array.isArray(normalized.borders)) {
+    const nextBorders = normalized.borders
+      .map((border) => pruneEmptyLayoutNode(border))
+      .filter((border): border is Record<string, unknown> => border !== null);
+    (normalized as unknown as { borders: unknown[] }).borders = nextBorders;
+    nextBorders.forEach(walk);
+  }
+
+  return normalized;
+}
+
+function buildFactoryLayouts(): SavedLayout[] {
+  return [
+    {
+      id: DEFAULT_LAYOUT_ID,
+      name: "Default",
+      model: normalizeLayoutModel(DEFAULT_LAYOUT_MODEL),
+    },
+    {
+      id: PQ_VIEW_LAYOUT_ID,
+      name: "pq-view",
+      model: normalizeLayoutModel(PQ_VIEW_LAYOUT_MODEL),
+    },
+    {
+      id: PQ_SQL_LAYOUT_ID,
+      name: "pq-sql",
+      model: normalizeLayoutModel(PQ_SQL_LAYOUT_MODEL),
+    },
+    {
+      id: SLO_MO_LAYOUT_ID,
+      name: "slo-mo",
+      model: normalizeLayoutModel(SLO_MO_LAYOUT_MODEL),
+    },
+  ];
+}
+
+function mergeFactoryLayouts(layouts: SavedLayout[]): SavedLayout[] {
+  const factory = buildFactoryLayouts();
+  const factoryIds = new Set(factory.map((layout) => layout.id));
+  const byId = new Map(layouts.map((layout) => [layout.id, layout]));
+  const mergedFactory = factory.map((layout) => byId.get(layout.id) ?? layout);
+  const custom = layouts.filter((layout) => !factoryIds.has(layout.id));
+  return [...mergedFactory, ...custom];
+}
+
+function defaultLayoutPrefs(): StoredLayoutPrefs {
+  return {
+    version: 1,
+    active_layout_id: DEFAULT_LAYOUT_ID,
+    layouts: buildFactoryLayouts(),
+  };
+}
+
+function recordLayoutRecovery(reason: string, detail: string) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  const event = {
+    at: new Date().toISOString(),
+    reason,
+    detail,
+  };
+  try {
+    window.localStorage.setItem(UI_LAYOUT_RECOVERY_STORAGE_KEY, JSON.stringify(event));
+  } catch {
+    // Ignore storage write failures and keep runtime functional.
+  }
+  console.warn(`[Parq-Bench][layout-recovery] ${reason}: ${detail}`);
+}
+
+function persistLayoutPrefs(prefs: StoredLayoutPrefs) {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.setItem(UI_LAYOUT_STORAGE_KEY, JSON.stringify(prefs));
+  } catch {
+    // Ignore storage write failures and keep runtime functional.
+  }
+}
+
+function canHydrateLayoutModel(model: IJsonModel): boolean {
+  try {
+    Model.fromJson(cloneJson(model));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function recoverDefaultLayoutPrefs(reason: string, detail: string): StoredLayoutPrefs {
+  const fallback = defaultLayoutPrefs();
+  recordLayoutRecovery(reason, detail);
+  persistLayoutPrefs(fallback);
+  return fallback;
+}
+
+function readLayoutPrefs(): StoredLayoutPrefs {
+  if (typeof window === "undefined") {
+    return defaultLayoutPrefs();
+  }
+  const raw = window.localStorage.getItem(UI_LAYOUT_STORAGE_KEY);
+  if (!raw) {
+    return defaultLayoutPrefs();
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<StoredLayoutPrefs>;
+    if (parsed.version !== 1 || !Array.isArray(parsed.layouts) || parsed.layouts.length === 0) {
+      return recoverDefaultLayoutPrefs(
+        "invalid_layout_prefs_shape",
+        "Stored layout payload failed version/layout list validation.",
+      );
+    }
+    const normalizedLayouts = parsed.layouts
+      .filter(
+        (layout): layout is SavedLayout =>
+          typeof layout.id === "string" &&
+          layout.id.trim().length > 0 &&
+          typeof layout.name === "string" &&
+          layout.name.trim().length > 0 &&
+          typeof layout.model === "object" &&
+          layout.model !== null,
+      )
+      .map((layout) => ({
+        ...layout,
+        model: normalizeLayoutModel(layout.model),
+      }));
+    const layouts = normalizedLayouts.filter((layout) => canHydrateLayoutModel(layout.model));
+    if (layouts.length !== normalizedLayouts.length) {
+      recordLayoutRecovery(
+        "dropped_invalid_layout_models",
+        `Dropped ${normalizedLayouts.length - layouts.length} saved layout(s) due to invalid model JSON.`,
+      );
+    }
+    if (layouts.length === 0) {
+      return recoverDefaultLayoutPrefs(
+        "no_valid_layout_models",
+        "No persisted layouts could be hydrated into runtime layout models.",
+      );
+    }
+    const mergedLayouts = mergeFactoryLayouts(layouts);
+    const active = mergedLayouts.some((layout) => layout.id === parsed.active_layout_id)
+      ? (parsed.active_layout_id as string)
+      : DEFAULT_LAYOUT_ID;
+    if (active !== parsed.active_layout_id) {
+      recordLayoutRecovery(
+        "invalid_active_layout_id",
+        "Active layout id missing; reset active layout to default.",
+      );
+    }
+    return {
+      version: 1,
+      active_layout_id: active,
+      layouts: mergedLayouts,
+    };
+  } catch (err) {
+    return recoverDefaultLayoutPrefs(
+      "layout_prefs_parse_error",
+      `Failed to parse persisted layout payload: ${String(err)}`,
+    );
+  }
+}
+
+function nextLayoutId(): string {
+  return `layout_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isJsonModel(value: unknown): value is IJsonModel {
+  return isRecord(value) && isRecord(value.layout);
+}
+
+function sanitizeFileName(value: string): string {
+  const normalized = value.trim().replace(/[^a-zA-Z0-9_-]+/g, "_");
+  return normalized.length > 0 ? normalized : "layout";
+}
+
+function readFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Failed to read layout file."));
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.readAsText(file);
+  });
+}
+
+function parseImportedLayoutPayload(parsed: unknown, fallbackName: string): { name: string; model: IJsonModel } {
+  if (!isRecord(parsed)) {
+    throw new Error("Unsupported layout file format.");
+  }
+
+  const parsedLayout = parsed.layout;
+  if (isRecord(parsedLayout) && isJsonModel(parsedLayout.model)) {
+    const layout = parsed.layout as Record<string, unknown>;
+    const layoutModel = parsedLayout.model;
+    return {
+      name: typeof layout.name === "string" && layout.name.trim().length > 0 ? layout.name.trim() : fallbackName,
+      model: normalizeLayoutModel(layoutModel),
+    };
+  }
+
+  const parsedModel = parsed.model;
+  if (isJsonModel(parsedModel)) {
+    return {
+      name: typeof parsed.name === "string" && parsed.name.trim().length > 0 ? parsed.name.trim() : fallbackName,
+      model: normalizeLayoutModel(parsedModel),
+    };
+  }
+
+  if (Array.isArray(parsed.layouts)) {
+    const list = parsed.layouts.filter(isRecord);
+    const chosen =
+      list.find((item) => typeof item.id === "string" && item.id === parsed.active_layout_id) ?? list[0];
+    const chosenModel = chosen?.model;
+    if (!chosen || !isJsonModel(chosenModel)) {
+      throw new Error("No valid layout model found.");
+    }
+    return {
+      name: typeof chosen.name === "string" && chosen.name.trim().length > 0 ? chosen.name.trim() : fallbackName,
+      model: normalizeLayoutModel(chosenModel),
+    };
+  }
+
+  if (isJsonModel(parsed)) {
+    return {
+      name: typeof parsed.name === "string" && parsed.name.trim().length > 0 ? parsed.name.trim() : fallbackName,
+      model: normalizeLayoutModel(parsed),
+    };
+  }
+
+  throw new Error("Unsupported layout file format.");
+}
+
+function collectLayoutTabComponents(model: IJsonModel): string[] {
+  const components: string[] = [];
+  const walk = (node: unknown) => {
+    if (!isRecord(node)) {
+      return;
+    }
+    if (node.type === "tab" && typeof node.component === "string") {
+      components.push(node.component);
+    }
+    if (Array.isArray(node.children)) {
+      node.children.forEach(walk);
+    }
+  };
+  walk(model.layout);
+  if (Array.isArray(model.borders)) {
+    model.borders.forEach(walk);
+  }
+  return components;
+}
+
+function readThemeMode(): ThemeMode {
+  if (typeof window === "undefined") {
+    return "system";
+  }
+  const value = window.localStorage.getItem(UI_THEME_STORAGE_KEY);
+  if (value === "light" || value === "dark" || value === "system") {
+    return value;
+  }
+  return "system";
+}
+
+function readLayoutEditEnabled(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return window.localStorage.getItem(UI_LAYOUT_EDIT_STORAGE_KEY) === "1";
+}
+
+function readWorkspaceSlowModeEnabled(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return window.localStorage.getItem(UI_WORKSPACE_SLOW_MODE_STORAGE_KEY) === "1";
+}
+
+function resolveThemeMode(mode: ThemeMode): ResolvedTheme {
+  if (mode === "light" || mode === "dark") {
+    return mode;
+  }
+  if (typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+    return "dark";
+  }
+  return "light";
+}
+
+function formatWorkspaceDelimiter(value: string | null): string {
+  if (value === null) {
+    return "auto";
+  }
+  if (value === "\t") {
+    return "\\t";
+  }
+  if (value === "\n") {
+    return "\\n";
+  }
+  if (value === "\r") {
+    return "\\r";
+  }
+  return value;
+}
+
+function appendGlobPattern(folderPath: string, pattern: string): string {
+  const trimmed = folderPath.trim();
+  if (trimmed.length === 0) {
+    return pattern;
+  }
+  if (trimmed.endsWith("\\") || trimmed.endsWith("/")) {
+    return `${trimmed}${pattern}`;
+  }
+  const separator = trimmed.includes("\\") ? "\\" : "/";
+  return `${trimmed}${separator}${pattern}`;
+}
+
 function App() {
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
+  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() => resolveThemeMode(readThemeMode()));
+  const initialLayoutPrefsRef = useRef<StoredLayoutPrefs | null>(null);
+  if (initialLayoutPrefsRef.current === null) {
+    initialLayoutPrefsRef.current = readLayoutPrefs();
+  }
+  const initialLayoutPrefs = initialLayoutPrefsRef.current;
+  const initialActiveLayout =
+    initialLayoutPrefs.layouts.find((layout) => layout.id === initialLayoutPrefs.active_layout_id) ??
+    initialLayoutPrefs.layouts[0];
+  const [savedLayouts, setSavedLayouts] = useState<SavedLayout[]>(initialLayoutPrefs.layouts);
+  const [activeLayoutId, setActiveLayoutId] = useState<string>(initialActiveLayout.id);
+  const [layoutModel, setLayoutModel] = useState<Model>(() => Model.fromJson(cloneJson(initialActiveLayout.model)));
+  const [layoutEditEnabled, setLayoutEditEnabled] = useState<boolean>(() => readLayoutEditEnabled());
+  const [pendingImportedLayout, setPendingImportedLayout] = useState<ImportedLayoutPreview | null>(null);
+  const [pendingImportedName, setPendingImportedName] = useState("");
+
   const [result, setResult] = useState<SmokeQueryResponse | null>(null);
   const [arrowRows, setArrowRows] = useState<ArrowRow[]>([]);
   const [arrowBytes, setArrowBytes] = useState(0);
@@ -216,6 +818,11 @@ function App() {
   const [workspaceAliasInput, setWorkspaceAliasInput] = useState("");
   const [workspacePathInput, setWorkspacePathInput] = useState("");
   const [workspaceIsGlob, setWorkspaceIsGlob] = useState(false);
+  const [workspaceSlowModeEnabled, setWorkspaceSlowModeEnabled] = useState<boolean>(
+    () => readWorkspaceSlowModeEnabled(),
+  );
+  const [workspaceSourceKind, setWorkspaceSourceKind] = useState<WorkspaceSourceKind>("parquet");
+  const [workspaceDelimiterInput, setWorkspaceDelimiterInput] = useState("");
   const [workspaceEditorReady, setWorkspaceEditorReady] = useState(false);
   const [workspaceSql, setWorkspaceSql] = useState(
     "SELECT * FROM my_table LIMIT 100",
@@ -229,6 +836,8 @@ function App() {
   const [workspaceDiffRightAlias, setWorkspaceDiffRightAlias] = useState("");
   const [workspaceSchemaDiff, setWorkspaceSchemaDiff] = useState<WorkspaceSchemaDiffResponse | null>(null);
   const [workspaceExport, setWorkspaceExport] = useState<WorkspaceExportResponse | null>(null);
+  const [layoutMenuOpen, setLayoutMenuOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const perspectiveViewerRef = useRef<HTMLElement | null>(null);
   const perspectiveTableRef = useRef<{ delete?: () => Promise<void> | void } | null>(null);
   const memoryGuardRef = useRef(false);
@@ -236,6 +845,9 @@ function App() {
   const perspectiveStatusRef = useRef<PerspectiveStatus>("idle");
   const perspectiveErrorRef = useRef<string | null>(null);
   const perspectiveReadyMsRef = useRef<number | null>(null);
+  const previousLayoutIdRef = useRef<string | null>(null);
+  const slowModeAutoEnabledByLayoutRef = useRef(false);
+  const layoutRecoveryInProgressRef = useRef(false);
   const perspectiveRuntimeInitRef = useRef<Promise<void> | null>(null);
   const perspectiveCoreRef = useRef<any>(null);
   const workspaceEditorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
@@ -322,13 +934,26 @@ function App() {
   }
 
   async function pickWorkspaceTablePath(): Promise<void> {
+    const registrationSourceKind: WorkspaceSourceKind = workspaceSlowModeEnabled ? workspaceSourceKind : "parquet";
+    const filters = workspaceSlowModeEnabled
+      ? [
+          { name: "Parquet", extensions: ["parquet"] },
+          { name: "Delimited", extensions: ["csv", "tsv", "txt", "data"] },
+        ]
+      : [{ name: "Parquet", extensions: ["parquet"] }];
     const selected = await open({
-      title: "Select Workspace Table Source",
+      title: workspaceIsGlob ? "Select Workspace Source Folder" : "Select Workspace Table Source",
       multiple: false,
-      filters: [{ name: "Parquet", extensions: ["parquet"] }],
+      directory: workspaceIsGlob,
+      filters,
     });
     if (selected && !Array.isArray(selected)) {
-      setWorkspacePathInput(selected);
+      if (workspaceIsGlob) {
+        const pattern = registrationSourceKind === "delimited" ? "*.*" : "*.parquet";
+        setWorkspacePathInput(appendGlobPattern(selected, pattern));
+      } else {
+        setWorkspacePathInput(selected);
+      }
     }
   }
 
@@ -394,10 +1019,14 @@ function App() {
     setLoading(true);
     setError(null);
     try {
+      const sourceKind: WorkspaceSourceKind = workspaceSlowModeEnabled ? workspaceSourceKind : "parquet";
+      const delimiter = sourceKind === "delimited" ? workspaceDelimiterInput.trim() || undefined : undefined;
       await invoke<WorkspaceTableInfo>("register_workspace_table", {
         alias: workspaceAliasInput.trim(),
         filePath: workspacePathInput.trim(),
         isGlob: workspaceIsGlob,
+        sourceKind,
+        delimiter,
       });
       await refreshWorkspaceTables();
       const alias = workspaceAliasInput.trim();
@@ -407,6 +1036,8 @@ function App() {
       setWorkspaceAliasInput("");
       setWorkspacePathInput("");
       setWorkspaceIsGlob(false);
+      setWorkspaceSourceKind("parquet");
+      setWorkspaceDelimiterInput("");
     } catch (err) {
       setError(String(err));
     } finally {
@@ -690,8 +1321,12 @@ function App() {
       if (dataset.length === 0) {
         throw new Error("No rows available to visualize.");
       }
-      if (options?.context) {
-        setPerspectiveContext(options.context);
+      const targetContext = resolvePerspectiveContext(options?.context);
+      if (!targetContext) {
+        throw new Error("Perspective viewer unavailable in current layout. Add Preview or Workspace tab.");
+      }
+      if (perspectiveContext !== targetContext) {
+        setPerspectiveContext(targetContext);
         await waitForNextPaint();
       }
 
@@ -731,7 +1366,18 @@ function App() {
       stage = "viewer.restore";
       setPerspectiveStage(stage);
       const restoreTimeoutMs = perspectiveRestoreTimeoutMs(restoreConfig);
-      await withTimeout("viewer.restore()", viewer.restore(restoreConfig), restoreTimeoutMs);
+      try {
+        await withTimeout("viewer.restore()", viewer.restore(restoreConfig), restoreTimeoutMs);
+      } catch (restoreErr) {
+        const restoreMessage = String(restoreErr);
+        if (!restoreMessage.includes("View not found")) {
+          throw restoreErr;
+        }
+        stage = "viewer.restore.retry";
+        setPerspectiveStage(stage);
+        await waitForNextPaint();
+        await withTimeout("viewer.restore(retry)", viewer.restore(restoreConfig), restoreTimeoutMs);
+      }
       if (previousTable?.delete) {
         try {
           await previousTable.delete();
@@ -768,6 +1414,9 @@ function App() {
 
   async function loadPreviewFromPath(filePath: string): Promise<number> {
     openStartRef.current = performance.now();
+    perspectiveStatusRef.current = "idle";
+    perspectiveReadyMsRef.current = null;
+    perspectiveErrorRef.current = null;
     setFirstViewportMs(null);
     setPerspectiveReadyMs(null);
 
@@ -793,7 +1442,6 @@ function App() {
     });
 
     await waitForNextPaint();
-    await waitForNextPaint();
     const elapsed = openStartRef.current === null ? 0 : performance.now() - openStartRef.current;
     setFirstViewportMs(elapsed);
     return elapsed;
@@ -808,7 +1456,10 @@ function App() {
     while (performance.now() - started < timeoutMs) {
       const status = perspectiveStatusRef.current;
       if (status === "ready") {
-        return { status: "ready", readyMs: perspectiveReadyMsRef.current, error: null };
+        const readyMs = perspectiveReadyMsRef.current;
+        if (readyMs !== null) {
+          return { status: "ready", readyMs, error: null };
+        }
       }
       if (status === "error") {
         return {
@@ -1593,6 +2244,12 @@ function App() {
   const canExportResults = true;
   const memoryGuardActive = runtimeHealth?.memory_guard_tripped ?? false;
   const memoryUsagePct = runtimeHealth ? runtimeHealth.usage_ratio * 100 : null;
+  const memoryRssMb = runtimeHealth ? runtimeHealth.process_rss_bytes / (1024 * 1024) : null;
+  const previewRowCount = preview?.total_rows ?? null;
+  const previewColumnCount = preview?.schema.length ?? null;
+  const workspaceRowCount = workspaceQueryResult?.row_count ?? null;
+  const workspaceColumnCount = workspaceQueryResult?.schema.length ?? null;
+  const workspaceQueryElapsedMs = workspaceQueryResult?.elapsed_ms ?? null;
   const workspaceColumns = workspaceQueryResult?.schema ?? [];
   const workspaceNumericColumns = workspaceColumns.filter((column) =>
     isNumericDuckType(column.duckdb_type),
@@ -1639,7 +2296,12 @@ function App() {
   }, [runtimeHealth]);
 
   useEffect(() => {
-    if (!preview || perspectiveLoadedForFile === preview.file_path || perspectiveStatus !== "idle") {
+    if (
+      !preview ||
+      firstViewportMs === null ||
+      perspectiveLoadedForFile === preview.file_path ||
+      perspectiveStatus !== "idle"
+    ) {
       return;
     }
 
@@ -1665,7 +2327,7 @@ function App() {
       trackOpenTiming: true,
       context: "preview",
     });
-  }, [loadedRows, perspectiveLoadedForFile, perspectiveStatus, preview]);
+  }, [firstViewportMs, loadedRows, perspectiveLoadedForFile, perspectiveStatus, preview]);
 
   useEffect(() => {
     void (async () => {
@@ -1683,645 +2345,1212 @@ function App() {
     })();
   }, []);
 
-  return (
-    <main className="app-shell">
-      <header className="topbar">
-        <h1>Parq-Bench</h1>
-        <span className="phase">Phase 3 Hardening</span>
-      </header>
+  useEffect(() => {
+    window.localStorage.setItem(UI_THEME_STORAGE_KEY, themeMode);
+    if (themeMode === "light" || themeMode === "dark") {
+      setResolvedTheme(themeMode);
+      return;
+    }
+    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    const applySystemTheme = () => setResolvedTheme(mediaQuery.matches ? "dark" : "light");
+    applySystemTheme();
+    mediaQuery.addEventListener("change", applySystemTheme);
+    return () => mediaQuery.removeEventListener("change", applySystemTheme);
+  }, [themeMode]);
 
-      <section className="card">
-        <div className="actions">
-          <button type="button" onClick={() => void openParquetPreview()} disabled={loading || memoryGuardActive}>
-            Open Parquet
-          </button>
-          <button type="button" onClick={() => void runAcceptanceGate()} disabled={loading || memoryGuardActive}>
-            {loading ? "Running..." : "Run Acceptance Gate"}
-          </button>
-          <div className="perf-sweep-controls">
-            <label htmlFor="perf-sweep-runs">Runs</label>
-            <input
-              id="perf-sweep-runs"
-              type="number"
-              className="perf-sweep-input"
-              min={PERF_SWEEP_MIN_RUNS}
-              max={PERF_SWEEP_MAX_RUNS}
-              value={perfSweepRunsInput}
-              onChange={(event) => setPerfSweepRunsInput(event.currentTarget.value)}
-              disabled={loading || memoryGuardActive}
-            />
-            <button type="button" onClick={() => void runPerfSweep()} disabled={loading || memoryGuardActive}>
-              {loading ? "Running..." : "Run Perf Sweep"}
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", resolvedTheme);
+  }, [resolvedTheme]);
+
+  const activeLayout = useMemo(
+    () => savedLayouts.find((layout) => layout.id === activeLayoutId) ?? savedLayouts[0] ?? null,
+    [activeLayoutId, savedLayouts],
+  );
+
+  useEffect(() => {
+    if (!activeLayout) {
+      return;
+    }
+    const payload: StoredLayoutPrefs = {
+      version: 1,
+      active_layout_id: activeLayoutId,
+      layouts: savedLayouts,
+    };
+    window.localStorage.setItem(UI_LAYOUT_STORAGE_KEY, JSON.stringify(payload));
+  }, [activeLayout, activeLayoutId, savedLayouts]);
+
+  useEffect(() => {
+    window.localStorage.setItem(UI_LAYOUT_EDIT_STORAGE_KEY, layoutEditEnabled ? "1" : "0");
+  }, [layoutEditEnabled]);
+
+  useEffect(() => {
+    window.localStorage.setItem(UI_WORKSPACE_SLOW_MODE_STORAGE_KEY, workspaceSlowModeEnabled ? "1" : "0");
+  }, [workspaceSlowModeEnabled]);
+
+  useEffect(() => {
+    const previous = previousLayoutIdRef.current;
+
+    if (activeLayoutId === SLO_MO_LAYOUT_ID && previous !== SLO_MO_LAYOUT_ID) {
+      if (!workspaceSlowModeEnabled) {
+        slowModeAutoEnabledByLayoutRef.current = true;
+        setWorkspaceSlowModeEnabled(true);
+      } else {
+        slowModeAutoEnabledByLayoutRef.current = false;
+      }
+    } else if (previous === SLO_MO_LAYOUT_ID && activeLayoutId !== SLO_MO_LAYOUT_ID) {
+      if (slowModeAutoEnabledByLayoutRef.current) {
+        setWorkspaceSlowModeEnabled(false);
+      }
+      slowModeAutoEnabledByLayoutRef.current = false;
+    }
+
+    previousLayoutIdRef.current = activeLayoutId;
+  }, [activeLayoutId, workspaceSlowModeEnabled]);
+
+  useEffect(() => {
+    if (!workspaceSlowModeEnabled) {
+      setWorkspaceSourceKind("parquet");
+      setWorkspaceDelimiterInput("");
+    }
+  }, [workspaceSlowModeEnabled]);
+
+  useEffect(() => {
+    if (!layoutEditEnabled) {
+      return;
+    }
+    const normalized = normalizeLayoutModel(layoutModel.toJson());
+    setLayoutModel(Model.fromJson(cloneJson(normalized)));
+    setSavedLayouts((prev) =>
+      prev.map((layout) =>
+        layout.id === activeLayoutId
+          ? {
+              ...layout,
+              model: cloneJson(normalized),
+            }
+          : layout,
+      ),
+    );
+  }, [activeLayoutId, layoutEditEnabled]);
+
+  useEffect(() => {
+    if (savedLayouts.length === 0) {
+      if (layoutRecoveryInProgressRef.current) {
+        return;
+      }
+      layoutRecoveryInProgressRef.current = true;
+      const fallback = recoverDefaultLayoutPrefs(
+        "empty_layout_state",
+        "Runtime layout state became empty; restored factory defaults.",
+      );
+      setSavedLayouts(fallback.layouts);
+      setActiveLayoutId(fallback.active_layout_id);
+      setLayoutModel(Model.fromJson(cloneJson(fallback.layouts[0].model)));
+      return;
+    }
+    layoutRecoveryInProgressRef.current = false;
+    if (!savedLayouts.some((layout) => layout.id === activeLayoutId)) {
+      const next = savedLayouts[0];
+      setActiveLayoutId(next.id);
+      setLayoutModel(Model.fromJson(cloneJson(next.model)));
+    }
+  }, [activeLayoutId, savedLayouts]);
+
+  function switchLayout(layoutId: string) {
+    const next = savedLayouts.find((layout) => layout.id === layoutId);
+    if (!next) {
+      return;
+    }
+    setActiveLayoutId(next.id);
+    setLayoutModel(Model.fromJson(cloneJson(next.model)));
+  }
+
+  function saveLayoutSnapshot() {
+    const name = window.prompt("Save layout as", `${activeLayout?.name ?? "Layout"} Copy`)?.trim();
+    if (!name) {
+      return;
+    }
+    const snapshotModel = normalizeLayoutModel(layoutModel.toJson());
+    const snapshot: SavedLayout = {
+      id: nextLayoutId(),
+      name,
+      model: cloneJson(snapshotModel),
+    };
+    setSavedLayouts((prev) => [...prev, snapshot]);
+    setActiveLayoutId(snapshot.id);
+    setLayoutModel(Model.fromJson(cloneJson(snapshot.model)));
+  }
+
+  function renameLayout() {
+    if (!activeLayout) {
+      return;
+    }
+    const name = window.prompt("Rename layout", activeLayout.name)?.trim();
+    if (!name) {
+      return;
+    }
+    setSavedLayouts((prev) =>
+      prev.map((layout) => (layout.id === activeLayout.id ? { ...layout, name } : layout)),
+    );
+  }
+
+  function duplicateLayout() {
+    if (!activeLayout) {
+      return;
+    }
+    const snapshotModel = normalizeLayoutModel(layoutModel.toJson());
+    const snapshot: SavedLayout = {
+      id: nextLayoutId(),
+      name: `${activeLayout.name} Copy`,
+      model: cloneJson(snapshotModel),
+    };
+    setSavedLayouts((prev) => [...prev, snapshot]);
+    setActiveLayoutId(snapshot.id);
+    setLayoutModel(Model.fromJson(cloneJson(snapshot.model)));
+  }
+
+  function deleteLayout() {
+    if (!activeLayout || savedLayouts.length <= 1) {
+      return;
+    }
+    if (!window.confirm(`Delete layout "${activeLayout.name}"?`)) {
+      return;
+    }
+    const remaining = savedLayouts.filter((layout) => layout.id !== activeLayout.id);
+    const next = remaining[0];
+    setSavedLayouts(remaining);
+    setActiveLayoutId(next.id);
+    setLayoutModel(Model.fromJson(cloneJson(next.model)));
+  }
+
+  function resetToDefaultLayout() {
+    const nextModel = normalizeLayoutModel(DEFAULT_LAYOUT_MODEL);
+    setLayoutModel(Model.fromJson(nextModel));
+    setSavedLayouts((prev) =>
+      prev.map((layout) =>
+        layout.id === activeLayoutId
+          ? {
+              ...layout,
+              model: nextModel,
+            }
+          : layout,
+      ),
+    );
+  }
+
+  function restoreFactoryLayouts() {
+    if (!window.confirm("Restore factory layouts? This will remove all saved custom layouts.")) {
+      return;
+    }
+    const defaults = defaultLayoutPrefs();
+    setSavedLayouts(defaults.layouts);
+    setActiveLayoutId(defaults.active_layout_id);
+    setLayoutModel(Model.fromJson(cloneJson(defaults.layouts[0].model)));
+    setLayoutEditEnabled(false);
+  }
+
+  function exportLayoutJson() {
+    if (!activeLayout) {
+      setError("No active layout to export.");
+      return;
+    }
+    try {
+      const payload = {
+        version: 1,
+        exported_at: new Date().toISOString(),
+        layout: {
+          name: activeLayout.name,
+          model: cloneJson(layoutModel.toJson()),
+        },
+      };
+      const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${sanitizeFileName(activeLayout.name)}.layout.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setError(null);
+    } catch (err) {
+      setError(`Export layout failed: ${String(err)}`);
+    }
+  }
+
+  async function importLayoutJson() {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.multiple = false;
+
+    const filePromise = new Promise<File | null>((resolve) => {
+      input.onchange = () => {
+        resolve(input.files?.[0] ?? null);
+      };
+    });
+
+    input.click();
+    const selected = await filePromise;
+    if (!selected) {
+      return;
+    }
+
+    try {
+      const raw = await readFileAsText(selected);
+      const parsed = JSON.parse(raw) as unknown;
+      const fallbackName = selected.name.replace(/\.json$/i, "") || "Imported";
+      const imported = parseImportedLayoutPayload(parsed, fallbackName);
+      Model.fromJson(cloneJson(imported.model));
+
+      const components = collectLayoutTabComponents(imported.model);
+      const panelCountsMap = new Map<string, number>();
+      components.forEach((component) => {
+        panelCountsMap.set(component, (panelCountsMap.get(component) ?? 0) + 1);
+      });
+      const panelCounts = Array.from(panelCountsMap.entries())
+        .map(([component, count]) => ({ component, count }))
+        .sort((a, b) => a.component.localeCompare(b.component));
+      const knownPanels = new Set<DockPanelComponent>(["actions", "preview", "workspace", "diagnostics"]);
+      const unknownPanels = panelCounts
+        .map((item) => item.component)
+        .filter((component) => !knownPanels.has(component as DockPanelComponent));
+
+      setPendingImportedLayout({
+        sourceFile: selected.name,
+        name: imported.name,
+        model: cloneJson(imported.model),
+        tabCount: components.length,
+        panelCounts,
+        unknownPanels,
+      });
+      setPendingImportedName(imported.name);
+      setError(null);
+    } catch (err) {
+      setError(`Import layout failed: ${String(err)}`);
+    }
+  }
+
+  function applyImportedLayout() {
+    if (!pendingImportedLayout) {
+      return;
+    }
+    const layoutName = pendingImportedName.trim() || pendingImportedLayout.name;
+    const normalizedModel = normalizeLayoutModel(pendingImportedLayout.model);
+    const snapshot: SavedLayout = {
+      id: nextLayoutId(),
+      name: layoutName,
+      model: cloneJson(normalizedModel),
+    };
+    setSavedLayouts((prev) => [...prev, snapshot]);
+    setActiveLayoutId(snapshot.id);
+    setLayoutModel(Model.fromJson(cloneJson(snapshot.model)));
+    setPendingImportedLayout(null);
+    setPendingImportedName("");
+    setError(null);
+  }
+
+  function cancelImportedLayout() {
+    setPendingImportedLayout(null);
+    setPendingImportedName("");
+  }
+
+  function onLayoutModelChange(model: Model) {
+    const snapshot = normalizeLayoutModel(model.toJson());
+    setSavedLayouts((prev) =>
+      prev.map((layout) =>
+        layout.id === activeLayoutId
+          ? {
+              ...layout,
+              model: snapshot,
+            }
+          : layout,
+      ),
+    );
+  }
+
+  function onLayoutAction(action: Action): Action | undefined {
+    if (layoutEditEnabled) {
+      return action;
+    }
+    const blocked = new Set<string>([
+      Actions.MOVE_NODE,
+      Actions.ADD_NODE,
+      Actions.DELETE_TAB,
+      Actions.DELETE_TABSET,
+      Actions.RENAME_TAB,
+      Actions.ADJUST_WEIGHTS,
+      Actions.ADJUST_BORDER_SPLIT,
+      Actions.MAXIMIZE_TOGGLE,
+      Actions.CREATE_WINDOW,
+      Actions.CLOSE_WINDOW,
+      Actions.POPOUT_TAB,
+      Actions.POPOUT_TABSET,
+      Actions.UPDATE_MODEL_ATTRIBUTES,
+      Actions.UPDATE_NODE_ATTRIBUTES,
+    ]);
+    if (blocked.has(action.type)) {
+      return undefined;
+    }
+    return action;
+  }
+
+  function resolvePerspectiveContext(preferred?: PerspectiveContext): PerspectiveContext | null {
+    const components = new Set(collectLayoutTabComponents(layoutModel.toJson()));
+    const hasPreview = components.has("preview");
+    const hasWorkspace = components.has("workspace");
+
+    if (preferred === "preview" && hasPreview) {
+      return "preview";
+    }
+    if (preferred === "workspace" && hasWorkspace) {
+      return "workspace";
+    }
+    if (hasPreview) {
+      return "preview";
+    }
+    if (hasWorkspace) {
+      return "workspace";
+    }
+    return null;
+  }
+
+  const actionsPanel = (
+    <section className="dock-panel">
+      <div className="actions">
+        <button type="button" onClick={() => void openParquetPreview()} disabled={loading || memoryGuardActive}>
+          Open Parquet
+        </button>
+        <button type="button" onClick={() => void runAcceptanceGate()} disabled={loading || memoryGuardActive}>
+          {loading ? "Running..." : "Run Acceptance Gate"}
+        </button>
+        <button type="button" onClick={() => setLayoutMenuOpen((prev) => !prev)}>
+          {layoutMenuOpen ? "Hide Layouts" : "Layouts"}
+        </button>
+        <button type="button" onClick={() => void exportResults("json")} disabled={loading || !canExportResults}>
+          Export JSON
+        </button>
+        <button type="button" onClick={() => void exportResults("csv")} disabled={loading || !canExportResults}>
+          Export CSV
+        </button>
+        {preview ? (
+          <>
+            <button type="button" onClick={() => setViewMode("virtual")} disabled={viewMode === "virtual"}>
+              Virtual View
             </button>
-          </div>
+            <button
+              type="button"
+              onClick={() => setViewMode("perspective")}
+              disabled={perspectiveStatus !== "ready" || viewMode === "perspective"}
+            >
+              Perspective View
+            </button>
+          </>
+        ) : null}
+        {result ? <span>DuckDB {result.duckdb_version}</span> : null}
+        {arrowBytes > 0 ? <span>Arrow IPC {arrowBytes} bytes</span> : null}
+        {lastExportPath ? (
+          <span className="path-text" title={lastExportPath}>
+            Exported: {lastExportPath}
+          </span>
+        ) : null}
+      </div>
+      {layoutMenuOpen ? (
+        <div className="actions-layout-menu">
+          <button type="button" onClick={saveLayoutSnapshot}>
+            Save As
+          </button>
+          <button type="button" onClick={renameLayout} disabled={!activeLayout}>
+            Rename
+          </button>
+          <button type="button" onClick={duplicateLayout} disabled={!activeLayout}>
+            Duplicate
+          </button>
+          <button type="button" onClick={deleteLayout} disabled={savedLayouts.length <= 1}>
+            Delete
+          </button>
+          <button type="button" onClick={resetToDefaultLayout}>
+            Reset
+          </button>
+          <button type="button" onClick={restoreFactoryLayouts}>
+            Restore Factory
+          </button>
+          <button type="button" onClick={exportLayoutJson} disabled={!activeLayout}>
+            Export Layout JSON
+          </button>
           <button
             type="button"
-            onClick={() =>
-              void (async () => {
-                setLoading(true);
-                setError(null);
-                try {
-                  await runSmokeQuery();
-                  await runArrowIpcSmoke();
-                  await runTransportBenchmarks();
-                } catch (err) {
-                  setError(String(err));
-                } finally {
-                  setLoading(false);
-                }
-              })()
-            }
-            disabled={loading || memoryGuardActive}
+            onClick={() => {
+              void importLayoutJson();
+            }}
           >
-            {loading ? "Running..." : "Run Smoke Checks"}
+            Import Layout JSON
           </button>
-          <button type="button" onClick={() => void exportResults("json")} disabled={loading || !canExportResults}>
-            Export JSON
+          <button type="button" onClick={() => setLayoutEditEnabled((prev) => !prev)}>
+            {layoutEditEnabled ? "Lock Layout" : "Edit Layout"}
           </button>
-          <button type="button" onClick={() => void exportResults("csv")} disabled={loading || !canExportResults}>
-            Export CSV
+          <button type="button" onClick={() => void runTransportBenchmarks()} disabled={loading}>
+            Run Transport Bench
           </button>
-          {preview ? (
-            <>
-              <button
-                type="button"
-                onClick={() => setViewMode("virtual")}
-                disabled={viewMode === "virtual"}
-              >
-                Virtual View
-              </button>
-              <button
-                type="button"
-                onClick={() => setViewMode("perspective")}
-                disabled={perspectiveStatus !== "ready" || viewMode === "perspective"}
-              >
-                Perspective View
-              </button>
-            </>
+          <button type="button" onClick={() => void runPerfSweep()} disabled={loading}>
+            Run Perf Sweep
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              void (async () => {
+                await runSmokeQuery();
+                await runArrowIpcSmoke();
+              })();
+            }}
+            disabled={loading}
+          >
+            Run Smoke Checks
+          </button>
+          <span className={layoutEditEnabled ? "metric-chip metric-good" : "metric-chip"}>
+            {layoutEditEnabled ? "Layout editing enabled" : "Layout editing locked"}
+          </span>
+          <span className="phase">Advanced checks are intentionally tucked under Layouts.</span>
+        </div>
+      ) : null}
+
+      {runtimeHealth || preview || workspaceQueryResult ? (
+        <div className="runtime-metrics">
+          {runtimeHealth ? (
+            <span className={memoryGuardActive ? "metric-chip metric-bad" : "metric-chip"}>
+              Memory: {memoryUsagePct?.toFixed(1) ?? "n/a"}%
+            </span>
           ) : null}
-          {result ? <span>DuckDB {result.duckdb_version}</span> : null}
-          {arrowBytes > 0 ? <span>Arrow IPC {arrowBytes} bytes</span> : null}
-          {lastExportPath ? (
-            <span className="path-text" title={lastExportPath}>
-              Exported: {lastExportPath}
+          {runtimeHealth ? <span className="metric-chip">RSS: {memoryRssMb?.toFixed(1) ?? "n/a"} MB</span> : null}
+          {previewRowCount !== null ? <span className="metric-chip">Preview rows: {previewRowCount.toLocaleString()}</span> : null}
+          {previewColumnCount !== null ? <span className="metric-chip">Preview cols: {previewColumnCount}</span> : null}
+          {firstViewportMs !== null ? <span className="metric-chip">Preview load: {firstViewportMs.toFixed(0)}ms</span> : null}
+          {workspaceRowCount !== null ? <span className="metric-chip">SQL rows: {workspaceRowCount.toLocaleString()}</span> : null}
+          {workspaceColumnCount !== null ? <span className="metric-chip">SQL cols: {workspaceColumnCount}</span> : null}
+          {workspaceQueryElapsedMs !== null ? (
+            <span className="metric-chip">SQL response: {workspaceQueryElapsedMs.toFixed(0)}ms</span>
+          ) : null}
+          {runtimeHealth?.message ? (
+            <span className={memoryGuardActive ? "metric-chip metric-bad" : "metric-chip"} title={runtimeHealth.message}>
+              {runtimeHealth.message}
             </span>
           ) : null}
         </div>
+      ) : null}
 
-        {runtimeHealth ? (
-          <div className={memoryGuardActive ? "health-banner health-bad" : "health-banner"}>
-            Memory usage: {memoryUsagePct?.toFixed(1)}%
-            {runtimeHealth.message ? ` | ${runtimeHealth.message}` : ""}
-          </div>
-        ) : null}
-
-        {acceptanceGate ? (
-          <div className={acceptanceGate.passed ? "gate-report gate-pass" : "gate-report gate-fail"}>
-            Gate {acceptanceGate.passed ? "PASS" : "FAIL"} | First viewport:{" "}
-            {acceptanceGate.firstViewportMs === null ? "n/a" : `${acceptanceGate.firstViewportMs.toFixed(0)}ms`} |{" "}
-            Perspective:{" "}
-            {acceptanceGate.perspectiveReadyMs === null
-              ? acceptanceGate.perspectiveStatus
-              : `${acceptanceGate.perspectiveReadyMs.toFixed(0)}ms (${acceptanceGate.perspectiveStatus})`}{" "}
-            | File: {acceptanceGate.filePath}
-            {acceptanceGate.details ? ` | Detail: ${acceptanceGate.details}` : ""}
-          </div>
-        ) : null}
-        {perfSweepReport ? (
-          <div className={perfSweepReport.failCount === 0 ? "gate-report gate-pass" : "gate-report gate-fail"}>
-            Perf Sweep {perfSweepReport.failCount === 0 ? "PASS" : "FAIL"} | Runs:{" "}
-            {perfSweepReport.completedRuns}/{perfSweepReport.runCount} | Pass: {perfSweepReport.passCount} | First
-            p50/p95:{" "}
-            {perfSweepReport.firstViewportP50 === null
-              ? "n/a"
-              : `${perfSweepReport.firstViewportP50.toFixed(0)}ms / ${perfSweepReport.firstViewportP95?.toFixed(0) ?? "n/a"}ms`}{" "}
-            | Perspective p50/p95:{" "}
-            {perfSweepReport.perspectiveReadyP50 === null
-              ? "n/a"
-              : `${perfSweepReport.perspectiveReadyP50.toFixed(0)}ms / ${perfSweepReport.perspectiveReadyP95?.toFixed(0) ?? "n/a"}ms`}{" "}
-            | File: {perfSweepReport.filePath}
-          </div>
-        ) : null}
-        {perfSweepReport ? (
-          <details className="sweep-runs">
-            <summary>Perf Sweep Runs</summary>
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Run</th>
-                    <th>First viewport (ms)</th>
-                    <th>Perspective (ms)</th>
-                    <th>Status</th>
-                    <th>Gate</th>
-                    <th>Detail</th>
+      {acceptanceGate ? (
+        <div className={acceptanceGate.passed ? "gate-report gate-pass" : "gate-report gate-fail"}>
+          Gate {acceptanceGate.passed ? "PASS" : "FAIL"} | First viewport:{" "}
+          {acceptanceGate.firstViewportMs === null ? "n/a" : `${acceptanceGate.firstViewportMs.toFixed(0)}ms`} |{" "}
+          Perspective:{" "}
+          {acceptanceGate.perspectiveReadyMs === null
+            ? acceptanceGate.perspectiveStatus
+            : `${acceptanceGate.perspectiveReadyMs.toFixed(0)}ms (${acceptanceGate.perspectiveStatus})`}{" "}
+          | File: {acceptanceGate.filePath}
+          {acceptanceGate.details ? ` | Detail: ${acceptanceGate.details}` : ""}
+        </div>
+      ) : null}
+      {perfSweepReport ? (
+        <div className={perfSweepReport.failCount === 0 ? "gate-report gate-pass" : "gate-report gate-fail"}>
+          Perf Sweep {perfSweepReport.failCount === 0 ? "PASS" : "FAIL"} | Runs: {perfSweepReport.completedRuns}/
+          {perfSweepReport.runCount} | Pass: {perfSweepReport.passCount} | First p50/p95:{" "}
+          {perfSweepReport.firstViewportP50 === null
+            ? "n/a"
+            : `${perfSweepReport.firstViewportP50.toFixed(0)}ms / ${perfSweepReport.firstViewportP95?.toFixed(0) ?? "n/a"}ms`}{" "}
+          | Perspective p50/p95:{" "}
+          {perfSweepReport.perspectiveReadyP50 === null
+            ? "n/a"
+            : `${perfSweepReport.perspectiveReadyP50.toFixed(0)}ms / ${perfSweepReport.perspectiveReadyP95?.toFixed(0) ?? "n/a"}ms`}{" "}
+          | File: {perfSweepReport.filePath}
+        </div>
+      ) : null}
+      {perfSweepReport ? (
+        <details className="sweep-runs">
+          <summary>Perf Sweep Runs</summary>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Run</th>
+                  <th>First viewport (ms)</th>
+                  <th>Perspective (ms)</th>
+                  <th>Status</th>
+                  <th>Gate</th>
+                  <th>Detail</th>
+                </tr>
+              </thead>
+              <tbody>
+                {perfSweepReport.runs.map((run, index) => (
+                  <tr key={`perf-run-${run.evaluatedAt}-${index}`}>
+                    <td>{index + 1}</td>
+                    <td>{run.firstViewportMs === null ? "n/a" : run.firstViewportMs.toFixed(1)}</td>
+                    <td>{run.perspectiveReadyMs === null ? "n/a" : run.perspectiveReadyMs.toFixed(1)}</td>
+                    <td>{run.perspectiveStatus}</td>
+                    <td>{run.passed ? "PASS" : "FAIL"}</td>
+                    <td>{run.details || "-"}</td>
                   </tr>
-                </thead>
-                <tbody>
-                  {perfSweepReport.runs.map((run, index) => (
-                    <tr key={`perf-run-${run.evaluatedAt}-${index}`}>
-                      <td>{index + 1}</td>
-                      <td>{run.firstViewportMs === null ? "n/a" : run.firstViewportMs.toFixed(1)}</td>
-                      <td>{run.perspectiveReadyMs === null ? "n/a" : run.perspectiveReadyMs.toFixed(1)}</td>
-                      <td>{run.perspectiveStatus}</td>
-                      <td>{run.passed ? "PASS" : "FAIL"}</td>
-                      <td>{run.details || "-"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </details>
-        ) : null}
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      ) : null}
 
-        {error ? <p className="error">{error}</p> : null}
+      {error ? <p className="error">{error}</p> : null}
+    </section>
+  );
 
-        {preview ? (
-          <>
-            <h3>Parquet Preview</h3>
-            <p className="meta-line">
-              <span className="path-text" title={preview.file_path}>
-                <strong>Path:</strong> {preview.file_path}
-              </span>
-              <span>
-                <strong>Size:</strong> {(preview.file_size_bytes / (1024 * 1024)).toFixed(2)} MB
-              </span>
-              <span>
-                <strong>Rows:</strong> {preview.total_rows.toLocaleString()}
-              </span>
-              <span>
-                <strong>Columns:</strong> {preview.schema.length}
-              </span>
-              <span>
-                <strong>Renderer:</strong> {viewMode}
-              </span>
-              <span>
-                <strong>Perspective:</strong> {perspectiveStatus}
-              </span>
-              <span>
-                <strong>Stage:</strong> {perspectiveStage}
-              </span>
-            </p>
-            <div className="metrics-line">
-              <span
-                className={
-                  firstViewportMs === null
-                    ? "metric-chip"
-                    : firstViewportMs <= FIRST_VIEWPORT_TARGET_MS
-                      ? "metric-chip metric-good"
-                      : "metric-chip metric-bad"
-                }
-              >
-                First viewport:{" "}
-                {firstViewportMs === null
-                  ? "pending"
-                  : `${firstViewportMs.toFixed(0)}ms / target ${FIRST_VIEWPORT_TARGET_MS}ms`}
-              </span>
-              <span
-                className={
-                  perspectiveReadyMs === null
-                    ? "metric-chip"
-                    : perspectiveReadyMs <= PERSPECTIVE_READY_TARGET_MS
-                      ? "metric-chip metric-good"
-                      : "metric-chip metric-bad"
-                }
-              >
-                Perspective ready:{" "}
-                {perspectiveReadyMs === null
-                  ? "pending"
-                  : `${perspectiveReadyMs.toFixed(0)}ms / target ${PERSPECTIVE_READY_TARGET_MS}ms`}
-              </span>
-            </div>
-            {perspectiveError ? <p className="error">Perspective error: {perspectiveError}</p> : null}
+  const previewPanel = (
+    <section className="preview-panel">
+      {preview ? (
+        <>
+          <h3>Parquet Preview</h3>
+          <p className="meta-line">
+            <span className="path-text" title={preview.file_path}>
+              <strong>Path:</strong> {preview.file_path}
+            </span>
+            <span>
+              <strong>Size:</strong> {(preview.file_size_bytes / (1024 * 1024)).toFixed(2)} MB
+            </span>
+            <span>
+              <strong>Rows:</strong> {preview.total_rows.toLocaleString()}
+            </span>
+            <span>
+              <strong>Columns:</strong> {preview.schema.length}
+            </span>
+            <span>
+              <strong>Renderer:</strong> {viewMode}
+            </span>
+            <span>
+              <strong>Perspective:</strong> {perspectiveStatus}
+            </span>
+            <span>
+              <strong>Stage:</strong> {perspectiveStage}
+            </span>
+          </p>
+          <div className="metrics-line">
+            <span
+              className={
+                firstViewportMs === null
+                  ? "metric-chip"
+                  : firstViewportMs <= FIRST_VIEWPORT_TARGET_MS
+                    ? "metric-chip metric-good"
+                    : "metric-chip metric-bad"
+              }
+            >
+              First viewport:{" "}
+              {firstViewportMs === null ? "pending" : `${firstViewportMs.toFixed(0)}ms / target ${FIRST_VIEWPORT_TARGET_MS}ms`}
+            </span>
+            <span
+              className={
+                perspectiveReadyMs === null
+                  ? "metric-chip"
+                  : perspectiveReadyMs <= PERSPECTIVE_READY_TARGET_MS
+                    ? "metric-chip metric-good"
+                    : "metric-chip metric-bad"
+              }
+            >
+              Perspective ready:{" "}
+              {perspectiveReadyMs === null
+                ? "pending"
+                : `${perspectiveReadyMs.toFixed(0)}ms / target ${PERSPECTIVE_READY_TARGET_MS}ms`}
+            </span>
+          </div>
+          {perspectiveError ? <p className="error">Perspective error: {perspectiveError}</p> : null}
 
-            {viewMode === "virtual" ? (
-              <>
-                <div className="virtual-header-track">
-                  <div
-                    className="virtual-header-row"
-                    style={{
-                      gridTemplateColumns: columnGridTemplate,
-                      width: `${gridContentWidth}px`,
-                      transform: `translateX(-${scrollLeft}px)`,
-                    }}
-                  >
-                    {preview.schema.map((col) => (
-                      <div
-                        key={col.name}
-                        className="virtual-cell virtual-cell-head"
-                        title={col.duckdb_type}
-                      >
-                        {col.name}
-                      </div>
-                    ))}
-                  </div>
-                </div>
+          {viewMode === "virtual" ? (
+            <>
+              <div className="virtual-header-track">
                 <div
-                  className="virtual-grid"
-                  style={{ height: `${viewportHeight}px` }}
-                  onScroll={(event) => {
-                    setScrollTop(event.currentTarget.scrollTop);
-                    setScrollLeft(event.currentTarget.scrollLeft);
+                  className="virtual-header-row"
+                  style={{
+                    gridTemplateColumns: columnGridTemplate,
+                    width: `${gridContentWidth}px`,
+                    transform: `translateX(-${scrollLeft}px)`,
                   }}
                 >
-                  <div
-                    className="virtual-spacer"
-                    style={{ height: `${totalRows * ROW_HEIGHT}px`, width: `${gridContentWidth}px` }}
-                  >
-                    {visibleIndices.map((index) => {
-                      const row = loadedRows.get(index);
-                      return (
-                        <div
-                          key={`virtual-row-${index}`}
-                          className="virtual-row"
-                          style={{
-                            top: `${index * ROW_HEIGHT}px`,
-                            height: `${ROW_HEIGHT}px`,
-                            width: `${gridContentWidth}px`,
-                            gridTemplateColumns: columnGridTemplate,
-                          }}
-                        >
-                          {preview.schema.map((col, colIndex) => (
-                            <div
-                              key={`virtual-cell-${index}-${col.name}`}
-                              className="virtual-cell"
-                              title={row?.[colIndex] ?? "NULL"}
-                            >
-                              {row ? (row[colIndex] ?? "NULL") : "..."}
-                            </div>
-                          ))}
-                        </div>
-                      );
-                    })}
-                  </div>
+                  {preview.schema.map((col) => (
+                    <div key={col.name} className="virtual-cell virtual-cell-head" title={col.duckdb_type}>
+                      {col.name}
+                    </div>
+                  ))}
                 </div>
-              </>
-            ) : null}
-            {perspectiveContext === "preview" ? (
-              <div
-                className={viewMode === "perspective" ? "perspective-wrap" : "perspective-wrap hidden"}
-                style={{ height: `${viewportHeight}px` }}
-              >
-                <perspective-viewer ref={perspectiveViewerRef} className="perspective-viewer" />
               </div>
-            ) : null}
-          </>
-        ) : null}
-
-        <section className="workspace-panel">
-          <h3>Workspace Explorer</h3>
-          <div className="workspace-register-row">
-            <input
-              type="text"
-              placeholder="alias (e.g. my_table)"
-              value={workspaceAliasInput}
-              onChange={(event) => setWorkspaceAliasInput(event.currentTarget.value)}
-            />
-            <input
-              type="text"
-              className="workspace-path-input"
-              placeholder="parquet file path or glob"
-              value={workspacePathInput}
-              onChange={(event) => setWorkspacePathInput(event.currentTarget.value)}
-            />
-            <label className="workspace-checkbox">
-              <input
-                type="checkbox"
-                checked={workspaceIsGlob}
-                onChange={(event) => setWorkspaceIsGlob(event.currentTarget.checked)}
-              />
-              glob
-            </label>
-            <button type="button" onClick={() => void pickWorkspaceTablePath()} disabled={loading}>
-              Browse
-            </button>
-            <button type="button" onClick={() => void registerWorkspaceTable()} disabled={loading}>
-              Register
-            </button>
-          </div>
-
-          <div className="workspace-list">
-            <strong>Tables:</strong>{" "}
-            {workspaceTables.length === 0
-              ? "none"
-              : workspaceTables.map((table) => (
-                  <span key={`workspace-${table.alias}`} className="workspace-table-pill">
-                    {table.alias}
-                    <button
-                      type="button"
-                      className="workspace-pill-remove"
-                      onClick={() => void removeWorkspaceTable(table.alias)}
-                      disabled={loading}
-                    >
-                      x
-                    </button>
-                  </span>
-                ))}
-          </div>
-          {workspaceTables.length > 0 ? (
-            <div className="workspace-schema-summary">
-              {workspaceTables.map((table) => {
-                const schema = workspaceTableSchemas[table.alias] ?? [];
-                const columnsPreview = schema
-                  .slice(0, 6)
-                  .map((column) => column.name)
-                  .join(", ");
-                const suffix = schema.length > 6 ? ", ..." : "";
-                return (
-                  <span
-                    key={`workspace-schema-${table.alias}`}
-                    className="workspace-schema-pill"
-                    title={
-                      schema.length === 0
-                        ? `${table.alias}: schema unavailable`
-                        : `${table.alias}: ${schema.map((column) => `${column.name} (${column.duckdb_type})`).join(", ")}`
-                    }
-                  >
-                    <strong>{table.alias}</strong>:{" "}
-                    {schema.length === 0 ? "schema unavailable" : `${columnsPreview}${suffix}`}
-                  </span>
-                );
-              })}
-            </div>
-          ) : null}
-
-          <div className="workspace-diff-row">
-            <label>
-              Diff Left
-              <select
-                value={workspaceDiffLeftAlias}
-                onChange={(event) => setWorkspaceDiffLeftAlias(event.currentTarget.value)}
+              <div
+                className="virtual-grid"
+                style={{ height: `${viewportHeight}px` }}
+                onScroll={(event) => {
+                  setScrollTop(event.currentTarget.scrollTop);
+                  setScrollLeft(event.currentTarget.scrollLeft);
+                }}
               >
-                <option value="">Select table</option>
-                {workspaceTables.map((table) => (
-                  <option key={`diff-left-${table.alias}`} value={table.alias}>
-                    {table.alias}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Diff Right
-              <select
-                value={workspaceDiffRightAlias}
-                onChange={(event) => setWorkspaceDiffRightAlias(event.currentTarget.value)}
-              >
-                <option value="">Select table</option>
-                {workspaceTables.map((table) => (
-                  <option key={`diff-right-${table.alias}`} value={table.alias}>
-                    {table.alias}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              type="button"
-              onClick={() => void runWorkspaceSchemaDiff()}
-              disabled={loading || workspaceTables.length < 2}
-            >
-              Run Schema Diff
-            </button>
-          </div>
-
-          {workspaceSchemaDiff ? (
-            <>
-              <p className="meta-line">
-                <span>
-                  <strong>Added:</strong> {workspaceSchemaDiff.added_count}
-                </span>
-                <span>
-                  <strong>Removed:</strong> {workspaceSchemaDiff.removed_count}
-                </span>
-                <span>
-                  <strong>Type Changed:</strong> {workspaceSchemaDiff.type_changed_count}
-                </span>
-                <span>
-                  <strong>Unchanged:</strong> {workspaceSchemaDiff.unchanged_count}
-                </span>
-              </p>
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Column</th>
-                      <th>{workspaceSchemaDiff.left_alias}</th>
-                      <th>{workspaceSchemaDiff.right_alias}</th>
-                      <th>Change</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {workspaceSchemaDiff.columns.map((column) => (
-                      <tr key={`schema-diff-${column.name}`}>
-                        <td>{column.name}</td>
-                        <td>{column.left_type ?? "-"}</td>
-                        <td>{column.right_type ?? "-"}</td>
-                        <td>{column.change}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <div className="virtual-spacer" style={{ height: `${totalRows * ROW_HEIGHT}px`, width: `${gridContentWidth}px` }}>
+                  {visibleIndices.map((index) => {
+                    const row = loadedRows.get(index);
+                    return (
+                      <div
+                        key={`virtual-row-${index}`}
+                        className="virtual-row"
+                        style={{
+                          top: `${index * ROW_HEIGHT}px`,
+                          height: `${ROW_HEIGHT}px`,
+                          width: `${gridContentWidth}px`,
+                          gridTemplateColumns: columnGridTemplate,
+                        }}
+                      >
+                        {preview.schema.map((col, colIndex) => (
+                          <div key={`virtual-cell-${index}-${col.name}`} className="virtual-cell" title={row?.[colIndex] ?? "NULL"}>
+                            {row ? (row[colIndex] ?? "NULL") : "..."}
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             </>
           ) : null}
-
-          <div className="workspace-sql-row">
-            <div className="workspace-editor">
-              <Editor
-                height="180px"
-                defaultLanguage="sql"
-                defaultValue={workspaceSql}
-                onMount={onWorkspaceEditorMount}
-                onChange={(value) => setWorkspaceSql(value ?? "")}
-                options={{
-                  automaticLayout: true,
-                  minimap: { enabled: false },
-                  wordWrap: "on",
-                  fontSize: 13,
-                  scrollBeyondLastLine: false,
-                  lineNumbers: "on",
-                }}
-              />
-            </div>
-            <button type="button" onClick={() => void runWorkspaceQuery()} disabled={loading}>
-              Run SQL
-            </button>
-            <div className="workspace-export-row">
-              <button type="button" onClick={() => void exportWorkspaceQuery("csv")} disabled={loading}>
-                Export Query CSV
-              </button>
-              <button type="button" onClick={() => void exportWorkspaceQuery("parquet")} disabled={loading}>
-                Export Query Parquet
-              </button>
-            </div>
-          </div>
-
-          {workspaceExport ? (
-            <p className="meta-line">
-              <span>
-                <strong>Last Export:</strong> {workspaceExport.format.toUpperCase()}
-              </span>
-              <span className="path-text" title={workspaceExport.output_path}>
-                <strong>Path:</strong> {workspaceExport.output_path}
-              </span>
-              <span>
-                <strong>Size:</strong> {(workspaceExport.file_size_bytes / 1024).toFixed(1)} KB
-              </span>
-              <span>
-                <strong>Elapsed:</strong> {workspaceExport.elapsed_ms.toFixed(0)}ms
-              </span>
-            </p>
-          ) : null}
-
-          <div className="workspace-chart-row">
-            <label>
-              Plugin
-              <select
-                value={workspaceChartPlugin}
-                onChange={(event) => setWorkspaceChartPlugin(event.currentTarget.value as WorkspaceChartPlugin)}
-              >
-                <option value="Datagrid">Datagrid</option>
-                <option value="Y Bar">Y Bar</option>
-                <option value="X Bar">X Bar</option>
-                <option value="Y Line">Y Line</option>
-                <option value="Treemap">Treemap</option>
-              </select>
-            </label>
-            <label>
-              X
-              <select value={workspaceChartX} onChange={(event) => setWorkspaceChartX(event.currentTarget.value)}>
-                {workspaceColumns.map((column) => (
-                  <option key={`chart-x-${column.name}`} value={column.name}>
-                    {column.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Y
-              <select value={workspaceChartY} onChange={(event) => setWorkspaceChartY(event.currentTarget.value)}>
-                {workspaceColumns.map((column) => (
-                  <option key={`chart-y-${column.name}`} value={column.name}>
-                    {column.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Agg
-              <select value={workspaceChartAgg} onChange={(event) => setWorkspaceChartAgg(event.currentTarget.value)}>
-                <option value="sum">sum</option>
-                <option value="avg">avg</option>
-                <option value="count">count</option>
-                <option value="min">min</option>
-                <option value="max">max</option>
-              </select>
-            </label>
-            <button
-              type="button"
-              onClick={() => void visualizeWorkspaceChart()}
-              disabled={loading || workspaceQueryResult === null}
-            >
-              Chart In Perspective
-            </button>
-            {workspaceNumericColumns.length === 0 && workspaceQueryResult ? (
-              <span className="phase">No numeric columns detected; use Datagrid.</span>
-            ) : null}
-          </div>
-
-          {perspectiveContext === "workspace" ? (
+          {perspectiveContext === "preview" ? (
             <div
               className={viewMode === "perspective" ? "perspective-wrap" : "perspective-wrap hidden"}
-              style={{ height: `${Math.max(360, Math.floor(viewportHeight * 0.8))}px`, marginBottom: "8px" }}
+              style={{ height: `${viewportHeight}px` }}
             >
               <perspective-viewer ref={perspectiveViewerRef} className="perspective-viewer" />
             </div>
           ) : null}
+        </>
+      ) : (
+        <div className="preview-placeholder">
+          <h3>Parquet Preview</h3>
+          <p className="phase">Open a parquet file to inspect rows and switch between virtual and perspective views.</p>
+        </div>
+      )}
+    </section>
+  );
 
-          {workspaceQueryResult ? (
-            <>
-              <p className="meta-line">
-                <span>
-                  <strong>Rows:</strong> {workspaceQueryResult.row_count}
-                  {workspaceQueryResult.truncated ? ` (truncated to ${workspaceQueryResult.row_limit})` : ""}
-                </span>
-                <span>
-                  <strong>Elapsed:</strong> {workspaceQueryResult.elapsed_ms.toFixed(0)}ms
-                </span>
-                <span>
-                  <strong>Columns:</strong> {workspaceQueryResult.schema.length}
-                </span>
-              </p>
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      {workspaceQueryResult.schema.map((col) => (
-                        <th key={`workspace-col-${col.name}`} title={col.duckdb_type}>
-                          {col.name}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {workspaceQueryResult.rows.map((row, rowIndex) => (
-                      <tr key={`workspace-row-${rowIndex}`}>
-                        {row.map((value, colIndex) => (
-                          <td key={`workspace-cell-${rowIndex}-${colIndex}`}>{value ?? "NULL"}</td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </>
+  const diagnosticsPanel = (
+    <section className="dock-panel">
+      <h3>Arrow IPC Decode</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Label</th>
+          </tr>
+        </thead>
+        <tbody>
+          {arrowRows.map((row) => (
+            <tr key={`arrow-${row.id}`}>
+              <td>{row.id}</td>
+              <td>{row.label}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <h3>Transport Benchmarks</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Mode</th>
+            <th>Payload</th>
+            <th>Bytes</th>
+            <th>Time (ms)</th>
+            <th>Throughput (MB/s)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {benchmarks.map((entry) => (
+            <tr key={entry.mode}>
+              <td>{entry.mode}</td>
+              <td>{entry.sizeMb} MB</td>
+              <td>{entry.bytes.toLocaleString()}</td>
+              <td>{entry.elapsedMs.toFixed(1)}</td>
+              <td>{entry.throughputMbps.toFixed(1)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+
+  const workspacePanel = (
+    <section className="workspace-panel">
+      <h3>Workspace Explorer</h3>
+      <div className="workspace-mode-row">
+        <label className="workspace-slow-toggle">
+          <input
+            type="checkbox"
+            checked={workspaceSlowModeEnabled}
+            onChange={(event) => setWorkspaceSlowModeEnabled(event.currentTarget.checked)}
+          />
+          Enable slow mode for non-Parquet workspace sources
+        </label>
+        {workspaceSlowModeEnabled ? <span className="metric-chip metric-bad">Slow mode enabled</span> : null}
+      </div>
+      {workspaceSlowModeEnabled ? (
+        <div className="workspace-slow-warning">
+          Slow mode is active. Non-Parquet file parsing is outside the fast path and may have higher latency and memory
+          pressure than standard Parquet workflows.
+        </div>
+      ) : null}
+      {workspaceSlowModeEnabled ? (
+        <div className="workspace-source-row">
+          <label>
+            Source type
+            <select
+              value={workspaceSourceKind}
+              onChange={(event) => {
+                const next = event.currentTarget.value as WorkspaceSourceKind;
+                setWorkspaceSourceKind(next);
+                if (next === "parquet") {
+                  setWorkspaceDelimiterInput("");
+                }
+              }}
+            >
+              <option value="parquet">Parquet (fast path)</option>
+              <option value="delimited">Delimited (csv/txt/data/tsv)</option>
+            </select>
+          </label>
+          {workspaceSourceKind === "delimited" ? (
+            <label>
+              Delimiter
+              <input
+                type="text"
+                value={workspaceDelimiterInput}
+                onChange={(event) => setWorkspaceDelimiterInput(event.currentTarget.value)}
+                placeholder='Auto by extension (.csv ",", .tsv "\\t", .txt/.data ",")'
+              />
+            </label>
           ) : null}
-        </section>
+        </div>
+      ) : null}
+      <div className="workspace-register-row">
+        <input
+          type="text"
+          placeholder="alias (e.g. my_table)"
+          value={workspaceAliasInput}
+          onChange={(event) => setWorkspaceAliasInput(event.currentTarget.value)}
+        />
+        <input
+          type="text"
+          className="workspace-path-input"
+          placeholder={
+            workspaceSlowModeEnabled && workspaceSourceKind === "delimited"
+              ? "csv/txt/data file path or glob"
+              : "parquet file path or glob"
+          }
+          value={workspacePathInput}
+          onChange={(event) => setWorkspacePathInput(event.currentTarget.value)}
+        />
+        <label className="workspace-checkbox">
+          <input
+            type="checkbox"
+            checked={workspaceIsGlob}
+            onChange={(event) => setWorkspaceIsGlob(event.currentTarget.checked)}
+          />
+          glob
+        </label>
+        <button type="button" onClick={() => void pickWorkspaceTablePath()} disabled={loading}>
+          Browse
+        </button>
+        <button type="button" onClick={() => void registerWorkspaceTable()} disabled={loading}>
+          Register
+        </button>
+      </div>
 
-        <details className="diagnostics">
-          <summary>Diagnostics</summary>
-          <h3>Arrow IPC Decode</h3>
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Label</th>
-              </tr>
-            </thead>
-            <tbody>
-              {arrowRows.map((row) => (
-                <tr key={`arrow-${row.id}`}>
-                  <td>{row.id}</td>
-                  <td>{row.label}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      <div className="workspace-list">
+        <strong>Tables:</strong>{" "}
+        {workspaceTables.length === 0
+          ? "none"
+          : workspaceTables.map((table) => (
+              <span key={`workspace-${table.alias}`} className="workspace-table-pill">
+                {table.alias}
+                <span className="workspace-table-source">
+                  {table.source_kind === "delimited"
+                    ? `delimited | ${formatWorkspaceDelimiter(table.delimiter)}`
+                    : "parquet"}
+                </span>
+                <button
+                  type="button"
+                  className="workspace-pill-remove"
+                  onClick={() => void removeWorkspaceTable(table.alias)}
+                  disabled={loading}
+                >
+                  x
+                </button>
+              </span>
+            ))}
+      </div>
+      {workspaceTables.length > 0 ? (
+        <div className="workspace-schema-summary">
+          {workspaceTables.map((table) => {
+            const schema = workspaceTableSchemas[table.alias] ?? [];
+            const columnsPreview = schema
+              .slice(0, 6)
+              .map((column) => column.name)
+              .join(", ");
+            const suffix = schema.length > 6 ? ", ..." : "";
+            return (
+              <span
+                key={`workspace-schema-${table.alias}`}
+                className="workspace-schema-pill"
+                title={
+                  schema.length === 0
+                    ? `${table.alias}: schema unavailable`
+                    : `${table.alias}: ${schema.map((column) => `${column.name} (${column.duckdb_type})`).join(", ")}`
+                }
+              >
+                <strong>{table.alias}</strong>: {schema.length === 0 ? "schema unavailable" : `${columnsPreview}${suffix}`}
+              </span>
+            );
+          })}
+        </div>
+      ) : null}
 
-          <h3>Transport Benchmarks</h3>
-          <table>
-            <thead>
-              <tr>
-                <th>Mode</th>
-                <th>Payload</th>
-                <th>Bytes</th>
-                <th>Time (ms)</th>
-                <th>Throughput (MB/s)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {benchmarks.map((entry) => (
-                <tr key={entry.mode}>
-                  <td>{entry.mode}</td>
-                  <td>{entry.sizeMb} MB</td>
-                  <td>{entry.bytes.toLocaleString()}</td>
-                  <td>{entry.elapsedMs.toFixed(1)}</td>
-                  <td>{entry.throughputMbps.toFixed(1)}</td>
+      <div className="workspace-diff-row">
+        <label>
+          Diff Left
+          <select value={workspaceDiffLeftAlias} onChange={(event) => setWorkspaceDiffLeftAlias(event.currentTarget.value)}>
+            <option value="">Select table</option>
+            {workspaceTables.map((table) => (
+              <option key={`diff-left-${table.alias}`} value={table.alias}>
+                {table.alias}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Diff Right
+          <select value={workspaceDiffRightAlias} onChange={(event) => setWorkspaceDiffRightAlias(event.currentTarget.value)}>
+            <option value="">Select table</option>
+            {workspaceTables.map((table) => (
+              <option key={`diff-right-${table.alias}`} value={table.alias}>
+                {table.alias}
+              </option>
+            ))}
+          </select>
+        </label>
+        <button type="button" onClick={() => void runWorkspaceSchemaDiff()} disabled={loading || workspaceTables.length < 2}>
+          Run Schema Diff
+        </button>
+      </div>
+
+      {workspaceSchemaDiff ? (
+        <>
+          <p className="meta-line">
+            <span>
+              <strong>Added:</strong> {workspaceSchemaDiff.added_count}
+            </span>
+            <span>
+              <strong>Removed:</strong> {workspaceSchemaDiff.removed_count}
+            </span>
+            <span>
+              <strong>Type Changed:</strong> {workspaceSchemaDiff.type_changed_count}
+            </span>
+            <span>
+              <strong>Unchanged:</strong> {workspaceSchemaDiff.unchanged_count}
+            </span>
+          </p>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Column</th>
+                  <th>{workspaceSchemaDiff.left_alias}</th>
+                  <th>{workspaceSchemaDiff.right_alias}</th>
+                  <th>Change</th>
                 </tr>
+              </thead>
+              <tbody>
+                {workspaceSchemaDiff.columns.map((column) => (
+                  <tr key={`schema-diff-${column.name}`}>
+                    <td>{column.name}</td>
+                    <td>{column.left_type ?? "-"}</td>
+                    <td>{column.right_type ?? "-"}</td>
+                    <td>{column.change}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : null}
+
+      <div className="workspace-sql-row">
+        <div className="workspace-editor">
+          <Editor
+            height="180px"
+            defaultLanguage="sql"
+            defaultValue={workspaceSql}
+            theme={resolvedTheme === "dark" ? "vs-dark" : "vs"}
+            onMount={onWorkspaceEditorMount}
+            onChange={(value) => setWorkspaceSql(value ?? "")}
+            options={{
+              automaticLayout: true,
+              minimap: { enabled: false },
+              wordWrap: "on",
+              fontSize: 13,
+              scrollBeyondLastLine: false,
+              lineNumbers: "on",
+            }}
+          />
+        </div>
+        <button type="button" onClick={() => void runWorkspaceQuery()} disabled={loading}>
+          Run SQL
+        </button>
+        <div className="workspace-export-row">
+          <button type="button" onClick={() => void exportWorkspaceQuery("csv")} disabled={loading}>
+            Export Query CSV
+          </button>
+          <button type="button" onClick={() => void exportWorkspaceQuery("parquet")} disabled={loading}>
+            Export Query Parquet
+          </button>
+        </div>
+      </div>
+
+      {workspaceExport ? (
+        <p className="meta-line">
+          <span>
+            <strong>Last Export:</strong> {workspaceExport.format.toUpperCase()}
+          </span>
+          <span className="path-text" title={workspaceExport.output_path}>
+            <strong>Path:</strong> {workspaceExport.output_path}
+          </span>
+          <span>
+            <strong>Size:</strong> {(workspaceExport.file_size_bytes / 1024).toFixed(1)} KB
+          </span>
+          <span>
+            <strong>Elapsed:</strong> {workspaceExport.elapsed_ms.toFixed(0)}ms
+          </span>
+        </p>
+      ) : null}
+
+      <div className="workspace-chart-row">
+        <label>
+          Plugin
+          <select value={workspaceChartPlugin} onChange={(event) => setWorkspaceChartPlugin(event.currentTarget.value as WorkspaceChartPlugin)}>
+            <option value="Datagrid">Datagrid</option>
+            <option value="Y Bar">Y Bar</option>
+            <option value="X Bar">X Bar</option>
+            <option value="Y Line">Y Line</option>
+            <option value="Treemap">Treemap</option>
+          </select>
+        </label>
+        <label>
+          X
+          <select value={workspaceChartX} onChange={(event) => setWorkspaceChartX(event.currentTarget.value)}>
+            {workspaceColumns.map((column) => (
+              <option key={`chart-x-${column.name}`} value={column.name}>
+                {column.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Y
+          <select value={workspaceChartY} onChange={(event) => setWorkspaceChartY(event.currentTarget.value)}>
+            {workspaceColumns.map((column) => (
+              <option key={`chart-y-${column.name}`} value={column.name}>
+                {column.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Agg
+          <select value={workspaceChartAgg} onChange={(event) => setWorkspaceChartAgg(event.currentTarget.value)}>
+            <option value="sum">sum</option>
+            <option value="avg">avg</option>
+            <option value="count">count</option>
+            <option value="min">min</option>
+            <option value="max">max</option>
+          </select>
+        </label>
+        <button type="button" onClick={() => void visualizeWorkspaceChart()} disabled={loading || workspaceQueryResult === null}>
+          Chart In Perspective
+        </button>
+        {workspaceNumericColumns.length === 0 && workspaceQueryResult ? (
+          <span className="phase">No numeric columns detected; use Datagrid.</span>
+        ) : null}
+      </div>
+
+      {perspectiveContext === "workspace" ? (
+        <div
+          className={viewMode === "perspective" ? "perspective-wrap" : "perspective-wrap hidden"}
+          style={{ height: `${Math.max(360, Math.floor(viewportHeight * 0.8))}px`, marginBottom: "8px" }}
+        >
+          <perspective-viewer ref={perspectiveViewerRef} className="perspective-viewer" />
+        </div>
+      ) : null}
+
+      {workspaceQueryResult ? (
+        <>
+          <p className="meta-line">
+            <span>
+              <strong>Rows:</strong> {workspaceQueryResult.row_count}
+              {workspaceQueryResult.truncated ? ` (truncated to ${workspaceQueryResult.row_limit})` : ""}
+            </span>
+            <span>
+              <strong>Elapsed:</strong> {workspaceQueryResult.elapsed_ms.toFixed(0)}ms
+            </span>
+            <span>
+              <strong>Columns:</strong> {workspaceQueryResult.schema.length}
+            </span>
+          </p>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  {workspaceQueryResult.schema.map((col) => (
+                    <th key={`workspace-col-${col.name}`} title={col.duckdb_type}>
+                      {col.name}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {workspaceQueryResult.rows.map((row, rowIndex) => (
+                  <tr key={`workspace-row-${rowIndex}`}>
+                    {row.map((value, colIndex) => (
+                      <td key={`workspace-cell-${rowIndex}-${colIndex}`}>{value ?? "NULL"}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      ) : null}
+    </section>
+  );
+
+  const dockThemeClass = resolvedTheme === "dark" ? "flexlayout__theme_dark" : "flexlayout__theme_light";
+
+  function dockFactory(node: TabNode) {
+    const component = node.getComponent() as DockPanelComponent;
+    switch (component) {
+      case "actions":
+        return actionsPanel;
+      case "preview":
+        return previewPanel;
+      case "workspace":
+        return workspacePanel;
+      case "diagnostics":
+        return diagnosticsPanel;
+      default:
+        return <div className="phase">Unknown panel</div>;
+    }
+  }
+
+  return (
+    <main className="app-shell">
+      <header className="topbar">
+        <h1>Parq-Bench — High-Performance Local Data Lake</h1>
+        <div className="topbar-right">
+          <label className="theme-picker">
+            Layout
+            <select value={activeLayout?.id ?? ""} onChange={(event) => switchLayout(event.currentTarget.value)}>
+              {savedLayouts.map((layout) => (
+                <option key={`layout-top-${layout.id}`} value={layout.id}>
+                  {layout.name}
+                </option>
               ))}
-            </tbody>
-          </table>
-        </details>
+            </select>
+          </label>
+          <label className="theme-picker">
+            Theme
+            <select value={themeMode} onChange={(event) => setThemeMode(event.currentTarget.value as ThemeMode)}>
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+          <button type="button" onClick={() => setAboutOpen(true)} disabled={pendingImportedLayout !== null}>
+            About
+          </button>
+          <span className="phase">Phase 3 Hardening</span>
+        </div>
+      </header>
+
+      <section className="card">
+        <div className={`dock-host ${dockThemeClass}`}>
+          <Layout
+            model={layoutModel}
+            factory={dockFactory}
+            onAction={onLayoutAction}
+            onModelChange={(model) => onLayoutModelChange(model)}
+          />
+        </div>
       </section>
+
+      {aboutOpen ? (
+        <div className="modal-backdrop" role="presentation" onClick={() => setAboutOpen(false)}>
+          <section
+            className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="About Parq-Bench"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>About Parq-Bench</h3>
+            <p className="phase">Parq-Bench — High-Performance Local Data Lake.</p>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setAboutOpen(false)}>
+                Close
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {pendingImportedLayout ? (
+        <div className="modal-backdrop" role="presentation" onClick={cancelImportedLayout}>
+          <section
+            className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Import layout preview"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>Import Layout Preview</h3>
+            <p className="phase">
+              File: <strong>{pendingImportedLayout.sourceFile}</strong>
+            </p>
+            <p className="phase">
+              Tabs: <strong>{pendingImportedLayout.tabCount}</strong>
+            </p>
+            <div className="meta-line">
+              {pendingImportedLayout.panelCounts.map((item) => (
+                <span key={`import-panel-${item.component}`} className="metric-chip">
+                  {item.component}: {item.count}
+                </span>
+              ))}
+            </div>
+            {pendingImportedLayout.unknownPanels.length > 0 ? (
+              <p className="error">
+                Unknown panel components: {pendingImportedLayout.unknownPanels.join(", ")}. They may render as
+                placeholders.
+              </p>
+            ) : null}
+            <label className="theme-picker">
+              Imported layout name
+              <input
+                type="text"
+                value={pendingImportedName}
+                onChange={(event) => setPendingImportedName(event.currentTarget.value)}
+              />
+            </label>
+            <div className="modal-actions">
+              <button type="button" onClick={applyImportedLayout}>
+                Import
+              </button>
+              <button type="button" onClick={cancelImportedLayout}>
+                Cancel
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </main>
   );
 }

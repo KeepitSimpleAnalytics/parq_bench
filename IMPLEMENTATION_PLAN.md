@@ -153,4 +153,25 @@ Acceptance criteria:
 6. Build DuckDB compatibility matrix runner over fixture corpus with schema/read/query/export checks and JSON report output. `COMPLETED`
 7. Wire compatibility matrix into release gate command + CI workflow (`npm run release:gate`, GitHub Actions on push/PR to `main`). `COMPLETED`
 8. Pin and document explicit DuckDB upgrade policy with matrix revalidation requirements (`docs/duckdb-upgrade-policy.md`). `COMPLETED`
-9. Next: cut Phase 3 hardening release candidate and run final manual UX regression before Phase 4/UI iteration. `PENDING`
+9. Cut Phase 3 hardening release candidate and run final manual UX regression before Phase 4/UI iteration. `COMPLETED` (manual gate checks: `praxis_2023_data.parquet` first viewport `354ms`, Perspective `792ms`; `2017_raw_data.parquet` first viewport `232ms`, Perspective `824ms`)
+
+## 13) Phase 4 UI iteration execution slice
+Goal: improve day-to-day usability and layout reliability while preserving performance gates.
+
+1. Reconcile UI planning docs with implemented state (`docs/UI_CONFIG_PLAN.md`): mark completed docking/layout/theme milestones and isolate remaining hardening items. `COMPLETED`
+2. Harden layout persistence recovery:
+   - Add explicit invalid/corrupt layout payload handling telemetry.
+   - Ensure auto-reset path cannot loop and always restores factory layout. `COMPLETED` (recovery telemetry + persisted fallback + no-loop empty-state guard)
+3. Drag/reposition reliability pass:
+   - Validate tabset drag/resize behavior across default, `pq-view`, `pq-sql`, and `slo-mo`.
+   - Add regression checks around edit-lock transitions and empty tabset deletion flow. `COMPLETED` (empty layout container pruning in `normalizeLayoutModel` + manual cross-layout validation)
+4. Workspace UX polish pass:
+   - Keep advanced checks under `Layouts` menu; no duplicate top-level controls.
+   - Validate slow-mode visibility contract (all slow-mode UI hidden when disabled). `COMPLETED`
+5. Performance guardrail confirmation:
+   - Run 5-run perf sweep on representative files and confirm `first viewport p95 <= 400ms`, `Perspective p95 <= 1000ms`, `failCount = 0`.
+   - Re-run `npm run release:gate` after UI hardening changes. `COMPLETED` (perf sweep: first viewport p95 `353ms`, Perspective p95 `720ms`, failCount `0`; release gate rerun passed via staged execution)
+6. Phase 4 exit criteria:
+   - Manual regression checklist passes (preview/virtual/perspective, workspace SQL/chart/export, gate/perf sweep, layout persistence).
+   - No new regressions in Rust tests, compatibility matrix, or release gate.
+   - Plan docs updated with measured results and RC notes. `COMPLETED`

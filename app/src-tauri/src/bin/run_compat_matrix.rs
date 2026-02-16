@@ -97,7 +97,11 @@ fn load_schema(conn: &Connection, source: &str) -> Result<Vec<FileSchemaColumn>,
         .map_err(|e| format!("collect schema query rows: {e}"))
 }
 
-fn run_sample_query(conn: &Connection, source: &str, schema: &[FileSchemaColumn]) -> Result<(), String> {
+fn run_sample_query(
+    conn: &Connection,
+    source: &str,
+    schema: &[FileSchemaColumn],
+) -> Result<(), String> {
     if schema.is_empty() {
         return Err("no columns returned by schema query".to_string());
     }
@@ -131,7 +135,11 @@ fn run_sample_query(conn: &Connection, source: &str, schema: &[FileSchemaColumn]
     Ok(())
 }
 
-fn run_export_check(conn: &Connection, source: &str, file_stem: &str) -> Result<(bool, bool), String> {
+fn run_export_check(
+    conn: &Connection,
+    source: &str,
+    file_stem: &str,
+) -> Result<(bool, bool), String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -145,13 +153,20 @@ fn run_export_check(conn: &Connection, source: &str, file_stem: &str) -> Result<
     let csv_sql_path = sql_path(&csv_path);
     let pq_sql_path = sql_path(&pq_path);
 
-    let csv_sql = format!("COPY (SELECT * FROM {source} LIMIT 250) TO '{csv_sql_path}' (FORMAT CSV, HEADER TRUE);");
-    let pq_sql = format!("COPY (SELECT * FROM {source} LIMIT 250) TO '{pq_sql_path}' (FORMAT PARQUET);");
+    let csv_sql = format!(
+        "COPY (SELECT * FROM {source} LIMIT 250) TO '{csv_sql_path}' (FORMAT CSV, HEADER TRUE);"
+    );
+    let pq_sql =
+        format!("COPY (SELECT * FROM {source} LIMIT 250) TO '{pq_sql_path}' (FORMAT PARQUET);");
 
     let csv_ok = conn.execute_batch(&csv_sql).is_ok()
-        && fs::metadata(&csv_path).map(|meta| meta.len() > 0).unwrap_or(false);
+        && fs::metadata(&csv_path)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false);
     let pq_ok = conn.execute_batch(&pq_sql).is_ok()
-        && fs::metadata(&pq_path).map(|meta| meta.len() > 0).unwrap_or(false);
+        && fs::metadata(&pq_path)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false);
 
     let _ = fs::remove_file(csv_path);
     let _ = fs::remove_file(pq_path);
@@ -283,7 +298,8 @@ fn main() -> Result<(), String> {
             "[{}] {} | rows={} cols={} nested={} err={}",
             if result.passed { "PASS" } else { "FAIL" },
             result.file_name,
-            result.row_count
+            result
+                .row_count
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "n/a".to_string()),
             result.column_count,
@@ -308,8 +324,8 @@ fn main() -> Result<(), String> {
     if let Some(parent) = report_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create report output directory: {e}"))?;
     }
-    let json = serde_json::to_string_pretty(&report)
-        .map_err(|e| format!("serialize report json: {e}"))?;
+    let json =
+        serde_json::to_string_pretty(&report).map_err(|e| format!("serialize report json: {e}"))?;
     fs::write(&report_path, json).map_err(|e| format!("write report: {e}"))?;
 
     println!(
@@ -319,7 +335,10 @@ fn main() -> Result<(), String> {
         report_path.display()
     );
     if report.fail_count > 0 {
-        return Err(format!("compatibility matrix failed: {} files failed", report.fail_count));
+        return Err(format!(
+            "compatibility matrix failed: {} files failed",
+            report.fail_count
+        ));
     }
     Ok(())
 }

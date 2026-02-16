@@ -1,10 +1,10 @@
 [package]
-name = "app"
+name = "parq-bench"
 version = "0.1.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
-default-run = "app"
+default-run = "parq-bench"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
