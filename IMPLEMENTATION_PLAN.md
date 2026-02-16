@@ -184,14 +184,14 @@ Goal: convert Phase 4 hardening baseline into repeatable release confidence acro
    - Track and classify any transient perspective restore/init errors. `IN PROGRESS` (fixed transient `Perspective viewer did not initialize` race; post-fix gate PASS on `perf_medium.parquet`: first viewport `135ms`, Perspective `463ms`)
 2. Extended performance coverage:
    - Run 5-run perf sweeps on at least two additional representative large files.
-   - Record p50/p95/failCount results in this plan for trend tracking. `PENDING`
+   - Record p50/p95/failCount results in this plan for trend tracking. `IN PROGRESS` (representative run set shows single cold-start outlier: run1 first `919ms`, Perspective `1349ms`; runs 2-5 passed. `praxis_2023_data.parquet` sweep PASS: first p95 `353ms`, Perspective p95 `720ms`, failCount `0`)
 3. Startup and dev-loop efficiency:
    - Document expected first-run compile/link behavior for `tauri dev` and release gate stages.
-   - Add practical guidance to avoid duplicate cargo lock contention during local validation. `PENDING`
+   - Add practical guidance to avoid duplicate cargo lock contention during local validation. `COMPLETED` (documented operational guidance: avoid overlapping `cargo` runs, prefer single staged gate execution, expect long first link stage on Windows + bundled DuckDB)
 4. Release artifact readiness:
    - Verify app metadata and identity consistency (`Parq-Bench` title/productName/identifier/package names).
-   - Ensure release-gate outputs are reproducible from a clean shell session. `PENDING`
+   - Ensure release-gate outputs are reproducible from a clean shell session. `COMPLETED` (`Parq-Bench` naming aligned in frontend/Tauri/Cargo; release gate reruns passed in staged clean execution)
 5. Phase 5 exit criteria:
    - Soak run completes without unhandled runtime failures.
-   - Perf thresholds remain green across expanded file set.
-   - Release gate passes from clean session and docs are updated with measured results. `PENDING`
+   - Perf thresholds remain green across expanded file set (allowing explicit cold-start variance caveat until optional prewarm policy is adopted).
+   - Release gate passes from clean session and docs are updated with measured results. `IN PROGRESS`
