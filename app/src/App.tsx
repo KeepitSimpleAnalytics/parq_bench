@@ -213,7 +213,7 @@ type StoredLayoutPrefs = {
 };
 
 const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";
-const UI_LAYOUT_STORAGE_KEY = "parqbench.ui.layouts.v1";
+const UI_LAYOUT_STORAGE_KEY = "parqbench.ui.layouts.v2";
 const UI_LAYOUT_RECOVERY_STORAGE_KEY = "parqbench.ui.layouts.recovery.v1";
 const UI_LAYOUT_EDIT_STORAGE_KEY = "parqbench.ui.layout_edit_enabled";
 const UI_WORKSPACE_SLOW_MODE_STORAGE_KEY = "parqbench.ui.workspace_slow_mode_enabled";
@@ -259,22 +259,14 @@ const DEFAULT_LAYOUT_MODEL: IJsonModel = {
     children: [
       {
         type: "tabset",
-        weight: 16,
-        enableClose: false,
-        enableDeleteWhenEmpty: true,
-        enableMaximize: false,
-        children: [{ type: "tab", component: "actions", name: "Actions", enableClose: false, enableDrag: true }],
-      },
-      {
-        type: "tabset",
-        weight: 40,
+        weight: 50,
         enableClose: false,
         enableDeleteWhenEmpty: true,
         children: [{ type: "tab", component: "preview", name: "Preview", enableClose: false }],
       },
       {
         type: "tabset",
-        weight: 30,
+        weight: 36,
         enableClose: false,
         enableDeleteWhenEmpty: true,
         children: [{ type: "tab", component: "workspace", name: "Workspace", enableClose: false }],
@@ -310,15 +302,7 @@ const PQ_VIEW_LAYOUT_MODEL: IJsonModel = {
     children: [
       {
         type: "tabset",
-        weight: 18,
-        enableClose: false,
-        enableDeleteWhenEmpty: true,
-        enableMaximize: false,
-        children: [{ type: "tab", component: "actions", name: "Actions", enableClose: false, enableDrag: true }],
-      },
-      {
-        type: "tabset",
-        weight: 68,
+        weight: 86,
         enableClose: false,
         enableDeleteWhenEmpty: true,
         children: [{ type: "tab", component: "preview", name: "Preview", enableClose: false }],
@@ -354,15 +338,7 @@ const PQ_SQL_LAYOUT_MODEL: IJsonModel = {
     children: [
       {
         type: "tabset",
-        weight: 16,
-        enableClose: false,
-        enableDeleteWhenEmpty: true,
-        enableMaximize: false,
-        children: [{ type: "tab", component: "actions", name: "Actions", enableClose: false, enableDrag: true }],
-      },
-      {
-        type: "tabset",
-        weight: 68,
+        weight: 84,
         enableClose: false,
         enableDeleteWhenEmpty: true,
         children: [{ type: "tab", component: "workspace", name: "Workspace", enableClose: false }],
@@ -416,7 +392,7 @@ function pruneEmptyLayoutNode(node: unknown): Record<string, unknown> | null {
     return null;
   }
 
-  if (node.type === "tab" && typeof node.component === "string" && node.component === "diagnostics") {
+  if (node.type === "tab" && typeof node.component === "string" && (node.component === "diagnostics" || node.component === "actions")) {
     return null;
   }
 
@@ -849,6 +825,8 @@ function App() {
   const [workspaceSql, setWorkspaceSql] = useState(
     "SELECT * FROM my_table LIMIT 100",
   );
+  const [editorHeight, setEditorHeight] = useState(180);
+  const [editorFontSize, setEditorFontSize] = useState(13);
   const [workspaceQueryResult, setWorkspaceQueryResult] = useState<WorkspaceQueryResponse | null>(null);
   const [workspaceChartPlugin, setWorkspaceChartPlugin] = useState<WorkspaceChartPlugin>("Datagrid");
   const [workspaceChartX, setWorkspaceChartX] = useState("");
@@ -2690,7 +2668,7 @@ function App() {
       const panelCounts = Array.from(panelCountsMap.entries())
         .map(([component, count]) => ({ component, count }))
         .sort((a, b) => a.component.localeCompare(b.component));
-      const knownPanels = new Set<DockPanelComponent>(["actions", "preview", "workspace", "diagnostics"]);
+      const knownPanels = new Set<DockPanelComponent>(["preview", "workspace", "diagnostics"]);
       const unknownPanels = panelCounts
         .map((item) => item.component)
         .filter((component) => !knownPanels.has(component as DockPanelComponent));
@@ -2795,7 +2773,7 @@ function App() {
   }
 
   const actionsPanel = (
-    <section className="dock-panel">
+    <section className="actions-toolbar">
       <div className="actions">
         <button type="button" onClick={() => void openParquetPreview()} disabled={loading || memoryGuardActive}>
           Open Parquet
@@ -3395,9 +3373,14 @@ function App() {
       ) : null}
 
       <div className="workspace-sql-row">
-        <div className="workspace-editor">
+        <div className="workspace-editor" style={{ height: editorHeight, resize: "vertical", overflow: "hidden" }}
+          onMouseUp={(e) => {
+            const h = (e.currentTarget as HTMLDivElement).offsetHeight;
+            if (h !== editorHeight) setEditorHeight(h);
+          }}
+        >
           <Editor
-            height="180px"
+            height="100%"
             defaultLanguage="sql"
             defaultValue={workspaceSql}
             theme={resolvedTheme === "dark" ? "vs-dark" : "vs"}
@@ -3407,15 +3390,22 @@ function App() {
               automaticLayout: true,
               minimap: { enabled: false },
               wordWrap: "on",
-              fontSize: 13,
+              fontSize: editorFontSize,
               scrollBeyondLastLine: false,
               lineNumbers: "on",
             }}
           />
         </div>
-        <button type="button" onClick={() => void runWorkspaceQuery()} disabled={loading}>
-          Run SQL
-        </button>
+        <div className="workspace-editor-controls">
+          <button type="button" onClick={() => void runWorkspaceQuery()} disabled={loading}>
+            Run SQL
+          </button>
+          <span className="editor-font-controls">
+            <button type="button" onClick={() => { const s = Math.max(10, editorFontSize - 2); setEditorFontSize(s); workspaceEditorRef.current?.updateOptions({ fontSize: s }); }}>A-</button>
+            <span className="phase">{editorFontSize}px</span>
+            <button type="button" onClick={() => { const s = Math.min(28, editorFontSize + 2); setEditorFontSize(s); workspaceEditorRef.current?.updateOptions({ fontSize: s }); }}>A+</button>
+          </span>
+        </div>
         <div className="workspace-export-row">
           <button type="button" onClick={() => void exportWorkspaceQuery("csv")} disabled={loading}>
             Export Query CSV
@@ -3548,7 +3538,7 @@ function App() {
     const component = node.getComponent() as DockPanelComponent;
     switch (component) {
       case "actions":
-        return actionsPanel;
+        return null;
       case "preview":
         return previewPanel;
       case "workspace":
@@ -3586,20 +3576,20 @@ function App() {
           <button type="button" onClick={() => setAboutOpen(true)} disabled={pendingImportedLayout !== null}>
             About
           </button>
-          <span className="phase">{PRODUCT_STAGE_LABEL}</span>
+          <span className="beta-badge">{PRODUCT_STAGE_LABEL} v0.1.0</span>
         </div>
       </header>
 
-      <section className="card">
-        <div className={`dock-host ${dockThemeClass}`}>
-          <Layout
-            model={layoutModel}
-            factory={dockFactory}
-            onAction={onLayoutAction}
-            onModelChange={(model) => onLayoutModelChange(model)}
-          />
-        </div>
-      </section>
+      {actionsPanel}
+
+      <div className={`dock-host ${dockThemeClass}`}>
+        <Layout
+          model={layoutModel}
+          factory={dockFactory}
+          onAction={onLayoutAction}
+          onModelChange={(model) => onLayoutModelChange(model)}
+        />
+      </div>
 
       {aboutOpen ? (
         <div className="modal-backdrop" role="presentation" onClick={() => setAboutOpen(false)}>
@@ -3610,9 +3600,26 @@ function App() {
             aria-label="About Parq-Bench"
             onClick={(event) => event.stopPropagation()}
           >
-            <h3>About Parq-Bench</h3>
-            <p className="phase">Parq-Bench v0.1.0 ({PRODUCT_STAGE_LABEL}).</p>
-            <p className="phase">Local-first Parquet preview and workspace SQL exploration.</p>
+            <h3>Parq-Bench</h3>
+            <span className="beta-badge" style={{ marginBottom: 12, alignSelf: "flex-start" }}>{PRODUCT_STAGE_LABEL} v0.1.0</span>
+            <p style={{ margin: "8px 0", lineHeight: 1.5 }}>
+              A high-performance desktop application for exploring large Parquet files locally.
+              No cloud, no accounts, no telemetry — all processing happens on your machine.
+            </p>
+            <p style={{ margin: "8px 0", lineHeight: 1.5, color: "var(--text-soft)" }}>
+              Built with care by{" "}
+              <a
+                href="https://www.keepitsimpleanalytics.com"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "var(--accent)" }}
+              >
+                KISA — Keep it Simple Analytics LLC
+              </a>
+            </p>
+            <p style={{ margin: "8px 0", fontSize: "0.84rem", color: "var(--text-soft)" }}>
+              Licensed under Apache 2.0. We believe great tools should be open and accessible to everyone.
+            </p>
             <div className="modal-actions">
               <button type="button" onClick={() => setAboutOpen(false)}>
                 Close
