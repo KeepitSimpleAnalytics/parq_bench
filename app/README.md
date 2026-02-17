@@ -1,6 +1,6 @@
-# Tauri + React + Typescript
+# Parq-Bench App
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+This directory contains the Tauri + React + TypeScript application. See the [main README](../README.md) for features, setup, and architecture.
 
 ## Recommended IDE Setup
 
