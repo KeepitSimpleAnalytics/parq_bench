@@ -1230,7 +1230,7 @@ function App() {
     if (model) {
       monaco.editor.setModelLanguage(model, "sql");
     }
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, async () => {
+    const pasteFromClipboard = async () => {
       try {
         const text = await readText();
         if (text) {
@@ -1240,6 +1240,14 @@ function App() {
           }
         }
       } catch (_) { /* clipboard unavailable */ }
+    };
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, pasteFromClipboard);
+    editor.addAction({
+      id: "tauri-paste",
+      label: "Paste",
+      contextMenuGroupId: "9_cutcopypaste",
+      contextMenuOrder: 3,
+      run: pasteFromClipboard,
     });
     setWorkspaceEditorReady(true);
   };
