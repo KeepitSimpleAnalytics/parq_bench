@@ -16,6 +16,23 @@ use tauri::Manager;
 use tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+/// Run a closure on a dedicated thread with an 8 MB stack.
+/// DuckDB builds deep recursive execution trees on large datasets that
+/// overflow the default ~1 MB Tauri command-thread stack.
+fn on_duckdb_thread<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    thread::Builder::new()
+        .name("duckdb-work".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(f)
+        .map_err(|e| format!("spawn duckdb thread: {e}"))?
+        .join()
+        .map_err(|_| "duckdb thread panicked".to_string())?
+}
+
 #[derive(Serialize)]
 struct SmokeRow {
     id: i64,
@@ -1122,37 +1139,40 @@ fn preview_parquet(
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<ParquetPreviewResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
-    let started = Instant::now();
-    let file_size_bytes = fs::metadata(&file_path)
-        .map_err(|e| format!("read file metadata: {e}"))?
-        .len();
-    let normalized = escape_sql_string_literal(&file_path);
-    let source = format!("read_parquet('{normalized}')");
-    let conn = open_configured_duckdb(state.as_ref())?;
-    let total_rows = parquet_total_rows(&conn, &normalized, &source)?;
-    let schema = parquet_schema(&conn, &source)?;
-    let row_offset = 0_u64;
-    let row_limit = row_limit.max(1);
-    let rows = parquet_rows_page(&conn, &source, &schema, row_offset, row_limit)?;
-    log_perf(
-        "preview_parquet",
-        &format!(
-            "duration_ms={} file_size_bytes={} schema_cols={} rows={}",
-            started.elapsed().as_millis(),
-            file_size_bytes,
-            schema.len(),
-            rows.len()
-        ),
-    );
+    let st = state.inner().clone();
+    on_duckdb_thread(move || {
+        let started = Instant::now();
+        let file_size_bytes = fs::metadata(&file_path)
+            .map_err(|e| format!("read file metadata: {e}"))?
+            .len();
+        let normalized = escape_sql_string_literal(&file_path);
+        let source = format!("read_parquet('{normalized}')");
+        let conn = open_configured_duckdb(&st)?;
+        let total_rows = parquet_total_rows(&conn, &normalized, &source)?;
+        let schema = parquet_schema(&conn, &source)?;
+        let row_offset = 0_u64;
+        let row_limit = row_limit.max(1);
+        let rows = parquet_rows_page(&conn, &source, &schema, row_offset, row_limit)?;
+        log_perf(
+            "preview_parquet",
+            &format!(
+                "duration_ms={} file_size_bytes={} schema_cols={} rows={}",
+                started.elapsed().as_millis(),
+                file_size_bytes,
+                schema.len(),
+                rows.len()
+            ),
+        );
 
-    Ok(ParquetPreviewResponse {
-        file_path,
-        file_size_bytes,
-        total_rows,
-        row_offset,
-        row_limit,
-        schema,
-        rows,
+        Ok(ParquetPreviewResponse {
+            file_path,
+            file_size_bytes,
+            total_rows,
+            row_offset,
+            row_limit,
+            schema,
+            rows,
+        })
     })
 }
 
@@ -1164,27 +1184,30 @@ fn fetch_parquet_rows(
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<ParquetRowsPage, String> {
     ensure_memory_guard_clear(state.as_ref())?;
-    let started = Instant::now();
-    let normalized = escape_sql_string_literal(&file_path);
-    let source = format!("read_parquet('{normalized}')");
-    let conn = open_configured_duckdb(state.as_ref())?;
-    let schema = parquet_schema(&conn, &source)?;
-    let rows = parquet_rows_page(&conn, &source, &schema, row_offset, row_limit.max(1))?;
-    log_perf(
-        "fetch_parquet_rows",
-        &format!(
-            "duration_ms={} row_offset={} row_limit={} rows={}",
-            started.elapsed().as_millis(),
-            row_offset,
-            row_limit.max(1),
-            rows.len()
-        ),
-    );
+    let st = state.inner().clone();
+    on_duckdb_thread(move || {
+        let started = Instant::now();
+        let normalized = escape_sql_string_literal(&file_path);
+        let source = format!("read_parquet('{normalized}')");
+        let conn = open_configured_duckdb(&st)?;
+        let schema = parquet_schema(&conn, &source)?;
+        let rows = parquet_rows_page(&conn, &source, &schema, row_offset, row_limit.max(1))?;
+        log_perf(
+            "fetch_parquet_rows",
+            &format!(
+                "duration_ms={} row_offset={} row_limit={} rows={}",
+                started.elapsed().as_millis(),
+                row_offset,
+                row_limit.max(1),
+                rows.len()
+            ),
+        );
 
-    Ok(ParquetRowsPage {
-        row_offset,
-        row_limit: row_limit.max(1),
-        rows,
+        Ok(ParquetRowsPage {
+            row_offset,
+            row_limit: row_limit.max(1),
+            rows,
+        })
     })
 }
 
@@ -1260,15 +1283,20 @@ async fn fetch_parquet_rows_transport(
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<ParquetRowsTransportResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
-    let started = Instant::now();
-    let normalized = escape_sql_string_literal(&file_path);
-    let source = format!("read_parquet('{normalized}')");
-    let conn = open_configured_duckdb(state.as_ref())?;
+    let st = state.inner().clone();
+    let (row_count, payload, started) = on_duckdb_thread(move || {
+        let started = Instant::now();
+        let normalized = escape_sql_string_literal(&file_path);
+        let source = format!("read_parquet('{normalized}')");
+        let conn = open_configured_duckdb(&st)?;
+        let safe_limit = row_limit.max(1);
+        let schema = parquet_schema(&conn, &source)?;
+        let rows = parquet_rows_page(&conn, &source, &schema, row_offset, safe_limit)?;
+        let row_count = rows.len();
+        let payload = rows_to_arrow_ipc(&schema, &rows)?;
+        Ok((row_count, payload, started))
+    })?;
     let safe_limit = row_limit.max(1);
-    let schema = parquet_schema(&conn, &source)?;
-    let rows = parquet_rows_page(&conn, &source, &schema, row_offset, safe_limit)?;
-    let row_count = rows.len();
-    let payload = rows_to_arrow_ipc(&schema, &rows)?;
     let payload_bytes = payload.len();
 
     if payload_bytes < INLINE_IPC_MAX_BYTES {
@@ -1441,58 +1469,46 @@ fn run_workspace_query(
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<WorkspaceQueryResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
-    let state_ref = state.inner().clone();
-    thread::Builder::new()
-        .name("duckdb-query".into())
-        .stack_size(8 * 1024 * 1024)
-        .spawn(move || run_workspace_query_inner(sql, row_limit, &state_ref))
-        .map_err(|e| format!("spawn query thread: {e}"))?
-        .join()
-        .map_err(|_| "query thread panicked".to_string())?
-}
+    let st = state.inner().clone();
+    on_duckdb_thread(move || {
+        let started = Instant::now();
+        let normalized_sql = normalize_single_sql_statement(&sql)?;
 
-fn run_workspace_query_inner(
-    sql: String,
-    row_limit: u32,
-    state: &AppRuntimeState,
-) -> Result<WorkspaceQueryResponse, String> {
-    let started = Instant::now();
-    let normalized_sql = normalize_single_sql_statement(&sql)?;
+        let tables = {
+            let lock = st
+                .workspace_tables
+                .lock()
+                .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+            lock.clone()
+        };
 
-    let tables = {
-        let lock = state
-            .workspace_tables
-            .lock()
-            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
-        lock.clone()
-    };
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        let safe_limit = row_limit.max(1);
+        let schema = query_schema(&conn, &normalized_sql)?;
+        let (rows, truncated) = query_rows_with_limit(&conn, &normalized_sql, &schema, safe_limit)?;
+        let elapsed_ms = started.elapsed().as_millis();
+        log_perf(
+            "run_workspace_query",
+            &format!(
+                "duration_ms={} row_limit={} row_count={} truncated={} workspace_tables={}",
+                elapsed_ms,
+                safe_limit,
+                rows.len(),
+                truncated,
+                tables.len()
+            ),
+        );
 
-    let conn = open_configured_duckdb(state)?;
-    apply_workspace_tables(&conn, &tables)?;
-    let safe_limit = row_limit.max(1);
-    let schema = query_schema(&conn, &normalized_sql)?;
-    let (rows, truncated) = query_rows_with_limit(&conn, &normalized_sql, &schema, safe_limit)?;
-    let elapsed_ms = started.elapsed().as_millis();
-    log_perf(
-        "run_workspace_query",
-        &format!(
-            "duration_ms={} row_limit={} row_count={} truncated={} workspace_tables={}",
-            elapsed_ms,
-            safe_limit,
-            rows.len(),
+        Ok(WorkspaceQueryResponse {
+            sql: normalized_sql,
+            row_limit: safe_limit,
+            row_count: rows.len(),
             truncated,
-            tables.len()
-        ),
-    );
-
-    Ok(WorkspaceQueryResponse {
-        sql: normalized_sql,
-        row_limit: safe_limit,
-        row_count: rows.len(),
-        truncated,
-        elapsed_ms,
-        schema,
-        rows,
+            elapsed_ms,
+            schema,
+            rows,
+        })
     })
 }
 
@@ -1502,7 +1518,7 @@ fn describe_workspace_table(
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<Vec<ParquetSchemaColumn>, String> {
     ensure_memory_guard_clear(state.as_ref())?;
-    let alias_trimmed = alias.trim();
+    let alias_trimmed = alias.trim().to_string();
     if alias_trimmed.is_empty() {
         return Err("Workspace alias is required.".to_string());
     }
@@ -1516,14 +1532,17 @@ fn describe_workspace_table(
     };
     let exists = tables
         .iter()
-        .any(|entry| entry.alias.eq_ignore_ascii_case(alias_trimmed));
+        .any(|entry| entry.alias.eq_ignore_ascii_case(&alias_trimmed));
     if !exists {
         return Err(format!("Workspace alias not found: {alias_trimmed}"));
     }
 
-    let conn = open_configured_duckdb(state.as_ref())?;
-    apply_workspace_tables(&conn, &tables)?;
-    table_schema_for_alias(&conn, alias_trimmed)
+    let st = state.inner().clone();
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        table_schema_for_alias(&conn, &alias_trimmed)
+    })
 }
 
 #[tauri::command]
@@ -1534,9 +1553,8 @@ fn export_workspace_query(
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<WorkspaceExportResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
-    let started = Instant::now();
     let normalized_sql = normalize_single_sql_statement(&sql)?;
-    let trimmed_path = output_path.trim();
+    let trimmed_path = output_path.trim().to_string();
     if trimmed_path.is_empty() {
         return Err("Output path is required.".to_string());
     }
@@ -1549,33 +1567,37 @@ fn export_workspace_query(
         lock.clone()
     };
 
-    let conn = open_configured_duckdb(state.as_ref())?;
-    apply_workspace_tables(&conn, &tables)?;
-    export_workspace_query_to_file(&conn, &normalized_sql, trimmed_path, &format)?;
+    let st = state.inner().clone();
+    on_duckdb_thread(move || {
+        let started = Instant::now();
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        export_workspace_query_to_file(&conn, &normalized_sql, &trimmed_path, &format)?;
 
-    let file_size_bytes = fs::metadata(trimmed_path)
-        .map(|meta| meta.len())
-        .unwrap_or(0);
-    let elapsed_ms = started.elapsed().as_millis();
-    let normalized_format = format.trim().to_ascii_lowercase();
-    log_perf(
-        "export_workspace_query",
-        &format!(
-            "duration_ms={} format={} output_path={} file_size_bytes={} workspace_tables={}",
-            elapsed_ms,
-            normalized_format,
-            trimmed_path,
+        let file_size_bytes = fs::metadata(&trimmed_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        let elapsed_ms = started.elapsed().as_millis();
+        let normalized_format = format.trim().to_ascii_lowercase();
+        log_perf(
+            "export_workspace_query",
+            &format!(
+                "duration_ms={} format={} output_path={} file_size_bytes={} workspace_tables={}",
+                elapsed_ms,
+                normalized_format,
+                trimmed_path,
+                file_size_bytes,
+                tables.len()
+            ),
+        );
+
+        Ok(WorkspaceExportResponse {
+            sql: normalized_sql,
+            format: normalized_format,
+            output_path: trimmed_path,
             file_size_bytes,
-            tables.len()
-        ),
-    );
-
-    Ok(WorkspaceExportResponse {
-        sql: normalized_sql,
-        format: normalized_format,
-        output_path: trimmed_path.to_string(),
-        file_size_bytes,
-        elapsed_ms,
+            elapsed_ms,
+        })
     })
 }
 
@@ -1586,12 +1608,12 @@ fn diff_workspace_schema(
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<WorkspaceSchemaDiffResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
-    let left_trimmed = left_alias.trim();
-    let right_trimmed = right_alias.trim();
+    let left_trimmed = left_alias.trim().to_string();
+    let right_trimmed = right_alias.trim().to_string();
     if left_trimmed.is_empty() || right_trimmed.is_empty() {
         return Err("Both workspace aliases are required.".to_string());
     }
-    if left_trimmed.eq_ignore_ascii_case(right_trimmed) {
+    if left_trimmed.eq_ignore_ascii_case(&right_trimmed) {
         return Err("Choose two different workspace aliases for schema diff.".to_string());
     }
 
@@ -1604,10 +1626,10 @@ fn diff_workspace_schema(
     };
     let has_left = tables
         .iter()
-        .any(|entry| entry.alias.eq_ignore_ascii_case(left_trimmed));
+        .any(|entry| entry.alias.eq_ignore_ascii_case(&left_trimmed));
     let has_right = tables
         .iter()
-        .any(|entry| entry.alias.eq_ignore_ascii_case(right_trimmed));
+        .any(|entry| entry.alias.eq_ignore_ascii_case(&right_trimmed));
     if !has_left {
         return Err(format!("Workspace alias not found: {left_trimmed}"));
     }
@@ -1615,25 +1637,28 @@ fn diff_workspace_schema(
         return Err(format!("Workspace alias not found: {right_trimmed}"));
     }
 
-    let conn = open_configured_duckdb(state.as_ref())?;
-    apply_workspace_tables(&conn, &tables)?;
-    let left_schema = table_schema_for_alias(&conn, left_trimmed)?;
-    let right_schema = table_schema_for_alias(&conn, right_trimmed)?;
-    let diff =
-        build_workspace_schema_diff(left_trimmed, &left_schema, right_trimmed, &right_schema);
-    log_perf(
-        "diff_workspace_schema",
-        &format!(
-            "left_alias={} right_alias={} added={} removed={} type_changed={} unchanged={}",
-            left_trimmed,
-            right_trimmed,
-            diff.added_count,
-            diff.removed_count,
-            diff.type_changed_count,
-            diff.unchanged_count
-        ),
-    );
-    Ok(diff)
+    let st = state.inner().clone();
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        let left_schema = table_schema_for_alias(&conn, &left_trimmed)?;
+        let right_schema = table_schema_for_alias(&conn, &right_trimmed)?;
+        let diff =
+            build_workspace_schema_diff(&left_trimmed, &left_schema, &right_trimmed, &right_schema);
+        log_perf(
+            "diff_workspace_schema",
+            &format!(
+                "left_alias={} right_alias={} added={} removed={} type_changed={} unchanged={}",
+                left_trimmed,
+                right_trimmed,
+                diff.added_count,
+                diff.removed_count,
+                diff.type_changed_count,
+                diff.unchanged_count
+            ),
+        );
+        Ok(diff)
+    })
 }
 
 #[cfg(test)]
