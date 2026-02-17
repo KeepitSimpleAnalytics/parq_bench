@@ -1441,6 +1441,21 @@ fn run_workspace_query(
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<WorkspaceQueryResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
+    let state_ref = state.inner().clone();
+    thread::Builder::new()
+        .name("duckdb-query".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || run_workspace_query_inner(sql, row_limit, &state_ref))
+        .map_err(|e| format!("spawn query thread: {e}"))?
+        .join()
+        .map_err(|_| "query thread panicked".to_string())?
+}
+
+fn run_workspace_query_inner(
+    sql: String,
+    row_limit: u32,
+    state: &AppRuntimeState,
+) -> Result<WorkspaceQueryResponse, String> {
     let started = Instant::now();
     let normalized_sql = normalize_single_sql_statement(&sql)?;
 
@@ -1452,7 +1467,7 @@ fn run_workspace_query(
         lock.clone()
     };
 
-    let conn = open_configured_duckdb(state.as_ref())?;
+    let conn = open_configured_duckdb(state)?;
     apply_workspace_tables(&conn, &tables)?;
     let safe_limit = row_limit.max(1);
     let schema = query_schema(&conn, &normalized_sql)?;
