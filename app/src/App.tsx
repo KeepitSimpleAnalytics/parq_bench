@@ -2288,8 +2288,6 @@ function App() {
   const memoryGuardActive = runtimeHealth?.memory_guard_tripped ?? false;
   const memoryUsagePct = runtimeHealth ? runtimeHealth.usage_ratio * 100 : null;
   const memoryRssMb = runtimeHealth ? runtimeHealth.process_rss_bytes / (1024 * 1024) : null;
-  const previewRowCount = preview?.total_rows ?? null;
-  const previewColumnCount = preview?.schema.length ?? null;
   const workspaceRowCount = workspaceQueryResult?.row_count ?? null;
   const workspaceColumnCount = workspaceQueryResult?.schema.length ?? null;
   const workspaceQueryElapsedMs = workspaceQueryResult?.elapsed_ms ?? null;
@@ -2812,6 +2810,24 @@ function App() {
             >
               Perspective View
             </button>
+            <button type="button" onClick={() => {
+              setPreview(null);
+              setViewMode("virtual");
+              setPerspectiveStatus("idle");
+              setPerspectiveStage("idle");
+              setPerspectiveError(null);
+              setPerspectiveLoadedForFile(null);
+              setFirstViewportMs(null);
+              setPerspectiveReadyMs(null);
+              setLoadedRows(new Map());
+              setLoadedPages(new Set());
+              setInFlightPages(new Set());
+              setScrollTop(0);
+              setScrollLeft(0);
+              setAcceptanceGate(null);
+            }}>
+              Close File
+            </button>
           </>
         ) : null}
         {INTERNAL_TOOLS_ENABLED && result ? <span>DuckDB {result.duckdb_version}</span> : null}
@@ -2889,9 +2905,6 @@ function App() {
             </span>
           ) : null}
           {runtimeHealth ? <span className="metric-chip">RSS: {memoryRssMb?.toFixed(1) ?? "n/a"} MB</span> : null}
-          {previewRowCount !== null ? <span className="metric-chip">Preview rows: {previewRowCount.toLocaleString()}</span> : null}
-          {previewColumnCount !== null ? <span className="metric-chip">Preview cols: {previewColumnCount}</span> : null}
-          {firstViewportMs !== null ? <span className="metric-chip">Preview load: {firstViewportMs.toFixed(0)}ms</span> : null}
           {workspaceRowCount !== null ? <span className="metric-chip">SQL rows: {workspaceRowCount.toLocaleString()}</span> : null}
           {workspaceColumnCount !== null ? <span className="metric-chip">SQL cols: {workspaceColumnCount}</span> : null}
           {workspaceQueryElapsedMs !== null ? (
@@ -3532,18 +3545,16 @@ function App() {
       <header className="topbar">
         <h1>Parq-Bench — High-Performance Local Data Lake</h1>
         <div className="topbar-right">
-          {LAYOUTS_ENABLED ? (
-            <label className="theme-picker">
-              Layout
-              <select value={activeLayout?.id ?? ""} onChange={(event) => switchLayout(event.currentTarget.value)}>
-                {savedLayouts.map((layout) => (
-                  <option key={`layout-top-${layout.id}`} value={layout.id}>
-                    {layout.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
+          <label className="theme-picker">
+            Layout
+            <select value={activeLayout?.id ?? ""} onChange={(event) => switchLayout(event.currentTarget.value)}>
+              {savedLayouts.map((layout) => (
+                <option key={`layout-top-${layout.id}`} value={layout.id}>
+                  {layout.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <label className="theme-picker">
             Theme
             <select value={themeMode} onChange={(event) => setThemeMode(event.currentTarget.value as ThemeMode)}>
