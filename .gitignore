@@ -19,3 +19,11 @@ desktop.ini
 
 # Development protocol (not part of release)
 systematic-dev/
+
+# Documents (not part of release)
+*.docx
+*.doc
+
+# Screenshots
+*.jpg
+*.jpeg
