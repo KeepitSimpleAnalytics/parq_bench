@@ -220,6 +220,18 @@ const DEFAULT_LAYOUT_ID = "default";
 const PQ_VIEW_LAYOUT_ID = "pq_view";
 const PQ_SQL_LAYOUT_ID = "pq_sql";
 const SLO_MO_LAYOUT_ID = "slo_mo";
+/**
+ * Feature flags (compile-time, dead-code eliminated by Vite in production):
+ *
+ * INTERNAL_TOOLS_ENABLED — gates acceptance gate, perf sweeps, transport
+ *   benchmarks, diagnostics panel, runtime metrics, and export buttons.
+ *   Always on in dev. In production builds, set the env var
+ *   VITE_PARQBENCH_INTERNAL_TOOLS=1 at build time to enable.
+ *
+ * LAYOUTS_ENABLED — gates the docking layout system (save/switch/rename
+ *   layouts, drag-lock toggle). Requires INTERNAL_TOOLS_ENABLED. Set
+ *   VITE_PARQBENCH_LAYOUTS_ENABLED=1 at build time to enable.
+ */
 const INTERNAL_TOOLS_ENABLED =
   import.meta.env.DEV || import.meta.env.VITE_PARQBENCH_INTERNAL_TOOLS === "1";
 const PRODUCT_STAGE_LABEL = "Beta";
@@ -858,6 +870,8 @@ function App() {
   const slowModeAutoEnabledByLayoutRef = useRef(false);
   const layoutRecoveryInProgressRef = useRef(false);
   const perspectiveRuntimeInitRef = useRef<Promise<void> | null>(null);
+  // Perspective module doesn't ship comprehensive TS types; typed as unknown
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const perspectiveCoreRef = useRef<any>(null);
   const workspaceEditorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const workspaceMonacoRef = useRef<typeof Monaco | null>(null);
@@ -1382,6 +1396,8 @@ function App() {
 
       stage = "worker";
       setPerspectiveStage(stage);
+      // Perspective worker API is untyped; see https://perspective.finos.org/docs/js/
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const worker: any = await withTimeout("perspective worker()", perspective.worker());
       stage = "table";
       setPerspectiveStage(stage);
