@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Editor, { type OnMount } from "@monaco-editor/react";
+import Editor, { loader, type OnMount } from "@monaco-editor/react";
+import * as monacoEditor from "monaco-editor";
+loader.config({ monaco: monacoEditor });
 import { Actions, Layout, Model, type Action, type IJsonModel, type TabNode } from "flexlayout-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
@@ -2775,9 +2777,11 @@ function App() {
   const actionsPanel = (
     <section className="actions-toolbar">
       <div className="actions">
-        <button type="button" onClick={() => void openParquetPreview()} disabled={loading || memoryGuardActive}>
-          Open Parquet
-        </button>
+        {activeLayoutId !== PQ_SQL_LAYOUT_ID && activeLayoutId !== SLO_MO_LAYOUT_ID ? (
+          <button type="button" onClick={() => void openParquetPreview()} disabled={loading || memoryGuardActive}>
+            Open Parquet
+          </button>
+        ) : null}
         {INTERNAL_TOOLS_ENABLED ? (
           <>
             <button type="button" onClick={() => void runAcceptanceGate()} disabled={loading || memoryGuardActive}>
@@ -2798,16 +2802,20 @@ function App() {
         ) : null}
         {preview ? (
           <>
-            <button type="button" onClick={() => setViewMode("virtual")} disabled={viewMode === "virtual"}>
-              Virtual View
-            </button>
-            <button
-              type="button"
-              onClick={() => setViewMode("perspective")}
-              disabled={perspectiveStatus !== "ready" || viewMode === "perspective"}
-            >
-              Perspective View
-            </button>
+            {INTERNAL_TOOLS_ENABLED ? (
+              <>
+                <button type="button" onClick={() => setViewMode("virtual")} disabled={viewMode === "virtual"}>
+                  Virtual View
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode("perspective")}
+                  disabled={perspectiveStatus !== "ready" || viewMode === "perspective"}
+                >
+                  Perspective View
+                </button>
+              </>
+            ) : null}
             <button type="button" onClick={() => {
               setPreview(null);
               setViewMode("virtual");
