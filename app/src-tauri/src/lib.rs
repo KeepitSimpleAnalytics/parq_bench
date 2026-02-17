@@ -2113,6 +2113,7 @@ pub fn run() {
         .manage(Arc::clone(&runtime_state))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let state = app.state::<Arc<AppRuntimeState>>().inner().clone();
             spawn_memory_monitor(state);

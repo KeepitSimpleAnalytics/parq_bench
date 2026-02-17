@@ -3,6 +3,7 @@ import Editor, { type OnMount } from "@monaco-editor/react";
 import { Actions, Layout, Model, type Action, type IJsonModel, type TabNode } from "flexlayout-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { tableFromIPC } from "apache-arrow";
 import type * as Monaco from "monaco-editor";
 import "flexlayout-react/style/combined.css";
@@ -1229,6 +1230,17 @@ function App() {
     if (model) {
       monaco.editor.setModelLanguage(model, "sql");
     }
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, async () => {
+      try {
+        const text = await readText();
+        if (text) {
+          const selection = editor.getSelection();
+          if (selection) {
+            editor.executeEdits("paste", [{ range: selection, text }]);
+          }
+        }
+      } catch (_) { /* clipboard unavailable */ }
+    });
     setWorkspaceEditorReady(true);
   };
 
