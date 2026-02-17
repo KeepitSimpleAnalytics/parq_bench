@@ -819,7 +819,7 @@ function App() {
   const [workspacePathInput, setWorkspacePathInput] = useState("");
   const [workspaceIsGlob, setWorkspaceIsGlob] = useState(false);
   const [workspaceSlowModeEnabled, setWorkspaceSlowModeEnabled] = useState<boolean>(
-    () => INTERNAL_TOOLS_ENABLED && readWorkspaceSlowModeEnabled(),
+    () => readWorkspaceSlowModeEnabled(),
   );
   const [workspaceSourceKind, setWorkspaceSourceKind] = useState<WorkspaceSourceKind>("parquet");
   const [workspaceDelimiterInput, setWorkspaceDelimiterInput] = useState("");
@@ -2435,19 +2435,9 @@ function App() {
     if (!LAYOUTS_ENABLED && layoutMenuOpen) {
       setLayoutMenuOpen(false);
     }
-    if (INTERNAL_TOOLS_ENABLED) {
-      return;
-    }
-    if (workspaceSlowModeEnabled) {
-      setWorkspaceSlowModeEnabled(false);
-    }
-  }, [layoutEditEnabled, layoutMenuOpen, workspaceSlowModeEnabled]);
+  }, [layoutEditEnabled, layoutMenuOpen]);
 
   useEffect(() => {
-    if (!INTERNAL_TOOLS_ENABLED) {
-      previousLayoutIdRef.current = activeLayoutId;
-      return;
-    }
     const previous = previousLayoutIdRef.current;
 
     if (activeLayoutId === SLO_MO_LAYOUT_ID && previous !== SLO_MO_LAYOUT_ID) {
@@ -3175,38 +3165,36 @@ function App() {
   const workspacePanel = (
     <section className="workspace-panel">
       <h3>Workspace Explorer</h3>
-      {INTERNAL_TOOLS_ENABLED ? (
-        <>
-          <div className="workspace-mode-row">
-            <label className="workspace-slow-toggle">
-              <input
-                type="checkbox"
-                checked={workspaceSlowModeEnabled}
-                onChange={(event) => setWorkspaceSlowModeEnabled(event.currentTarget.checked)}
-              />
-              Enable Slo-mo
-            </label>
-            {workspaceSlowModeEnabled ? <span className="metric-chip metric-bad">Slo-mo enabled</span> : null}
-          </div>
-          {workspaceSlowModeEnabled ? (
-            <div className="workspace-slow-warning">
-              Slo-mo enabled. You can process non-Parquet files, but at the expense of speed.
-            </div>
-          ) : null}
-          {workspaceSlowModeEnabled ? (
-            <div className="workspace-source-row">
-              <label>
-                Source type
-                <select
-                  value={workspaceSourceKind}
-                  onChange={(event) => {
-                    const next = event.currentTarget.value as WorkspaceSourceKind;
-                    setWorkspaceSourceKind(next);
-                    if (next === "parquet") {
-                      setWorkspaceDelimiterInput("");
-                    }
-                  }}
-                >
+      <div className="workspace-mode-row">
+        <label className="workspace-slow-toggle">
+          <input
+            type="checkbox"
+            checked={workspaceSlowModeEnabled}
+            onChange={(event) => setWorkspaceSlowModeEnabled(event.currentTarget.checked)}
+          />
+          Enable Slo-mo
+        </label>
+        {workspaceSlowModeEnabled ? <span className="metric-chip metric-bad">Slo-mo enabled</span> : null}
+      </div>
+      {workspaceSlowModeEnabled ? (
+        <div className="workspace-slow-warning">
+          Slo-mo enabled. You can process non-Parquet files, but at the expense of speed.
+        </div>
+      ) : null}
+      {workspaceSlowModeEnabled ? (
+        <div className="workspace-source-row">
+          <label>
+            Source type
+            <select
+              value={workspaceSourceKind}
+              onChange={(event) => {
+                const next = event.currentTarget.value as WorkspaceSourceKind;
+                setWorkspaceSourceKind(next);
+                if (next === "parquet") {
+                  setWorkspaceDelimiterInput("");
+                }
+              }}
+            >
                   <option value="parquet">Parquet (fast path)</option>
                   <option value="delimited">Delimited (csv/txt/data/tsv)</option>
                 </select>
@@ -3222,10 +3210,8 @@ function App() {
                   />
                 </label>
               ) : null}
-            </div>
-          ) : null}
-        </>
-      ) : null}
+          </div>
+        ) : null}
       <div className="workspace-register-row">
         <input
           type="text"
