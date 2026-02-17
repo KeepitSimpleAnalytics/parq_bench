@@ -220,6 +220,10 @@ const DEFAULT_LAYOUT_ID = "default";
 const PQ_VIEW_LAYOUT_ID = "pq_view";
 const PQ_SQL_LAYOUT_ID = "pq_sql";
 const SLO_MO_LAYOUT_ID = "slo_mo";
+const INTERNAL_TOOLS_ENABLED =
+  import.meta.env.DEV || import.meta.env.VITE_PARQBENCH_INTERNAL_TOOLS === "1";
+const PRODUCT_STAGE_LABEL = "Beta";
+const LAYOUTS_ENABLED = INTERNAL_TOOLS_ENABLED && import.meta.env.VITE_PARQBENCH_LAYOUTS_ENABLED === "1";
 
 const DEFAULT_LAYOUT_MODEL: IJsonModel = {
   global: {
@@ -396,6 +400,10 @@ function cloneJson<T>(value: T): T {
 
 function pruneEmptyLayoutNode(node: unknown): Record<string, unknown> | null {
   if (!isRecord(node)) {
+    return null;
+  }
+
+  if (node.type === "tab" && typeof node.component === "string" && node.component === "diagnostics") {
     return null;
   }
 
@@ -777,13 +785,14 @@ function App() {
     initialLayoutPrefsRef.current = readLayoutPrefs();
   }
   const initialLayoutPrefs = initialLayoutPrefsRef.current;
-  const initialActiveLayout =
-    initialLayoutPrefs.layouts.find((layout) => layout.id === initialLayoutPrefs.active_layout_id) ??
-    initialLayoutPrefs.layouts[0];
+  const initialActiveLayout = INTERNAL_TOOLS_ENABLED
+    ? (initialLayoutPrefs.layouts.find((layout) => layout.id === initialLayoutPrefs.active_layout_id) ??
+      initialLayoutPrefs.layouts[0])
+    : (initialLayoutPrefs.layouts.find((layout) => layout.id === DEFAULT_LAYOUT_ID) ?? initialLayoutPrefs.layouts[0]);
   const [savedLayouts, setSavedLayouts] = useState<SavedLayout[]>(initialLayoutPrefs.layouts);
   const [activeLayoutId, setActiveLayoutId] = useState<string>(initialActiveLayout.id);
   const [layoutModel, setLayoutModel] = useState<Model>(() => Model.fromJson(cloneJson(initialActiveLayout.model)));
-  const [layoutEditEnabled, setLayoutEditEnabled] = useState<boolean>(() => readLayoutEditEnabled());
+  const [layoutEditEnabled, setLayoutEditEnabled] = useState<boolean>(() => LAYOUTS_ENABLED && readLayoutEditEnabled());
   const [pendingImportedLayout, setPendingImportedLayout] = useState<ImportedLayoutPreview | null>(null);
   const [pendingImportedName, setPendingImportedName] = useState("");
 
@@ -819,7 +828,7 @@ function App() {
   const [workspacePathInput, setWorkspacePathInput] = useState("");
   const [workspaceIsGlob, setWorkspaceIsGlob] = useState(false);
   const [workspaceSlowModeEnabled, setWorkspaceSlowModeEnabled] = useState<boolean>(
-    () => readWorkspaceSlowModeEnabled(),
+    () => INTERNAL_TOOLS_ENABLED && readWorkspaceSlowModeEnabled(),
   );
   const [workspaceSourceKind, setWorkspaceSourceKind] = useState<WorkspaceSourceKind>("parquet");
   const [workspaceDelimiterInput, setWorkspaceDelimiterInput] = useState("");
@@ -2406,6 +2415,25 @@ function App() {
   }, [workspaceSlowModeEnabled]);
 
   useEffect(() => {
+    if (!LAYOUTS_ENABLED && layoutEditEnabled) {
+      setLayoutEditEnabled(false);
+    }
+    if (!LAYOUTS_ENABLED && layoutMenuOpen) {
+      setLayoutMenuOpen(false);
+    }
+    if (INTERNAL_TOOLS_ENABLED) {
+      return;
+    }
+    if (workspaceSlowModeEnabled) {
+      setWorkspaceSlowModeEnabled(false);
+    }
+  }, [layoutEditEnabled, layoutMenuOpen, workspaceSlowModeEnabled]);
+
+  useEffect(() => {
+    if (!INTERNAL_TOOLS_ENABLED) {
+      previousLayoutIdRef.current = activeLayoutId;
+      return;
+    }
     const previous = previousLayoutIdRef.current;
 
     if (activeLayoutId === SLO_MO_LAYOUT_ID && previous !== SLO_MO_LAYOUT_ID) {
@@ -2738,18 +2766,24 @@ function App() {
         <button type="button" onClick={() => void openParquetPreview()} disabled={loading || memoryGuardActive}>
           Open Parquet
         </button>
-        <button type="button" onClick={() => void runAcceptanceGate()} disabled={loading || memoryGuardActive}>
-          {loading ? "Running..." : "Run Acceptance Gate"}
-        </button>
-        <button type="button" onClick={() => setLayoutMenuOpen((prev) => !prev)}>
-          {layoutMenuOpen ? "Hide Layouts" : "Layouts"}
-        </button>
-        <button type="button" onClick={() => void exportResults("json")} disabled={loading || !canExportResults}>
-          Export JSON
-        </button>
-        <button type="button" onClick={() => void exportResults("csv")} disabled={loading || !canExportResults}>
-          Export CSV
-        </button>
+        {INTERNAL_TOOLS_ENABLED ? (
+          <>
+            <button type="button" onClick={() => void runAcceptanceGate()} disabled={loading || memoryGuardActive}>
+              {loading ? "Running..." : "Run Acceptance Gate"}
+            </button>
+            {LAYOUTS_ENABLED ? (
+              <button type="button" onClick={() => setLayoutMenuOpen((prev) => !prev)}>
+                {layoutMenuOpen ? "Hide Layouts" : "Layouts"}
+              </button>
+            ) : null}
+            <button type="button" onClick={() => void exportResults("json")} disabled={loading || !canExportResults}>
+              Export JSON
+            </button>
+            <button type="button" onClick={() => void exportResults("csv")} disabled={loading || !canExportResults}>
+              Export CSV
+            </button>
+          </>
+        ) : null}
         {preview ? (
           <>
             <button type="button" onClick={() => setViewMode("virtual")} disabled={viewMode === "virtual"}>
@@ -2764,15 +2798,15 @@ function App() {
             </button>
           </>
         ) : null}
-        {result ? <span>DuckDB {result.duckdb_version}</span> : null}
-        {arrowBytes > 0 ? <span>Arrow IPC {arrowBytes} bytes</span> : null}
-        {lastExportPath ? (
+        {INTERNAL_TOOLS_ENABLED && result ? <span>DuckDB {result.duckdb_version}</span> : null}
+        {INTERNAL_TOOLS_ENABLED && arrowBytes > 0 ? <span>Arrow IPC {arrowBytes} bytes</span> : null}
+        {INTERNAL_TOOLS_ENABLED && lastExportPath ? (
           <span className="path-text" title={lastExportPath}>
             Exported: {lastExportPath}
           </span>
         ) : null}
       </div>
-      {layoutMenuOpen ? (
+      {INTERNAL_TOOLS_ENABLED && LAYOUTS_ENABLED && layoutMenuOpen ? (
         <div className="actions-layout-menu">
           <button type="button" onClick={saveLayoutSnapshot}>
             Save As
@@ -2831,7 +2865,7 @@ function App() {
         </div>
       ) : null}
 
-      {runtimeHealth || preview || workspaceQueryResult ? (
+      {INTERNAL_TOOLS_ENABLED && (runtimeHealth || preview || workspaceQueryResult) ? (
         <div className="runtime-metrics">
           {runtimeHealth ? (
             <span className={memoryGuardActive ? "metric-chip metric-bad" : "metric-chip"}>
@@ -2855,7 +2889,7 @@ function App() {
         </div>
       ) : null}
 
-      {acceptanceGate ? (
+      {INTERNAL_TOOLS_ENABLED && acceptanceGate ? (
         <div className={acceptanceGate.passed ? "gate-report gate-pass" : "gate-report gate-fail"}>
           Gate {acceptanceGate.passed ? "PASS" : "FAIL"} | First viewport:{" "}
           {acceptanceGate.firstViewportMs === null ? "n/a" : `${acceptanceGate.firstViewportMs.toFixed(0)}ms`} |{" "}
@@ -2867,7 +2901,7 @@ function App() {
           {acceptanceGate.details ? ` | Detail: ${acceptanceGate.details}` : ""}
         </div>
       ) : null}
-      {perfSweepReport ? (
+      {INTERNAL_TOOLS_ENABLED && perfSweepReport ? (
         <div className={perfSweepReport.failCount === 0 ? "gate-report gate-pass" : "gate-report gate-fail"}>
           Perf Sweep {perfSweepReport.failCount === 0 ? "PASS" : "FAIL"} | Runs: {perfSweepReport.completedRuns}/
           {perfSweepReport.runCount} | Pass: {perfSweepReport.passCount} | First p50/p95:{" "}
@@ -2881,7 +2915,7 @@ function App() {
           | File: {perfSweepReport.filePath}
         </div>
       ) : null}
-      {perfSweepReport ? (
+      {INTERNAL_TOOLS_ENABLED && perfSweepReport ? (
         <details className="sweep-runs">
           <summary>Perf Sweep Runs</summary>
           <div className="table-wrap">
@@ -2935,44 +2969,50 @@ function App() {
             <span>
               <strong>Columns:</strong> {preview.schema.length}
             </span>
-            <span>
-              <strong>Renderer:</strong> {viewMode}
-            </span>
-            <span>
-              <strong>Perspective:</strong> {perspectiveStatus}
-            </span>
-            <span>
-              <strong>Stage:</strong> {perspectiveStage}
-            </span>
+            {INTERNAL_TOOLS_ENABLED ? (
+              <>
+                <span>
+                  <strong>Renderer:</strong> {viewMode}
+                </span>
+                <span>
+                  <strong>Perspective:</strong> {perspectiveStatus}
+                </span>
+                <span>
+                  <strong>Stage:</strong> {perspectiveStage}
+                </span>
+              </>
+            ) : null}
           </p>
-          <div className="metrics-line">
-            <span
-              className={
-                firstViewportMs === null
-                  ? "metric-chip"
-                  : firstViewportMs <= FIRST_VIEWPORT_TARGET_MS
-                    ? "metric-chip metric-good"
-                    : "metric-chip metric-bad"
-              }
-            >
-              First viewport:{" "}
-              {firstViewportMs === null ? "pending" : `${firstViewportMs.toFixed(0)}ms / target ${FIRST_VIEWPORT_TARGET_MS}ms`}
-            </span>
-            <span
-              className={
-                perspectiveReadyMs === null
-                  ? "metric-chip"
-                  : perspectiveReadyMs <= PERSPECTIVE_READY_TARGET_MS
-                    ? "metric-chip metric-good"
-                    : "metric-chip metric-bad"
-              }
-            >
-              Perspective ready:{" "}
-              {perspectiveReadyMs === null
-                ? "pending"
-                : `${perspectiveReadyMs.toFixed(0)}ms / target ${PERSPECTIVE_READY_TARGET_MS}ms`}
-            </span>
-          </div>
+          {INTERNAL_TOOLS_ENABLED ? (
+            <div className="metrics-line">
+              <span
+                className={
+                  firstViewportMs === null
+                    ? "metric-chip"
+                    : firstViewportMs <= FIRST_VIEWPORT_TARGET_MS
+                      ? "metric-chip metric-good"
+                      : "metric-chip metric-bad"
+                }
+              >
+                First viewport:{" "}
+                {firstViewportMs === null ? "pending" : `${firstViewportMs.toFixed(0)}ms / target ${FIRST_VIEWPORT_TARGET_MS}ms`}
+              </span>
+              <span
+                className={
+                  perspectiveReadyMs === null
+                    ? "metric-chip"
+                    : perspectiveReadyMs <= PERSPECTIVE_READY_TARGET_MS
+                      ? "metric-chip metric-good"
+                      : "metric-chip metric-bad"
+                }
+              >
+                Perspective ready:{" "}
+                {perspectiveReadyMs === null
+                  ? "pending"
+                  : `${perspectiveReadyMs.toFixed(0)}ms / target ${PERSPECTIVE_READY_TARGET_MS}ms`}
+              </span>
+            </div>
+          ) : null}
           {perspectiveError ? <p className="error">Perspective error: {perspectiveError}</p> : null}
 
           {viewMode === "virtual" ? (
@@ -3047,100 +3087,109 @@ function App() {
 
   const diagnosticsPanel = (
     <section className="dock-panel">
-      <h3>Arrow IPC Decode</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>ID</th>
-            <th>Label</th>
-          </tr>
-        </thead>
-        <tbody>
-          {arrowRows.map((row) => (
-            <tr key={`arrow-${row.id}`}>
-              <td>{row.id}</td>
-              <td>{row.label}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {INTERNAL_TOOLS_ENABLED ? (
+        <>
+          <h3>Arrow IPC Decode</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Label</th>
+              </tr>
+            </thead>
+            <tbody>
+              {arrowRows.map((row) => (
+                <tr key={`arrow-${row.id}`}>
+                  <td>{row.id}</td>
+                  <td>{row.label}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
 
-      <h3>Transport Benchmarks</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>Mode</th>
-            <th>Payload</th>
-            <th>Bytes</th>
-            <th>Time (ms)</th>
-            <th>Throughput (MB/s)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {benchmarks.map((entry) => (
-            <tr key={entry.mode}>
-              <td>{entry.mode}</td>
-              <td>{entry.sizeMb} MB</td>
-              <td>{entry.bytes.toLocaleString()}</td>
-              <td>{entry.elapsedMs.toFixed(1)}</td>
-              <td>{entry.throughputMbps.toFixed(1)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+          <h3>Transport Benchmarks</h3>
+          <table>
+            <thead>
+              <tr>
+                <th>Mode</th>
+                <th>Payload</th>
+                <th>Bytes</th>
+                <th>Time (ms)</th>
+                <th>Throughput (MB/s)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {benchmarks.map((entry) => (
+                <tr key={entry.mode}>
+                  <td>{entry.mode}</td>
+                  <td>{entry.sizeMb} MB</td>
+                  <td>{entry.bytes.toLocaleString()}</td>
+                  <td>{entry.elapsedMs.toFixed(1)}</td>
+                  <td>{entry.throughputMbps.toFixed(1)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      ) : (
+        <p className="phase">Diagnostics are hidden in beta builds.</p>
+      )}
     </section>
   );
 
   const workspacePanel = (
     <section className="workspace-panel">
       <h3>Workspace Explorer</h3>
-      <div className="workspace-mode-row">
-        <label className="workspace-slow-toggle">
-          <input
-            type="checkbox"
-            checked={workspaceSlowModeEnabled}
-            onChange={(event) => setWorkspaceSlowModeEnabled(event.currentTarget.checked)}
-          />
-          Enable slow mode for non-Parquet workspace sources
-        </label>
-        {workspaceSlowModeEnabled ? <span className="metric-chip metric-bad">Slow mode enabled</span> : null}
-      </div>
-      {workspaceSlowModeEnabled ? (
-        <div className="workspace-slow-warning">
-          Slow mode is active. Non-Parquet file parsing is outside the fast path and may have higher latency and memory
-          pressure than standard Parquet workflows.
-        </div>
-      ) : null}
-      {workspaceSlowModeEnabled ? (
-        <div className="workspace-source-row">
-          <label>
-            Source type
-            <select
-              value={workspaceSourceKind}
-              onChange={(event) => {
-                const next = event.currentTarget.value as WorkspaceSourceKind;
-                setWorkspaceSourceKind(next);
-                if (next === "parquet") {
-                  setWorkspaceDelimiterInput("");
-                }
-              }}
-            >
-              <option value="parquet">Parquet (fast path)</option>
-              <option value="delimited">Delimited (csv/txt/data/tsv)</option>
-            </select>
-          </label>
-          {workspaceSourceKind === "delimited" ? (
-            <label>
-              Delimiter
+      {INTERNAL_TOOLS_ENABLED ? (
+        <>
+          <div className="workspace-mode-row">
+            <label className="workspace-slow-toggle">
               <input
-                type="text"
-                value={workspaceDelimiterInput}
-                onChange={(event) => setWorkspaceDelimiterInput(event.currentTarget.value)}
-                placeholder='Auto by extension (.csv ",", .tsv "\\t", .txt/.data ",")'
+                type="checkbox"
+                checked={workspaceSlowModeEnabled}
+                onChange={(event) => setWorkspaceSlowModeEnabled(event.currentTarget.checked)}
               />
+              Enable Slo-mo
             </label>
+            {workspaceSlowModeEnabled ? <span className="metric-chip metric-bad">Slo-mo enabled</span> : null}
+          </div>
+          {workspaceSlowModeEnabled ? (
+            <div className="workspace-slow-warning">
+              Slo-mo enabled. You can process non-Parquet files, but at the expense of speed.
+            </div>
           ) : null}
-        </div>
+          {workspaceSlowModeEnabled ? (
+            <div className="workspace-source-row">
+              <label>
+                Source type
+                <select
+                  value={workspaceSourceKind}
+                  onChange={(event) => {
+                    const next = event.currentTarget.value as WorkspaceSourceKind;
+                    setWorkspaceSourceKind(next);
+                    if (next === "parquet") {
+                      setWorkspaceDelimiterInput("");
+                    }
+                  }}
+                >
+                  <option value="parquet">Parquet (fast path)</option>
+                  <option value="delimited">Delimited (csv/txt/data/tsv)</option>
+                </select>
+              </label>
+              {workspaceSourceKind === "delimited" ? (
+                <label>
+                  Delimiter
+                  <input
+                    type="text"
+                    value={workspaceDelimiterInput}
+                    onChange={(event) => setWorkspaceDelimiterInput(event.currentTarget.value)}
+                    placeholder='Auto by extension (.csv ",", .tsv "\\t", .txt/.data ",")'
+                  />
+                </label>
+              ) : null}
+            </div>
+          ) : null}
+        </>
       ) : null}
       <div className="workspace-register-row">
         <input
@@ -3225,35 +3274,37 @@ function App() {
         </div>
       ) : null}
 
-      <div className="workspace-diff-row">
-        <label>
-          Diff Left
-          <select value={workspaceDiffLeftAlias} onChange={(event) => setWorkspaceDiffLeftAlias(event.currentTarget.value)}>
-            <option value="">Select table</option>
-            {workspaceTables.map((table) => (
-              <option key={`diff-left-${table.alias}`} value={table.alias}>
-                {table.alias}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Diff Right
-          <select value={workspaceDiffRightAlias} onChange={(event) => setWorkspaceDiffRightAlias(event.currentTarget.value)}>
-            <option value="">Select table</option>
-            {workspaceTables.map((table) => (
-              <option key={`diff-right-${table.alias}`} value={table.alias}>
-                {table.alias}
-              </option>
-            ))}
-          </select>
-        </label>
-        <button type="button" onClick={() => void runWorkspaceSchemaDiff()} disabled={loading || workspaceTables.length < 2}>
-          Run Schema Diff
-        </button>
-      </div>
+      {INTERNAL_TOOLS_ENABLED ? (
+        <div className="workspace-diff-row">
+          <label>
+            Diff Left
+            <select value={workspaceDiffLeftAlias} onChange={(event) => setWorkspaceDiffLeftAlias(event.currentTarget.value)}>
+              <option value="">Select table</option>
+              {workspaceTables.map((table) => (
+                <option key={`diff-left-${table.alias}`} value={table.alias}>
+                  {table.alias}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Diff Right
+            <select value={workspaceDiffRightAlias} onChange={(event) => setWorkspaceDiffRightAlias(event.currentTarget.value)}>
+              <option value="">Select table</option>
+              {workspaceTables.map((table) => (
+                <option key={`diff-right-${table.alias}`} value={table.alias}>
+                  {table.alias}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button type="button" onClick={() => void runWorkspaceSchemaDiff()} disabled={loading || workspaceTables.length < 2}>
+            Run Schema Diff
+          </button>
+        </div>
+      ) : null}
 
-      {workspaceSchemaDiff ? (
+      {INTERNAL_TOOLS_ENABLED && workspaceSchemaDiff ? (
         <>
           <p className="meta-line">
             <span>
@@ -3465,16 +3516,18 @@ function App() {
       <header className="topbar">
         <h1>Parq-Bench — High-Performance Local Data Lake</h1>
         <div className="topbar-right">
-          <label className="theme-picker">
-            Layout
-            <select value={activeLayout?.id ?? ""} onChange={(event) => switchLayout(event.currentTarget.value)}>
-              {savedLayouts.map((layout) => (
-                <option key={`layout-top-${layout.id}`} value={layout.id}>
-                  {layout.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          {LAYOUTS_ENABLED ? (
+            <label className="theme-picker">
+              Layout
+              <select value={activeLayout?.id ?? ""} onChange={(event) => switchLayout(event.currentTarget.value)}>
+                {savedLayouts.map((layout) => (
+                  <option key={`layout-top-${layout.id}`} value={layout.id}>
+                    {layout.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
           <label className="theme-picker">
             Theme
             <select value={themeMode} onChange={(event) => setThemeMode(event.currentTarget.value as ThemeMode)}>
@@ -3486,7 +3539,7 @@ function App() {
           <button type="button" onClick={() => setAboutOpen(true)} disabled={pendingImportedLayout !== null}>
             About
           </button>
-          <span className="phase">Phase 3 Hardening</span>
+          <span className="phase">{PRODUCT_STAGE_LABEL}</span>
         </div>
       </header>
 
@@ -3511,7 +3564,8 @@ function App() {
             onClick={(event) => event.stopPropagation()}
           >
             <h3>About Parq-Bench</h3>
-            <p className="phase">Parq-Bench — High-Performance Local Data Lake.</p>
+            <p className="phase">Parq-Bench v0.1.0 ({PRODUCT_STAGE_LABEL}).</p>
+            <p className="phase">Local-first Parquet preview and workspace SQL exploration.</p>
             <div className="modal-actions">
               <button type="button" onClick={() => setAboutOpen(false)}>
                 Close

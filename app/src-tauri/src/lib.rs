@@ -506,17 +506,17 @@ fn parquet_schema(conn: &Connection, source: &str) -> Result<Vec<ParquetSchemaCo
         .collect::<Vec<_>>())
 }
 
-fn parquet_total_rows(conn: &Connection, normalized_path: &str, source: &str) -> u64 {
+fn parquet_total_rows(conn: &Connection, normalized_path: &str, source: &str) -> Result<u64, String> {
     let metadata_sql = format!(
         "SELECT COALESCE(SUM(num_rows), 0)::UBIGINT FROM parquet_metadata('{normalized_path}')"
     );
     if let Ok(rows) = conn.query_row(&metadata_sql, [], |row| row.get::<_, u64>(0)) {
-        return rows;
+        return Ok(rows);
     }
 
     let fallback_sql = format!("SELECT COUNT(*)::UBIGINT FROM {source}");
     conn.query_row(&fallback_sql, [], |row| row.get::<_, u64>(0))
-        .unwrap_or(0)
+        .map_err(|e| format!("failed to count rows: {e}"))
 }
 
 fn parquet_rows_page(
@@ -1129,7 +1129,7 @@ fn preview_parquet(
     let normalized = escape_sql_string_literal(&file_path);
     let source = format!("read_parquet('{normalized}')");
     let conn = open_configured_duckdb(state.as_ref())?;
-    let total_rows = parquet_total_rows(&conn, &normalized, &source);
+    let total_rows = parquet_total_rows(&conn, &normalized, &source)?;
     let schema = parquet_schema(&conn, &source)?;
     let row_offset = 0_u64;
     let row_limit = row_limit.max(1);
@@ -1343,6 +1343,11 @@ async fn start_arrow_socket_server(
 
 #[tauri::command]
 fn write_text_report(path: String, contents: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    match p.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()) {
+        Some(ext) if ext == "json" || ext == "csv" || ext == "txt" => {}
+        _ => return Err("write_text_report: only .json, .csv, and .txt files are allowed".into()),
+    }
     fs::write(&path, contents).map_err(|e| format!("write report file: {e}"))
 }
 
@@ -1687,7 +1692,7 @@ mod tests {
         assert_eq!(schema[0].name, "id");
         assert_eq!(schema[1].name, "label");
 
-        let total_rows = parquet_total_rows(&conn, &escaped_path, &source);
+        let total_rows = parquet_total_rows(&conn, &escaped_path, &source).expect("count rows");
         assert_eq!(total_rows, 3);
 
         let rows = parquet_rows_page(&conn, &source, &schema, 0, 10).expect("load parquet rows");

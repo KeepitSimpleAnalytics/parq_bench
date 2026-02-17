@@ -1,8 +1,8 @@
 [package]
 name = "parq-bench"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "A high-performance desktop Parquet file viewer"
+authors = ["KISA-Keep it Simple Analytics LLC"]
 edition = "2021"
 default-run = "parq-bench"
 
