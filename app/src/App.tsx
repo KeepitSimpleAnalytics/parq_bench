@@ -2,13 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Editor, { loader, type OnMount } from "@monaco-editor/react";
 import * as monacoEditor from "monaco-editor";
 loader.config({ monaco: monacoEditor });
-import { Actions, Layout, Model, type Action, type IJsonModel, type TabNode } from "flexlayout-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { tableFromIPC } from "apache-arrow";
 import type * as Monaco from "monaco-editor";
-import "flexlayout-react/style/combined.css";
 import "./App.css";
 
 const PAGE_SIZE = 256;
@@ -22,9 +20,6 @@ const PERSPECTIVE_READY_TARGET_MS = 3000;
 const ACCEPTANCE_GATE_TIMEOUT_MS = 15000;
 const PERSPECTIVE_RESTORE_TIMEOUT_DEFAULT_MS = 8000;
 const PERSPECTIVE_RESTORE_TIMEOUT_CHART_MS = 20000;
-const PERF_SWEEP_MIN_RUNS = 2;
-const PERF_SWEEP_MAX_RUNS = 25;
-const PERF_SWEEP_DEFAULT_RUNS = 5;
 
 type SmokeRow = {
   id: number;
@@ -41,10 +36,6 @@ type ArrowRow = {
   label: string;
 };
 
-type SocketServerInfo = {
-  url: string;
-  payload_bytes: number;
-};
 
 type BenchmarkResult = {
   mode: "ipc" | "socket";
@@ -194,35 +185,11 @@ type ExportPayload = {
 
 type ThemeMode = "system" | "light" | "dark";
 type ResolvedTheme = "light" | "dark";
-type DockPanelComponent = "actions" | "preview" | "workspace" | "diagnostics";
-type ImportedLayoutPreview = {
-  sourceFile: string;
-  name: string;
-  model: IJsonModel;
-  tabCount: number;
-  panelCounts: Array<{ component: string; count: number }>;
-  unknownPanels: string[];
-};
-type SavedLayout = {
-  id: string;
-  name: string;
-  model: IJsonModel;
-};
-type StoredLayoutPrefs = {
-  version: 1;
-  active_layout_id: string;
-  layouts: SavedLayout[];
-};
+type ActiveTab = "preview" | "sql";
 
 const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";
-const UI_LAYOUT_STORAGE_KEY = "parqbench.ui.layouts.v2";
-const UI_LAYOUT_RECOVERY_STORAGE_KEY = "parqbench.ui.layouts.recovery.v1";
-const UI_LAYOUT_EDIT_STORAGE_KEY = "parqbench.ui.layout_edit_enabled";
 const UI_WORKSPACE_SLOW_MODE_STORAGE_KEY = "parqbench.ui.workspace_slow_mode_enabled";
-const DEFAULT_LAYOUT_ID = "default";
-const PQ_VIEW_LAYOUT_ID = "pq_view";
-const PQ_SQL_LAYOUT_ID = "pq_sql";
-const SLO_MO_LAYOUT_ID = "slo_mo";
+const UI_ACTIVE_TAB_STORAGE_KEY = "parqbench.ui.active_tab";
 /**
  * Feature flags (compile-time, dead-code eliminated by Vite in production):
  *
@@ -231,478 +198,24 @@ const SLO_MO_LAYOUT_ID = "slo_mo";
  *   Always on in dev. In production builds, set the env var
  *   VITE_PARQBENCH_INTERNAL_TOOLS=1 at build time to enable.
  *
- * LAYOUTS_ENABLED — gates the docking layout system (save/switch/rename
- *   layouts, drag-lock toggle). Requires INTERNAL_TOOLS_ENABLED. Set
- *   VITE_PARQBENCH_LAYOUTS_ENABLED=1 at build time to enable.
  */
 const INTERNAL_TOOLS_ENABLED =
   import.meta.env.DEV || import.meta.env.VITE_PARQBENCH_INTERNAL_TOOLS === "1";
 const PRODUCT_STAGE_LABEL = "Beta";
-const LAYOUTS_ENABLED = INTERNAL_TOOLS_ENABLED && import.meta.env.VITE_PARQBENCH_LAYOUTS_ENABLED === "1";
 
-const DEFAULT_LAYOUT_MODEL: IJsonModel = {
-  global: {
-    rootOrientationVertical: true,
-    tabSetEnableClose: false,
-    tabSetEnableDeleteWhenEmpty: true,
-    tabSetEnableDrag: true,
-    tabSetEnableDrop: true,
-    tabSetEnableDivide: true,
-    tabSetEnableSingleTabStretch: false,
-    tabSetEnableTabStrip: true,
-    tabEnableClose: false,
-    tabEnableDrag: true,
-    tabEnablePopout: false,
-    tabEnableRenderOnDemand: false,
-  },
-  borders: [],
-  layout: {
-    type: "row",
-    children: [
-      {
-        type: "tabset",
-        weight: 50,
-        enableClose: false,
-        enableDeleteWhenEmpty: true,
-        children: [{ type: "tab", component: "preview", name: "Preview", enableClose: false }],
-      },
-      {
-        type: "tabset",
-        weight: 36,
-        enableClose: false,
-        enableDeleteWhenEmpty: true,
-        children: [{ type: "tab", component: "workspace", name: "Workspace", enableClose: false }],
-      },
-      {
-        type: "tabset",
-        weight: 14,
-        enableDeleteWhenEmpty: true,
-        children: [{ type: "tab", component: "diagnostics", name: "Diagnostics", enableClose: true }],
-      },
-    ],
-  },
-};
 
-const PQ_VIEW_LAYOUT_MODEL: IJsonModel = {
-  global: {
-    rootOrientationVertical: true,
-    tabSetEnableClose: false,
-    tabSetEnableDeleteWhenEmpty: true,
-    tabSetEnableDrag: true,
-    tabSetEnableDrop: true,
-    tabSetEnableDivide: true,
-    tabSetEnableSingleTabStretch: false,
-    tabSetEnableTabStrip: true,
-    tabEnableClose: false,
-    tabEnableDrag: true,
-    tabEnablePopout: false,
-    tabEnableRenderOnDemand: false,
-  },
-  borders: [],
-  layout: {
-    type: "row",
-    children: [
-      {
-        type: "tabset",
-        weight: 86,
-        enableClose: false,
-        enableDeleteWhenEmpty: true,
-        children: [{ type: "tab", component: "preview", name: "Preview", enableClose: false }],
-      },
-      {
-        type: "tabset",
-        weight: 14,
-        enableDeleteWhenEmpty: true,
-        children: [{ type: "tab", component: "diagnostics", name: "Diagnostics", enableClose: true }],
-      },
-    ],
-  },
-};
 
-const PQ_SQL_LAYOUT_MODEL: IJsonModel = {
-  global: {
-    rootOrientationVertical: true,
-    tabSetEnableClose: false,
-    tabSetEnableDeleteWhenEmpty: true,
-    tabSetEnableDrag: true,
-    tabSetEnableDrop: true,
-    tabSetEnableDivide: true,
-    tabSetEnableSingleTabStretch: false,
-    tabSetEnableTabStrip: true,
-    tabEnableClose: false,
-    tabEnableDrag: true,
-    tabEnablePopout: false,
-    tabEnableRenderOnDemand: false,
-  },
-  borders: [],
-  layout: {
-    type: "row",
-    children: [
-      {
-        type: "tabset",
-        weight: 84,
-        enableClose: false,
-        enableDeleteWhenEmpty: true,
-        children: [{ type: "tab", component: "workspace", name: "Workspace", enableClose: false }],
-      },
-      {
-        type: "tabset",
-        weight: 16,
-        enableDeleteWhenEmpty: true,
-        children: [{ type: "tab", component: "diagnostics", name: "Diagnostics", enableClose: true }],
-      },
-    ],
-  },
-};
 
-const SLO_MO_LAYOUT_MODEL: IJsonModel = {
-  global: {
-    rootOrientationVertical: true,
-    tabSetEnableClose: false,
-    tabSetEnableDeleteWhenEmpty: true,
-    tabSetEnableDrag: true,
-    tabSetEnableDrop: true,
-    tabSetEnableDivide: true,
-    tabSetEnableSingleTabStretch: false,
-    tabSetEnableTabStrip: true,
-    tabEnableClose: false,
-    tabEnableDrag: true,
-    tabEnablePopout: false,
-    tabEnableRenderOnDemand: false,
-  },
-  borders: [],
-  layout: {
-    type: "row",
-    children: [
-      {
-        type: "tabset",
-        weight: 100,
-        enableClose: false,
-        enableDeleteWhenEmpty: true,
-        children: [{ type: "tab", component: "workspace", name: "Workspace", enableClose: false }],
-      },
-    ],
-  },
-};
 
-function cloneJson<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
-}
-
-function pruneEmptyLayoutNode(node: unknown): Record<string, unknown> | null {
-  if (!isRecord(node)) {
-    return null;
-  }
-
-  if (node.type === "tab" && typeof node.component === "string" && (node.component === "diagnostics" || node.component === "actions")) {
-    return null;
-  }
-
-  if (Array.isArray(node.children)) {
-    const children = node.children
-      .map((child) => pruneEmptyLayoutNode(child))
-      .filter((child): child is Record<string, unknown> => child !== null);
-    node.children = children;
-  }
-
-  if (node.type === "tabset") {
-    return Array.isArray(node.children) && node.children.length > 0 ? node : null;
-  }
-
-  if (node.type === "row" || node.type === "column") {
-    return Array.isArray(node.children) && node.children.length > 0 ? node : null;
-  }
-
-  return node;
-}
-
-function normalizeLayoutModel(model: IJsonModel): IJsonModel {
-  const normalized = cloneJson(model);
-  const globalAttrs = (isRecord(normalized.global) ? normalized.global : {}) as Record<string, unknown>;
-  globalAttrs.tabSetEnableDeleteWhenEmpty = true;
-  globalAttrs.tabSetEnableDrag = true;
-  globalAttrs.tabSetEnableDrop = true;
-  globalAttrs.tabSetEnableDivide = true;
-  globalAttrs.tabSetEnableSingleTabStretch = false;
-  globalAttrs.tabSetEnableTabStrip = true;
-  globalAttrs.tabEnableDrag = true;
-  normalized.global = globalAttrs;
-
-  const walk = (node: unknown) => {
-    if (!isRecord(node)) {
-      return;
-    }
-    if (node.type === "tabset") {
-      node.enableDeleteWhenEmpty = true;
-      node.enableDrag = true;
-      node.enableDrop = true;
-      node.enableDivide = true;
-      node.enableTabStrip = true;
-    } else if (node.type === "tab" && typeof node.component === "string") {
-      node.enableDrag = true;
-    }
-    if (Array.isArray(node.children)) {
-      node.children.forEach(walk);
-    }
-  };
-
-  const normalizedLayout = pruneEmptyLayoutNode(normalized.layout);
-  normalized.layout = (normalizedLayout ?? cloneJson(DEFAULT_LAYOUT_MODEL.layout)) as IJsonModel["layout"];
-  walk(normalized.layout);
-  if (Array.isArray(normalized.borders)) {
-    const nextBorders = normalized.borders
-      .map((border) => pruneEmptyLayoutNode(border))
-      .filter((border): border is Record<string, unknown> => border !== null);
-    (normalized as unknown as { borders: unknown[] }).borders = nextBorders;
-    nextBorders.forEach(walk);
-  }
-
-  return normalized;
-}
-
-function buildFactoryLayouts(): SavedLayout[] {
-  return [
-    {
-      id: DEFAULT_LAYOUT_ID,
-      name: "Default",
-      model: normalizeLayoutModel(DEFAULT_LAYOUT_MODEL),
-    },
-    {
-      id: PQ_VIEW_LAYOUT_ID,
-      name: "pq-view",
-      model: normalizeLayoutModel(PQ_VIEW_LAYOUT_MODEL),
-    },
-    {
-      id: PQ_SQL_LAYOUT_ID,
-      name: "pq-sql",
-      model: normalizeLayoutModel(PQ_SQL_LAYOUT_MODEL),
-    },
-    {
-      id: SLO_MO_LAYOUT_ID,
-      name: "slo-mo",
-      model: normalizeLayoutModel(SLO_MO_LAYOUT_MODEL),
-    },
-  ];
-}
-
-function mergeFactoryLayouts(layouts: SavedLayout[]): SavedLayout[] {
-  const factory = buildFactoryLayouts();
-  const factoryIds = new Set(factory.map((layout) => layout.id));
-  const byId = new Map(layouts.map((layout) => [layout.id, layout]));
-  const mergedFactory = factory.map((layout) => byId.get(layout.id) ?? layout);
-  const custom = layouts.filter((layout) => !factoryIds.has(layout.id));
-  return [...mergedFactory, ...custom];
-}
-
-function defaultLayoutPrefs(): StoredLayoutPrefs {
-  return {
-    version: 1,
-    active_layout_id: DEFAULT_LAYOUT_ID,
-    layouts: buildFactoryLayouts(),
-  };
-}
-
-function recordLayoutRecovery(reason: string, detail: string) {
+function readActiveTab(): ActiveTab {
   if (typeof window === "undefined") {
-    return;
+    return "preview";
   }
-  const event = {
-    at: new Date().toISOString(),
-    reason,
-    detail,
-  };
-  try {
-    window.localStorage.setItem(UI_LAYOUT_RECOVERY_STORAGE_KEY, JSON.stringify(event));
-  } catch {
-    // Ignore storage write failures and keep runtime functional.
+  const value = window.localStorage.getItem(UI_ACTIVE_TAB_STORAGE_KEY);
+  if (value === "preview" || value === "sql") {
+    return value;
   }
-  console.warn(`[Parq-Bench][layout-recovery] ${reason}: ${detail}`);
-}
-
-function persistLayoutPrefs(prefs: StoredLayoutPrefs) {
-  if (typeof window === "undefined") {
-    return;
-  }
-  try {
-    window.localStorage.setItem(UI_LAYOUT_STORAGE_KEY, JSON.stringify(prefs));
-  } catch {
-    // Ignore storage write failures and keep runtime functional.
-  }
-}
-
-function canHydrateLayoutModel(model: IJsonModel): boolean {
-  try {
-    Model.fromJson(cloneJson(model));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function recoverDefaultLayoutPrefs(reason: string, detail: string): StoredLayoutPrefs {
-  const fallback = defaultLayoutPrefs();
-  recordLayoutRecovery(reason, detail);
-  persistLayoutPrefs(fallback);
-  return fallback;
-}
-
-function readLayoutPrefs(): StoredLayoutPrefs {
-  if (typeof window === "undefined") {
-    return defaultLayoutPrefs();
-  }
-  const raw = window.localStorage.getItem(UI_LAYOUT_STORAGE_KEY);
-  if (!raw) {
-    return defaultLayoutPrefs();
-  }
-  try {
-    const parsed = JSON.parse(raw) as Partial<StoredLayoutPrefs>;
-    if (parsed.version !== 1 || !Array.isArray(parsed.layouts) || parsed.layouts.length === 0) {
-      return recoverDefaultLayoutPrefs(
-        "invalid_layout_prefs_shape",
-        "Stored layout payload failed version/layout list validation.",
-      );
-    }
-    const normalizedLayouts = parsed.layouts
-      .filter(
-        (layout): layout is SavedLayout =>
-          typeof layout.id === "string" &&
-          layout.id.trim().length > 0 &&
-          typeof layout.name === "string" &&
-          layout.name.trim().length > 0 &&
-          typeof layout.model === "object" &&
-          layout.model !== null,
-      )
-      .map((layout) => ({
-        ...layout,
-        model: normalizeLayoutModel(layout.model),
-      }));
-    const layouts = normalizedLayouts.filter((layout) => canHydrateLayoutModel(layout.model));
-    if (layouts.length !== normalizedLayouts.length) {
-      recordLayoutRecovery(
-        "dropped_invalid_layout_models",
-        `Dropped ${normalizedLayouts.length - layouts.length} saved layout(s) due to invalid model JSON.`,
-      );
-    }
-    if (layouts.length === 0) {
-      return recoverDefaultLayoutPrefs(
-        "no_valid_layout_models",
-        "No persisted layouts could be hydrated into runtime layout models.",
-      );
-    }
-    const mergedLayouts = mergeFactoryLayouts(layouts);
-    const active = mergedLayouts.some((layout) => layout.id === parsed.active_layout_id)
-      ? (parsed.active_layout_id as string)
-      : DEFAULT_LAYOUT_ID;
-    if (active !== parsed.active_layout_id) {
-      recordLayoutRecovery(
-        "invalid_active_layout_id",
-        "Active layout id missing; reset active layout to default.",
-      );
-    }
-    return {
-      version: 1,
-      active_layout_id: active,
-      layouts: mergedLayouts,
-    };
-  } catch (err) {
-    return recoverDefaultLayoutPrefs(
-      "layout_prefs_parse_error",
-      `Failed to parse persisted layout payload: ${String(err)}`,
-    );
-  }
-}
-
-function nextLayoutId(): string {
-  return `layout_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function isJsonModel(value: unknown): value is IJsonModel {
-  return isRecord(value) && isRecord(value.layout);
-}
-
-function sanitizeFileName(value: string): string {
-  const normalized = value.trim().replace(/[^a-zA-Z0-9_-]+/g, "_");
-  return normalized.length > 0 ? normalized : "layout";
-}
-
-function readFileAsText(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error("Failed to read layout file."));
-    reader.onload = () => resolve(String(reader.result ?? ""));
-    reader.readAsText(file);
-  });
-}
-
-function parseImportedLayoutPayload(parsed: unknown, fallbackName: string): { name: string; model: IJsonModel } {
-  if (!isRecord(parsed)) {
-    throw new Error("Unsupported layout file format.");
-  }
-
-  const parsedLayout = parsed.layout;
-  if (isRecord(parsedLayout) && isJsonModel(parsedLayout.model)) {
-    const layout = parsed.layout as Record<string, unknown>;
-    const layoutModel = parsedLayout.model;
-    return {
-      name: typeof layout.name === "string" && layout.name.trim().length > 0 ? layout.name.trim() : fallbackName,
-      model: normalizeLayoutModel(layoutModel),
-    };
-  }
-
-  const parsedModel = parsed.model;
-  if (isJsonModel(parsedModel)) {
-    return {
-      name: typeof parsed.name === "string" && parsed.name.trim().length > 0 ? parsed.name.trim() : fallbackName,
-      model: normalizeLayoutModel(parsedModel),
-    };
-  }
-
-  if (Array.isArray(parsed.layouts)) {
-    const list = parsed.layouts.filter(isRecord);
-    const chosen =
-      list.find((item) => typeof item.id === "string" && item.id === parsed.active_layout_id) ?? list[0];
-    const chosenModel = chosen?.model;
-    if (!chosen || !isJsonModel(chosenModel)) {
-      throw new Error("No valid layout model found.");
-    }
-    return {
-      name: typeof chosen.name === "string" && chosen.name.trim().length > 0 ? chosen.name.trim() : fallbackName,
-      model: normalizeLayoutModel(chosenModel),
-    };
-  }
-
-  if (isJsonModel(parsed)) {
-    return {
-      name: typeof parsed.name === "string" && parsed.name.trim().length > 0 ? parsed.name.trim() : fallbackName,
-      model: normalizeLayoutModel(parsed),
-    };
-  }
-
-  throw new Error("Unsupported layout file format.");
-}
-
-function collectLayoutTabComponents(model: IJsonModel): string[] {
-  const components: string[] = [];
-  const walk = (node: unknown) => {
-    if (!isRecord(node)) {
-      return;
-    }
-    if (node.type === "tab" && typeof node.component === "string") {
-      components.push(node.component);
-    }
-    if (Array.isArray(node.children)) {
-      node.children.forEach(walk);
-    }
-  };
-  walk(model.layout);
-  if (Array.isArray(model.borders)) {
-    model.borders.forEach(walk);
-  }
-  return components;
+  return "preview";
 }
 
 function readThemeMode(): ThemeMode {
@@ -714,13 +227,6 @@ function readThemeMode(): ThemeMode {
     return value;
   }
   return "system";
-}
-
-function readLayoutEditEnabled(): boolean {
-  if (typeof window === "undefined") {
-    return false;
-  }
-  return window.localStorage.getItem(UI_LAYOUT_EDIT_STORAGE_KEY) === "1";
 }
 
 function readWorkspaceSlowModeEnabled(): boolean {
@@ -771,26 +277,11 @@ function appendGlobPattern(folderPath: string, pattern: string): string {
 function App() {
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
   const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() => resolveThemeMode(readThemeMode()));
-  const initialLayoutPrefsRef = useRef<StoredLayoutPrefs | null>(null);
-  if (initialLayoutPrefsRef.current === null) {
-    initialLayoutPrefsRef.current = readLayoutPrefs();
-  }
-  const initialLayoutPrefs = initialLayoutPrefsRef.current;
-  const initialActiveLayout = INTERNAL_TOOLS_ENABLED
-    ? (initialLayoutPrefs.layouts.find((layout) => layout.id === initialLayoutPrefs.active_layout_id) ??
-      initialLayoutPrefs.layouts[0])
-    : (initialLayoutPrefs.layouts.find((layout) => layout.id === DEFAULT_LAYOUT_ID) ?? initialLayoutPrefs.layouts[0]);
-  const [savedLayouts, setSavedLayouts] = useState<SavedLayout[]>(initialLayoutPrefs.layouts);
-  const [activeLayoutId, setActiveLayoutId] = useState<string>(initialActiveLayout.id);
-  const [layoutModel, setLayoutModel] = useState<Model>(() => Model.fromJson(cloneJson(initialActiveLayout.model)));
-  const [layoutEditEnabled, setLayoutEditEnabled] = useState<boolean>(() => LAYOUTS_ENABLED && readLayoutEditEnabled());
-  const [pendingImportedLayout, setPendingImportedLayout] = useState<ImportedLayoutPreview | null>(null);
-  const [pendingImportedName, setPendingImportedName] = useState("");
+  const [activeTab, setActiveTab] = useState<ActiveTab>(() => readActiveTab());
 
   const [result, setResult] = useState<SmokeQueryResponse | null>(null);
-  const [arrowRows, setArrowRows] = useState<ArrowRow[]>([]);
-  const [arrowBytes, setArrowBytes] = useState(0);
-  const [benchmarks, setBenchmarks] = useState<BenchmarkResult[]>([]);
+  const [, setArrowRows] = useState<ArrowRow[]>([]);
+  const [, setArrowBytes] = useState(0);
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth | null>(null);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [loadedRows, setLoadedRows] = useState<Map<number, Array<string | null>>>(new Map());
@@ -810,9 +301,7 @@ function App() {
   const [firstViewportMs, setFirstViewportMs] = useState<number | null>(null);
   const [perspectiveReadyMs, setPerspectiveReadyMs] = useState<number | null>(null);
   const [acceptanceGate, setAcceptanceGate] = useState<AcceptanceGateReport | null>(null);
-  const [perfSweepReport, setPerfSweepReport] = useState<PerfSweepSummary | null>(null);
-  const [perfSweepRunsInput, setPerfSweepRunsInput] = useState(String(PERF_SWEEP_DEFAULT_RUNS));
-  const [lastExportPath, setLastExportPath] = useState<string | null>(null);
+  const [, setLastExportPath] = useState<string | null>(null);
   const [workspaceTables, setWorkspaceTables] = useState<WorkspaceTableInfo[]>([]);
   const [workspaceTableSchemas, setWorkspaceTableSchemas] = useState<WorkspaceSchemaByAlias>({});
   const [workspaceAliasInput, setWorkspaceAliasInput] = useState("");
@@ -838,7 +327,6 @@ function App() {
   const [workspaceDiffRightAlias, setWorkspaceDiffRightAlias] = useState("");
   const [workspaceSchemaDiff, setWorkspaceSchemaDiff] = useState<WorkspaceSchemaDiffResponse | null>(null);
   const [workspaceExport, setWorkspaceExport] = useState<WorkspaceExportResponse | null>(null);
-  const [layoutMenuOpen, setLayoutMenuOpen] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
   const perspectiveViewerRef = useRef<HTMLElement | null>(null);
   const perspectiveTableRef = useRef<{ delete?: () => Promise<void> | void } | null>(null);
@@ -847,9 +335,6 @@ function App() {
   const perspectiveStatusRef = useRef<PerspectiveStatus>("idle");
   const perspectiveErrorRef = useRef<string | null>(null);
   const perspectiveReadyMsRef = useRef<number | null>(null);
-  const previousLayoutIdRef = useRef<string | null>(null);
-  const slowModeAutoEnabledByLayoutRef = useRef(false);
-  const layoutRecoveryInProgressRef = useRef(false);
   const perspectiveRuntimeInitRef = useRef<Promise<void> | null>(null);
   // Perspective module doesn't ship comprehensive TS types; typed as unknown
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -878,30 +363,6 @@ function App() {
 
   async function sleepMs(ms: number) {
     await new Promise<void>((resolve) => setTimeout(resolve, ms));
-  }
-
-  function clampPerfSweepRuns(input: string): number {
-    const parsed = Number.parseInt(input.trim(), 10);
-    if (!Number.isFinite(parsed)) {
-      return PERF_SWEEP_DEFAULT_RUNS;
-    }
-    return Math.min(PERF_SWEEP_MAX_RUNS, Math.max(PERF_SWEEP_MIN_RUNS, parsed));
-  }
-
-  function percentile(values: number[], fraction: number): number | null {
-    if (values.length === 0) {
-      return null;
-    }
-    const sorted = [...values].sort((a, b) => a - b);
-    const clamped = Math.max(0, Math.min(1, fraction));
-    const index = (sorted.length - 1) * clamped;
-    const lower = Math.floor(index);
-    const upper = Math.ceil(index);
-    if (lower === upper) {
-      return sorted[lower];
-    }
-    const weight = index - lower;
-    return sorted[lower] + (sorted[upper] - sorted[lower]) * weight;
   }
 
   function buildFailedGateReport(
@@ -1530,7 +991,7 @@ function App() {
         perspective_ready_ms: PERSPECTIVE_READY_TARGET_MS,
       },
       acceptance_gate: acceptanceGate,
-      benchmarks,
+      benchmarks: [],
       latest_view: {
         file_path: preview?.file_path ?? null,
         first_viewport_ms: firstViewportMs,
@@ -1544,7 +1005,7 @@ function App() {
         last_query: workspaceQueryResult,
         last_schema_diff: workspaceSchemaDiff,
       },
-      perf_sweep: perfSweepReport,
+      perf_sweep: null,
     };
   }
 
@@ -1978,47 +1439,6 @@ function App() {
     setArrowRows(rows);
   }
 
-  async function runIpcBenchmark(sizeMb: number): Promise<BenchmarkResult> {
-    const start = performance.now();
-    const payload = await invoke<number[]>("arrow_ipc_payload", { sizeMb });
-    const elapsedMs = performance.now() - start;
-    const bytes = payload.length;
-    const throughputMbps = bytes / (1024 * 1024) / (elapsedMs / 1000);
-
-    return { mode: "ipc", sizeMb, bytes, elapsedMs, throughputMbps };
-  }
-
-  async function runSocketBenchmark(sizeMb: number): Promise<BenchmarkResult> {
-    const server = await invoke<SocketServerInfo>("start_arrow_socket_server", {
-      sizeMb,
-    });
-
-    const start = performance.now();
-    const bytes = await new Promise<number>((resolve, reject) => {
-      let received = 0;
-      const ws = new WebSocket(server.url);
-      ws.binaryType = "arraybuffer";
-
-      ws.onmessage = (event) => {
-        if (typeof event.data === "string") {
-          return;
-        }
-
-        if (event.data instanceof ArrayBuffer) {
-          received += event.data.byteLength;
-        }
-      };
-
-      ws.onerror = () => reject(new Error("Socket benchmark connection failed"));
-      ws.onclose = () => resolve(received);
-    });
-
-    const elapsedMs = performance.now() - start;
-    const throughputMbps = bytes / (1024 * 1024) / (elapsedMs / 1000);
-
-    return { mode: "socket", sizeMb, bytes, elapsedMs, throughputMbps };
-  }
-
   async function readSocketPayload(url: string): Promise<Uint8Array> {
     return new Promise<Uint8Array>((resolve, reject) => {
       const chunks: Uint8Array[] = [];
@@ -2049,26 +1469,6 @@ function App() {
         resolve(merged);
       };
     });
-  }
-
-  async function runTransportBenchmarks() {
-    await refreshRuntimeHealth();
-    if (memoryGuardRef.current) {
-      setError("Memory panic circuit is active; transport benchmark is blocked.");
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-    try {
-      const ipc = await runIpcBenchmark(16);
-      const socket = await runSocketBenchmark(64);
-      setBenchmarks([ipc, socket]);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
-    }
   }
 
   const setRowsAtOffset = useCallback((rowOffset: number, rows: Array<Array<string | null>>) => {
@@ -2212,85 +1612,9 @@ function App() {
     }
   }
 
-  async function runPerfSweep() {
-    await refreshRuntimeHealth();
-    if (memoryGuardRef.current) {
-      setError("Memory panic circuit is active; perf sweep is blocked.");
-      return;
-    }
-
-    const runCount = clampPerfSweepRuns(perfSweepRunsInput);
-    setPerfSweepRunsInput(String(runCount));
-    setLoading(true);
-    setError(null);
-    setPerfSweepReport(null);
-
-    try {
-      let targetFile = preview?.file_path ?? null;
-      if (!targetFile) {
-        targetFile = await pickParquetFile();
-      }
-      if (!targetFile) {
-        return;
-      }
-
-      const runs: AcceptanceGateReport[] = [];
-      for (let index = 0; index < runCount; index += 1) {
-        try {
-          const report = await evaluateAcceptanceGateForFile(targetFile);
-          runs.push(report);
-          setAcceptanceGate(report);
-        } catch (err) {
-          const failed = buildFailedGateReport(targetFile, String(err));
-          runs.push(failed);
-          setAcceptanceGate(failed);
-        }
-
-        await refreshRuntimeHealth();
-        if (memoryGuardRef.current) {
-          setError("Memory panic circuit tripped during perf sweep. Sweep stopped early.");
-          break;
-        }
-      }
-
-      const firstViewportSamples = runs
-        .map((run) => run.firstViewportMs)
-        .filter((value): value is number => value !== null);
-      const perspectiveSamples = runs
-        .map((run) => run.perspectiveReadyMs)
-        .filter((value): value is number => value !== null);
-      const passCount = runs.filter((run) => run.passed).length;
-      const failCount = runs.length - passCount;
-      const summary: PerfSweepSummary = {
-        filePath: targetFile,
-        evaluatedAt: new Date().toISOString(),
-        runCount,
-        completedRuns: runs.length,
-        passCount,
-        failCount,
-        firstViewportP50: percentile(firstViewportSamples, 0.5),
-        firstViewportP95: percentile(firstViewportSamples, 0.95),
-        perspectiveReadyP50: percentile(perspectiveSamples, 0.5),
-        perspectiveReadyP95: percentile(perspectiveSamples, 0.95),
-        perspectiveReadySamples: perspectiveSamples.length,
-        runs,
-      };
-      setPerfSweepReport(summary);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
   const totalRows = preview?.total_rows ?? 0;
   const canExportResults = true;
   const memoryGuardActive = runtimeHealth?.memory_guard_tripped ?? false;
-  const memoryUsagePct = runtimeHealth ? runtimeHealth.usage_ratio * 100 : null;
-  const memoryRssMb = runtimeHealth ? runtimeHealth.process_rss_bytes / (1024 * 1024) : null;
-  const workspaceRowCount = workspaceQueryResult?.row_count ?? null;
-  const workspaceColumnCount = workspaceQueryResult?.schema.length ?? null;
-  const workspaceQueryElapsedMs = workspaceQueryResult?.elapsed_ms ?? null;
   const workspaceColumns = workspaceQueryResult?.schema ?? [];
   const workspaceNumericColumns = workspaceColumns.filter((column) =>
     isNumericDuckType(column.duckdb_type),
@@ -2403,59 +1727,9 @@ function App() {
     document.documentElement.setAttribute("data-theme", resolvedTheme);
   }, [resolvedTheme]);
 
-  const activeLayout = useMemo(
-    () => savedLayouts.find((layout) => layout.id === activeLayoutId) ?? savedLayouts[0] ?? null,
-    [activeLayoutId, savedLayouts],
-  );
-
-  useEffect(() => {
-    if (!activeLayout) {
-      return;
-    }
-    const payload: StoredLayoutPrefs = {
-      version: 1,
-      active_layout_id: activeLayoutId,
-      layouts: savedLayouts,
-    };
-    window.localStorage.setItem(UI_LAYOUT_STORAGE_KEY, JSON.stringify(payload));
-  }, [activeLayout, activeLayoutId, savedLayouts]);
-
-  useEffect(() => {
-    window.localStorage.setItem(UI_LAYOUT_EDIT_STORAGE_KEY, layoutEditEnabled ? "1" : "0");
-  }, [layoutEditEnabled]);
-
   useEffect(() => {
     window.localStorage.setItem(UI_WORKSPACE_SLOW_MODE_STORAGE_KEY, workspaceSlowModeEnabled ? "1" : "0");
   }, [workspaceSlowModeEnabled]);
-
-  useEffect(() => {
-    if (!LAYOUTS_ENABLED && layoutEditEnabled) {
-      setLayoutEditEnabled(false);
-    }
-    if (!LAYOUTS_ENABLED && layoutMenuOpen) {
-      setLayoutMenuOpen(false);
-    }
-  }, [layoutEditEnabled, layoutMenuOpen]);
-
-  useEffect(() => {
-    const previous = previousLayoutIdRef.current;
-
-    if (activeLayoutId === SLO_MO_LAYOUT_ID && previous !== SLO_MO_LAYOUT_ID) {
-      if (!workspaceSlowModeEnabled) {
-        slowModeAutoEnabledByLayoutRef.current = true;
-        setWorkspaceSlowModeEnabled(true);
-      } else {
-        slowModeAutoEnabledByLayoutRef.current = false;
-      }
-    } else if (previous === SLO_MO_LAYOUT_ID && activeLayoutId !== SLO_MO_LAYOUT_ID) {
-      if (slowModeAutoEnabledByLayoutRef.current) {
-        setWorkspaceSlowModeEnabled(false);
-      }
-      slowModeAutoEnabledByLayoutRef.current = false;
-    }
-
-    previousLayoutIdRef.current = activeLayoutId;
-  }, [activeLayoutId, workspaceSlowModeEnabled]);
 
   useEffect(() => {
     if (!workspaceSlowModeEnabled) {
@@ -2465,309 +1739,20 @@ function App() {
   }, [workspaceSlowModeEnabled]);
 
   useEffect(() => {
-    if (!layoutEditEnabled) {
-      return;
-    }
-    const normalized = normalizeLayoutModel(layoutModel.toJson());
-    setLayoutModel(Model.fromJson(cloneJson(normalized)));
-    setSavedLayouts((prev) =>
-      prev.map((layout) =>
-        layout.id === activeLayoutId
-          ? {
-              ...layout,
-              model: cloneJson(normalized),
-            }
-          : layout,
-      ),
-    );
-  }, [activeLayoutId, layoutEditEnabled]);
-
-  useEffect(() => {
-    if (savedLayouts.length === 0) {
-      if (layoutRecoveryInProgressRef.current) {
-        return;
-      }
-      layoutRecoveryInProgressRef.current = true;
-      const fallback = recoverDefaultLayoutPrefs(
-        "empty_layout_state",
-        "Runtime layout state became empty; restored factory defaults.",
-      );
-      setSavedLayouts(fallback.layouts);
-      setActiveLayoutId(fallback.active_layout_id);
-      setLayoutModel(Model.fromJson(cloneJson(fallback.layouts[0].model)));
-      return;
-    }
-    layoutRecoveryInProgressRef.current = false;
-    if (!savedLayouts.some((layout) => layout.id === activeLayoutId)) {
-      const next = savedLayouts[0];
-      setActiveLayoutId(next.id);
-      setLayoutModel(Model.fromJson(cloneJson(next.model)));
-    }
-  }, [activeLayoutId, savedLayouts]);
-
-  function switchLayout(layoutId: string) {
-    const next = savedLayouts.find((layout) => layout.id === layoutId);
-    if (!next) {
-      return;
-    }
-    setActiveLayoutId(next.id);
-    setLayoutModel(Model.fromJson(cloneJson(next.model)));
-  }
-
-  function saveLayoutSnapshot() {
-    const name = window.prompt("Save layout as", `${activeLayout?.name ?? "Layout"} Copy`)?.trim();
-    if (!name) {
-      return;
-    }
-    const snapshotModel = normalizeLayoutModel(layoutModel.toJson());
-    const snapshot: SavedLayout = {
-      id: nextLayoutId(),
-      name,
-      model: cloneJson(snapshotModel),
-    };
-    setSavedLayouts((prev) => [...prev, snapshot]);
-    setActiveLayoutId(snapshot.id);
-    setLayoutModel(Model.fromJson(cloneJson(snapshot.model)));
-  }
-
-  function renameLayout() {
-    if (!activeLayout) {
-      return;
-    }
-    const name = window.prompt("Rename layout", activeLayout.name)?.trim();
-    if (!name) {
-      return;
-    }
-    setSavedLayouts((prev) =>
-      prev.map((layout) => (layout.id === activeLayout.id ? { ...layout, name } : layout)),
-    );
-  }
-
-  function duplicateLayout() {
-    if (!activeLayout) {
-      return;
-    }
-    const snapshotModel = normalizeLayoutModel(layoutModel.toJson());
-    const snapshot: SavedLayout = {
-      id: nextLayoutId(),
-      name: `${activeLayout.name} Copy`,
-      model: cloneJson(snapshotModel),
-    };
-    setSavedLayouts((prev) => [...prev, snapshot]);
-    setActiveLayoutId(snapshot.id);
-    setLayoutModel(Model.fromJson(cloneJson(snapshot.model)));
-  }
-
-  function deleteLayout() {
-    if (!activeLayout || savedLayouts.length <= 1) {
-      return;
-    }
-    if (!window.confirm(`Delete layout "${activeLayout.name}"?`)) {
-      return;
-    }
-    const remaining = savedLayouts.filter((layout) => layout.id !== activeLayout.id);
-    const next = remaining[0];
-    setSavedLayouts(remaining);
-    setActiveLayoutId(next.id);
-    setLayoutModel(Model.fromJson(cloneJson(next.model)));
-  }
-
-  function resetToDefaultLayout() {
-    const nextModel = normalizeLayoutModel(DEFAULT_LAYOUT_MODEL);
-    setLayoutModel(Model.fromJson(nextModel));
-    setSavedLayouts((prev) =>
-      prev.map((layout) =>
-        layout.id === activeLayoutId
-          ? {
-              ...layout,
-              model: nextModel,
-            }
-          : layout,
-      ),
-    );
-  }
-
-  function restoreFactoryLayouts() {
-    if (!window.confirm("Restore factory layouts? This will remove all saved custom layouts.")) {
-      return;
-    }
-    const defaults = defaultLayoutPrefs();
-    setSavedLayouts(defaults.layouts);
-    setActiveLayoutId(defaults.active_layout_id);
-    setLayoutModel(Model.fromJson(cloneJson(defaults.layouts[0].model)));
-    setLayoutEditEnabled(false);
-  }
-
-  function exportLayoutJson() {
-    if (!activeLayout) {
-      setError("No active layout to export.");
-      return;
-    }
-    try {
-      const payload = {
-        version: 1,
-        exported_at: new Date().toISOString(),
-        layout: {
-          name: activeLayout.name,
-          model: cloneJson(layoutModel.toJson()),
-        },
-      };
-      const blob = new Blob([`${JSON.stringify(payload, null, 2)}\n`], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = `${sanitizeFileName(activeLayout.name)}.layout.json`;
-      document.body.appendChild(anchor);
-      anchor.click();
-      anchor.remove();
-      URL.revokeObjectURL(url);
-      setError(null);
-    } catch (err) {
-      setError(`Export layout failed: ${String(err)}`);
-    }
-  }
-
-  async function importLayoutJson() {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = ".json,application/json";
-    input.multiple = false;
-
-    const filePromise = new Promise<File | null>((resolve) => {
-      input.onchange = () => {
-        resolve(input.files?.[0] ?? null);
-      };
-    });
-
-    input.click();
-    const selected = await filePromise;
-    if (!selected) {
-      return;
-    }
-
-    try {
-      const raw = await readFileAsText(selected);
-      const parsed = JSON.parse(raw) as unknown;
-      const fallbackName = selected.name.replace(/\.json$/i, "") || "Imported";
-      const imported = parseImportedLayoutPayload(parsed, fallbackName);
-      Model.fromJson(cloneJson(imported.model));
-
-      const components = collectLayoutTabComponents(imported.model);
-      const panelCountsMap = new Map<string, number>();
-      components.forEach((component) => {
-        panelCountsMap.set(component, (panelCountsMap.get(component) ?? 0) + 1);
-      });
-      const panelCounts = Array.from(panelCountsMap.entries())
-        .map(([component, count]) => ({ component, count }))
-        .sort((a, b) => a.component.localeCompare(b.component));
-      const knownPanels = new Set<DockPanelComponent>(["preview", "workspace", "diagnostics"]);
-      const unknownPanels = panelCounts
-        .map((item) => item.component)
-        .filter((component) => !knownPanels.has(component as DockPanelComponent));
-
-      setPendingImportedLayout({
-        sourceFile: selected.name,
-        name: imported.name,
-        model: cloneJson(imported.model),
-        tabCount: components.length,
-        panelCounts,
-        unknownPanels,
-      });
-      setPendingImportedName(imported.name);
-      setError(null);
-    } catch (err) {
-      setError(`Import layout failed: ${String(err)}`);
-    }
-  }
-
-  function applyImportedLayout() {
-    if (!pendingImportedLayout) {
-      return;
-    }
-    const layoutName = pendingImportedName.trim() || pendingImportedLayout.name;
-    const normalizedModel = normalizeLayoutModel(pendingImportedLayout.model);
-    const snapshot: SavedLayout = {
-      id: nextLayoutId(),
-      name: layoutName,
-      model: cloneJson(normalizedModel),
-    };
-    setSavedLayouts((prev) => [...prev, snapshot]);
-    setActiveLayoutId(snapshot.id);
-    setLayoutModel(Model.fromJson(cloneJson(snapshot.model)));
-    setPendingImportedLayout(null);
-    setPendingImportedName("");
-    setError(null);
-  }
-
-  function cancelImportedLayout() {
-    setPendingImportedLayout(null);
-    setPendingImportedName("");
-  }
-
-  function onLayoutModelChange(model: Model) {
-    const snapshot = normalizeLayoutModel(model.toJson());
-    setSavedLayouts((prev) =>
-      prev.map((layout) =>
-        layout.id === activeLayoutId
-          ? {
-              ...layout,
-              model: snapshot,
-            }
-          : layout,
-      ),
-    );
-  }
-
-  function onLayoutAction(action: Action): Action | undefined {
-    if (layoutEditEnabled) {
-      return action;
-    }
-    const blocked = new Set<string>([
-      Actions.MOVE_NODE,
-      Actions.ADD_NODE,
-      Actions.DELETE_TAB,
-      Actions.DELETE_TABSET,
-      Actions.RENAME_TAB,
-      Actions.ADJUST_WEIGHTS,
-      Actions.ADJUST_BORDER_SPLIT,
-      Actions.MAXIMIZE_TOGGLE,
-      Actions.CREATE_WINDOW,
-      Actions.CLOSE_WINDOW,
-      Actions.POPOUT_TAB,
-      Actions.POPOUT_TABSET,
-      Actions.UPDATE_MODEL_ATTRIBUTES,
-      Actions.UPDATE_NODE_ATTRIBUTES,
-    ]);
-    if (blocked.has(action.type)) {
-      return undefined;
-    }
-    return action;
-  }
+    window.localStorage.setItem(UI_ACTIVE_TAB_STORAGE_KEY, activeTab);
+  }, [activeTab]);
 
   function resolvePerspectiveContext(preferred?: PerspectiveContext): PerspectiveContext | null {
-    const components = new Set(collectLayoutTabComponents(layoutModel.toJson()));
-    const hasPreview = components.has("preview");
-    const hasWorkspace = components.has("workspace");
-
-    if (preferred === "preview" && hasPreview) {
-      return "preview";
+    if (preferred === "preview" || preferred === "workspace") {
+      return preferred;
     }
-    if (preferred === "workspace" && hasWorkspace) {
-      return "workspace";
-    }
-    if (hasPreview) {
-      return "preview";
-    }
-    if (hasWorkspace) {
-      return "workspace";
-    }
-    return null;
+    return "preview";
   }
 
   const actionsPanel = (
     <section className="actions-toolbar">
       <div className="actions">
-        {activeLayoutId !== PQ_SQL_LAYOUT_ID && activeLayoutId !== SLO_MO_LAYOUT_ID ? (
+        {activeTab === "preview" ? (
           <button type="button" onClick={() => void openParquetPreview()} disabled={loading || memoryGuardActive}>
             Open Parquet
           </button>
@@ -2777,11 +1762,6 @@ function App() {
             <button type="button" onClick={() => void runAcceptanceGate()} disabled={loading || memoryGuardActive}>
               {loading ? "Running..." : "Run Acceptance Gate"}
             </button>
-            {LAYOUTS_ENABLED ? (
-              <button type="button" onClick={() => setLayoutMenuOpen((prev) => !prev)}>
-                {layoutMenuOpen ? "Hide Layouts" : "Layouts"}
-              </button>
-            ) : null}
             <button type="button" onClick={() => void exportResults("json")} disabled={loading || !canExportResults}>
               Export JSON
             </button>
@@ -2790,7 +1770,7 @@ function App() {
             </button>
           </>
         ) : null}
-        {preview ? (
+        {preview && activeTab === "preview" ? (
           <>
             {INTERNAL_TOOLS_ENABLED ? (
               <>
@@ -2827,151 +1807,7 @@ function App() {
           </>
         ) : null}
         {INTERNAL_TOOLS_ENABLED && result ? <span>DuckDB {result.duckdb_version}</span> : null}
-        {INTERNAL_TOOLS_ENABLED && arrowBytes > 0 ? <span>Arrow IPC {arrowBytes} bytes</span> : null}
-        {INTERNAL_TOOLS_ENABLED && lastExportPath ? (
-          <span className="path-text" title={lastExportPath}>
-            Exported: {lastExportPath}
-          </span>
-        ) : null}
       </div>
-      {INTERNAL_TOOLS_ENABLED && LAYOUTS_ENABLED && layoutMenuOpen ? (
-        <div className="actions-layout-menu">
-          <button type="button" onClick={saveLayoutSnapshot}>
-            Save As
-          </button>
-          <button type="button" onClick={renameLayout} disabled={!activeLayout}>
-            Rename
-          </button>
-          <button type="button" onClick={duplicateLayout} disabled={!activeLayout}>
-            Duplicate
-          </button>
-          <button type="button" onClick={deleteLayout} disabled={savedLayouts.length <= 1}>
-            Delete
-          </button>
-          <button type="button" onClick={resetToDefaultLayout}>
-            Reset
-          </button>
-          <button type="button" onClick={restoreFactoryLayouts}>
-            Restore Factory
-          </button>
-          <button type="button" onClick={exportLayoutJson} disabled={!activeLayout}>
-            Export Layout JSON
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              void importLayoutJson();
-            }}
-          >
-            Import Layout JSON
-          </button>
-          <button type="button" onClick={() => setLayoutEditEnabled((prev) => !prev)}>
-            {layoutEditEnabled ? "Lock Layout" : "Edit Layout"}
-          </button>
-          <button type="button" onClick={() => void runTransportBenchmarks()} disabled={loading}>
-            Run Transport Bench
-          </button>
-          <button type="button" onClick={() => void runPerfSweep()} disabled={loading}>
-            Run Perf Sweep
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              void (async () => {
-                await runSmokeQuery();
-                await runArrowIpcSmoke();
-              })();
-            }}
-            disabled={loading}
-          >
-            Run Smoke Checks
-          </button>
-          <span className={layoutEditEnabled ? "metric-chip metric-good" : "metric-chip"}>
-            {layoutEditEnabled ? "Layout editing enabled" : "Layout editing locked"}
-          </span>
-          <span className="phase">Advanced checks are intentionally tucked under Layouts.</span>
-        </div>
-      ) : null}
-
-      {INTERNAL_TOOLS_ENABLED && (runtimeHealth || preview || workspaceQueryResult) ? (
-        <div className="runtime-metrics">
-          {runtimeHealth ? (
-            <span className={memoryGuardActive ? "metric-chip metric-bad" : "metric-chip"}>
-              Memory: {memoryUsagePct?.toFixed(1) ?? "n/a"}%
-            </span>
-          ) : null}
-          {runtimeHealth ? <span className="metric-chip">RSS: {memoryRssMb?.toFixed(1) ?? "n/a"} MB</span> : null}
-          {workspaceRowCount !== null ? <span className="metric-chip">SQL rows: {workspaceRowCount.toLocaleString()}</span> : null}
-          {workspaceColumnCount !== null ? <span className="metric-chip">SQL cols: {workspaceColumnCount}</span> : null}
-          {workspaceQueryElapsedMs !== null ? (
-            <span className="metric-chip">SQL response: {workspaceQueryElapsedMs.toFixed(0)}ms</span>
-          ) : null}
-          {runtimeHealth?.message ? (
-            <span className={memoryGuardActive ? "metric-chip metric-bad" : "metric-chip"} title={runtimeHealth.message}>
-              {runtimeHealth.message}
-            </span>
-          ) : null}
-        </div>
-      ) : null}
-
-      {INTERNAL_TOOLS_ENABLED && acceptanceGate ? (
-        <div className={acceptanceGate.passed ? "gate-report gate-pass" : "gate-report gate-fail"}>
-          Gate {acceptanceGate.passed ? "PASS" : "FAIL"} | First viewport:{" "}
-          {acceptanceGate.firstViewportMs === null ? "n/a" : `${acceptanceGate.firstViewportMs.toFixed(0)}ms`} |{" "}
-          Perspective:{" "}
-          {acceptanceGate.perspectiveReadyMs === null
-            ? acceptanceGate.perspectiveStatus
-            : `${acceptanceGate.perspectiveReadyMs.toFixed(0)}ms (${acceptanceGate.perspectiveStatus})`}{" "}
-          | File: {acceptanceGate.filePath}
-          {acceptanceGate.details ? ` | Detail: ${acceptanceGate.details}` : ""}
-        </div>
-      ) : null}
-      {INTERNAL_TOOLS_ENABLED && perfSweepReport ? (
-        <div className={perfSweepReport.failCount === 0 ? "gate-report gate-pass" : "gate-report gate-fail"}>
-          Perf Sweep {perfSweepReport.failCount === 0 ? "PASS" : "FAIL"} | Runs: {perfSweepReport.completedRuns}/
-          {perfSweepReport.runCount} | Pass: {perfSweepReport.passCount} | First p50/p95:{" "}
-          {perfSweepReport.firstViewportP50 === null
-            ? "n/a"
-            : `${perfSweepReport.firstViewportP50.toFixed(0)}ms / ${perfSweepReport.firstViewportP95?.toFixed(0) ?? "n/a"}ms`}{" "}
-          | Perspective p50/p95:{" "}
-          {perfSweepReport.perspectiveReadyP50 === null
-            ? "n/a"
-            : `${perfSweepReport.perspectiveReadyP50.toFixed(0)}ms / ${perfSweepReport.perspectiveReadyP95?.toFixed(0) ?? "n/a"}ms`}{" "}
-          | File: {perfSweepReport.filePath}
-        </div>
-      ) : null}
-      {INTERNAL_TOOLS_ENABLED && perfSweepReport ? (
-        <details className="sweep-runs">
-          <summary>Perf Sweep Runs</summary>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Run</th>
-                  <th>First viewport (ms)</th>
-                  <th>Perspective (ms)</th>
-                  <th>Status</th>
-                  <th>Gate</th>
-                  <th>Detail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {perfSweepReport.runs.map((run, index) => (
-                  <tr key={`perf-run-${run.evaluatedAt}-${index}`}>
-                    <td>{index + 1}</td>
-                    <td>{run.firstViewportMs === null ? "n/a" : run.firstViewportMs.toFixed(1)}</td>
-                    <td>{run.perspectiveReadyMs === null ? "n/a" : run.perspectiveReadyMs.toFixed(1)}</td>
-                    <td>{run.perspectiveStatus}</td>
-                    <td>{run.passed ? "PASS" : "FAIL"}</td>
-                    <td>{run.details || "-"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </details>
-      ) : null}
-
       {error ? <p className="error">{error}</p> : null}
     </section>
   );
@@ -3110,58 +1946,6 @@ function App() {
     </section>
   );
 
-  const diagnosticsPanel = (
-    <section className="dock-panel">
-      {INTERNAL_TOOLS_ENABLED ? (
-        <>
-          <h3>Arrow IPC Decode</h3>
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Label</th>
-              </tr>
-            </thead>
-            <tbody>
-              {arrowRows.map((row) => (
-                <tr key={`arrow-${row.id}`}>
-                  <td>{row.id}</td>
-                  <td>{row.label}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-
-          <h3>Transport Benchmarks</h3>
-          <table>
-            <thead>
-              <tr>
-                <th>Mode</th>
-                <th>Payload</th>
-                <th>Bytes</th>
-                <th>Time (ms)</th>
-                <th>Throughput (MB/s)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {benchmarks.map((entry) => (
-                <tr key={entry.mode}>
-                  <td>{entry.mode}</td>
-                  <td>{entry.sizeMb} MB</td>
-                  <td>{entry.bytes.toLocaleString()}</td>
-                  <td>{entry.elapsedMs.toFixed(1)}</td>
-                  <td>{entry.throughputMbps.toFixed(1)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </>
-      ) : (
-        <p className="phase">Diagnostics are hidden in beta builds.</p>
-      )}
-    </section>
-  );
-
   const workspacePanel = (
     <section className="workspace-panel">
       <h3>Workspace Explorer</h3>
@@ -3242,7 +2026,7 @@ function App() {
           Browse
         </button>
         <button type="button" onClick={() => void registerWorkspaceTable()} disabled={loading}>
-          Register
+          Mount
         </button>
       </div>
 
@@ -3526,39 +2310,11 @@ function App() {
     </section>
   );
 
-  const dockThemeClass = resolvedTheme === "dark" ? "flexlayout__theme_dark" : "flexlayout__theme_light";
-
-  function dockFactory(node: TabNode) {
-    const component = node.getComponent() as DockPanelComponent;
-    switch (component) {
-      case "actions":
-        return null;
-      case "preview":
-        return previewPanel;
-      case "workspace":
-        return workspacePanel;
-      case "diagnostics":
-        return diagnosticsPanel;
-      default:
-        return <div className="phase">Unknown panel</div>;
-    }
-  }
-
   return (
     <main className="app-shell">
       <header className="topbar">
         <h1>Parq-Bench — High-Performance Local Data Lake</h1>
         <div className="topbar-right">
-          <label className="theme-picker">
-            Layout
-            <select value={activeLayout?.id ?? ""} onChange={(event) => switchLayout(event.currentTarget.value)}>
-              {savedLayouts.map((layout) => (
-                <option key={`layout-top-${layout.id}`} value={layout.id}>
-                  {layout.name}
-                </option>
-              ))}
-            </select>
-          </label>
           <label className="theme-picker">
             Theme
             <select value={themeMode} onChange={(event) => setThemeMode(event.currentTarget.value as ThemeMode)}>
@@ -3567,22 +2323,39 @@ function App() {
               <option value="dark">Dark</option>
             </select>
           </label>
-          <button type="button" onClick={() => setAboutOpen(true)} disabled={pendingImportedLayout !== null}>
+          <button type="button" onClick={() => setAboutOpen(true)}>
             About
           </button>
           <span className="beta-badge">{PRODUCT_STAGE_LABEL} v0.1.0</span>
         </div>
       </header>
 
+      <nav className="tab-bar">
+        <button
+          type="button"
+          className={activeTab === "preview" ? "tab-button tab-active" : "tab-button"}
+          onClick={() => setActiveTab("preview")}
+        >
+          Preview
+        </button>
+        <button
+          type="button"
+          className={activeTab === "sql" ? "tab-button tab-active" : "tab-button"}
+          onClick={() => setActiveTab("sql")}
+        >
+          SQL
+        </button>
+      </nav>
+
       {actionsPanel}
 
-      <div className={`dock-host ${dockThemeClass}`}>
-        <Layout
-          model={layoutModel}
-          factory={dockFactory}
-          onAction={onLayoutAction}
-          onModelChange={(model) => onLayoutModelChange(model)}
-        />
+      <div className="tab-content">
+        <div className={activeTab === "preview" ? "tab-pane tab-pane-visible" : "tab-pane tab-pane-hidden"}>
+          {previewPanel}
+        </div>
+        <div className={activeTab === "sql" ? "tab-pane tab-pane-visible" : "tab-pane tab-pane-hidden"}>
+          {workspacePanel}
+        </div>
       </div>
 
       {aboutOpen ? (
@@ -3617,55 +2390,6 @@ function App() {
             <div className="modal-actions">
               <button type="button" onClick={() => setAboutOpen(false)}>
                 Close
-              </button>
-            </div>
-          </section>
-        </div>
-      ) : null}
-
-      {pendingImportedLayout ? (
-        <div className="modal-backdrop" role="presentation" onClick={cancelImportedLayout}>
-          <section
-            className="modal-card"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Import layout preview"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <h3>Import Layout Preview</h3>
-            <p className="phase">
-              File: <strong>{pendingImportedLayout.sourceFile}</strong>
-            </p>
-            <p className="phase">
-              Tabs: <strong>{pendingImportedLayout.tabCount}</strong>
-            </p>
-            <div className="meta-line">
-              {pendingImportedLayout.panelCounts.map((item) => (
-                <span key={`import-panel-${item.component}`} className="metric-chip">
-                  {item.component}: {item.count}
-                </span>
-              ))}
-            </div>
-            {pendingImportedLayout.unknownPanels.length > 0 ? (
-              <p className="error">
-                Unknown panel components: {pendingImportedLayout.unknownPanels.join(", ")}. They may render as
-                placeholders.
-              </p>
-            ) : null}
-            <label className="theme-picker">
-              Imported layout name
-              <input
-                type="text"
-                value={pendingImportedName}
-                onChange={(event) => setPendingImportedName(event.currentTarget.value)}
-              />
-            </label>
-            <div className="modal-actions">
-              <button type="button" onClick={applyImportedLayout}>
-                Import
-              </button>
-              <button type="button" onClick={cancelImportedLayout}>
-                Cancel
               </button>
             </div>
           </section>
