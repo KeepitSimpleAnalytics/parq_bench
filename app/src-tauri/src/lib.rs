@@ -1446,6 +1446,48 @@ fn list_workspace_tables(
 }
 
 #[tauri::command]
+fn rename_workspace_table(
+    old_alias: String,
+    new_alias: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<WorkspaceTableInfo, String> {
+    let trimmed_old = old_alias.trim();
+    let trimmed_new = new_alias.trim();
+    if trimmed_old.is_empty() || trimmed_new.is_empty() {
+        return Err("Both old and new alias are required.".to_string());
+    }
+    if !is_valid_workspace_alias(trimmed_new) {
+        return Err(
+            "Alias must start with a letter/underscore and only contain letters, numbers, and underscores."
+                .to_string(),
+        );
+    }
+
+    let mut tables = state
+        .workspace_tables
+        .lock()
+        .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+
+    let entry_idx = tables
+        .iter()
+        .position(|entry| entry.alias.eq_ignore_ascii_case(trimmed_old))
+        .ok_or_else(|| format!("Workspace alias not found: {trimmed_old}"))?;
+
+    let collides = tables.iter().enumerate().any(|(idx, entry)| {
+        idx != entry_idx && entry.alias.eq_ignore_ascii_case(trimmed_new)
+    });
+    if collides {
+        return Err(format!(
+            "Workspace alias '{}' is already in use.",
+            trimmed_new
+        ));
+    }
+
+    tables[entry_idx].alias = trimmed_new.to_string();
+    Ok(workspace_table_info(&tables[entry_idx]))
+}
+
+#[tauri::command]
 fn remove_workspace_table(
     alias: String,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
@@ -2171,6 +2213,7 @@ pub fn run() {
             write_text_report,
             register_workspace_table,
             list_workspace_tables,
+            rename_workspace_table,
             remove_workspace_table,
             run_workspace_query,
             describe_workspace_table,

@@ -3,6 +3,7 @@ import Editor, { loader, type OnMount } from "@monaco-editor/react";
 import * as monacoEditor from "monaco-editor";
 loader.config({ monaco: monacoEditor });
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 import { tableFromIPC } from "apache-arrow";
@@ -328,6 +329,11 @@ function App() {
   const [workspaceSchemaDiff, setWorkspaceSchemaDiff] = useState<WorkspaceSchemaDiffResponse | null>(null);
   const [workspaceExport, setWorkspaceExport] = useState<WorkspaceExportResponse | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [dragOverZone, setDragOverZone] = useState<"preview" | "sql" | null>(null);
+  const [editingAlias, setEditingAlias] = useState<string | null>(null);
+  const [editingAliasValue, setEditingAliasValue] = useState("");
+  const previewPaneRef = useRef<HTMLDivElement | null>(null);
+  const sqlPaneRef = useRef<HTMLDivElement | null>(null);
   const perspectiveViewerRef = useRef<HTMLElement | null>(null);
   const perspectiveTableRef = useRef<{ delete?: () => Promise<void> | void } | null>(null);
   const memoryGuardRef = useRef(false);
@@ -1742,6 +1748,242 @@ function App() {
     window.localStorage.setItem(UI_ACTIVE_TAB_STORAGE_KEY, activeTab);
   }, [activeTab]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const unlisten = getCurrentWebview().onDragDropEvent((event) => {
+      if (cancelled) return;
+      const payload = event.payload;
+      if (payload.type === "over") {
+        const pos = payload.position;
+        const previewRect = previewPaneRef.current?.getBoundingClientRect();
+        const sqlRect = sqlPaneRef.current?.getBoundingClientRect();
+        if (
+          previewRect &&
+          activeTab === "preview" &&
+          pos.x >= previewRect.left &&
+          pos.x <= previewRect.right &&
+          pos.y >= previewRect.top &&
+          pos.y <= previewRect.bottom
+        ) {
+          setDragOverZone("preview");
+        } else if (
+          sqlRect &&
+          activeTab === "sql" &&
+          pos.x >= sqlRect.left &&
+          pos.x <= sqlRect.right &&
+          pos.y >= sqlRect.top &&
+          pos.y <= sqlRect.bottom
+        ) {
+          setDragOverZone("sql");
+        } else {
+          setDragOverZone(activeTab);
+        }
+      } else if (payload.type === "leave") {
+        setDragOverZone(null);
+      } else if (payload.type === "drop") {
+        const zone = dragOverZone ?? activeTab;
+        setDragOverZone(null);
+        const paths = payload.paths;
+        if (!paths || paths.length === 0) return;
+        if (zone === "preview") {
+          void handlePreviewDrop(paths);
+        } else {
+          void handleSqlDrop(paths);
+        }
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      unlisten.then((fn) => fn());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, dragOverZone]);
+
+  async function handlePreviewDrop(paths: string[]) {
+    const parquetPaths = paths.filter((p) => p.toLowerCase().endsWith(".parquet"));
+    if (parquetPaths.length === 0) {
+      setError("Only .parquet files can be opened in Preview.");
+      return;
+    }
+    if (memoryGuardRef.current) {
+      setError("Memory panic circuit is active. Cannot open file.");
+      return;
+    }
+    if (loading) return;
+
+    setLoading(true);
+    setError(null);
+    try {
+      await loadPreviewFromPath(parquetPaths[0]);
+      setActiveTab("preview");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleSqlDrop(paths: string[]) {
+    const parquetExts = [".parquet"];
+    const delimitedExts = [".csv", ".tsv", ".txt", ".data"];
+    const validPaths = paths.filter((p) => {
+      const lower = p.toLowerCase();
+      if (parquetExts.some((ext) => lower.endsWith(ext))) return true;
+      if (workspaceSlowModeEnabled && delimitedExts.some((ext) => lower.endsWith(ext))) return true;
+      return false;
+    });
+    if (validPaths.length === 0) {
+      setError(
+        workspaceSlowModeEnabled
+          ? "No supported files found. Supported: .parquet, .csv, .tsv, .txt, .data"
+          : "No .parquet files found. Enable Slo-mo to support CSV/TSV files.",
+      );
+      return;
+    }
+    if (loading) return;
+
+    setLoading(true);
+    setError(null);
+    try {
+      const existingAliases = new Set(workspaceTables.map((t) => t.alias.toLowerCase()));
+      const batchAliases = new Set<string>();
+      let firstAlias: string | null = null;
+
+      for (const filePath of validPaths) {
+        const fileName = filePath.replace(/\\/g, "/").split("/").pop() ?? "table";
+        const baseName = fileName.replace(/\.[^.]+$/, "");
+        let sanitized = baseName
+          .replace(/[^A-Za-z0-9_]/g, "_")
+          .toLowerCase();
+        if (!/^[a-z_]/.test(sanitized)) {
+          sanitized = "_" + sanitized;
+        }
+
+        let alias = sanitized;
+        let counter = 2;
+        while (existingAliases.has(alias) || batchAliases.has(alias)) {
+          alias = `${sanitized}_${counter}`;
+          counter++;
+        }
+        batchAliases.add(alias);
+        existingAliases.add(alias);
+        if (!firstAlias) firstAlias = alias;
+
+        const lower = filePath.toLowerCase();
+        const sourceKind: "parquet" | "delimited" = parquetExts.some((ext) => lower.endsWith(ext))
+          ? "parquet"
+          : "delimited";
+        const delimiter = lower.endsWith(".tsv") ? "\t" : undefined;
+
+        await invoke<WorkspaceTableInfo>("register_workspace_table", {
+          alias,
+          filePath,
+          isGlob: false,
+          sourceKind,
+          delimiter,
+        });
+      }
+
+      await refreshWorkspaceTables();
+      if (firstAlias) {
+        const currentSql = readWorkspaceSql();
+        if (currentSql === "SELECT * FROM my_table LIMIT 100") {
+          replaceWorkspaceSql(`SELECT * FROM ${firstAlias} LIMIT 100`);
+        }
+      }
+      setActiveTab("sql");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function renameWorkspaceTable(oldAlias: string, newAlias: string) {
+    setLoading(true);
+    setError(null);
+    try {
+      await invoke<WorkspaceTableInfo>("rename_workspace_table", { oldAlias, newAlias });
+      await refreshWorkspaceTables();
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Global keyboard shortcuts
+  useEffect(() => {
+    function handleGlobalKeyDown(e: KeyboardEvent) {
+      const mod = e.ctrlKey || e.metaKey;
+      const target = e.target as HTMLElement | null;
+      const tagName = target?.tagName ?? "";
+      const isTextInput = tagName === "INPUT" || tagName === "TEXTAREA";
+
+      // Escape — always allowed
+      if (e.key === "Escape") {
+        if (aboutOpen) {
+          e.preventDefault();
+          setAboutOpen(false);
+        } else if (error) {
+          e.preventDefault();
+          setError(null);
+        }
+        return;
+      }
+
+      // Skip modifier shortcuts when typing in text inputs (but not Monaco — Monaco handles its own keys)
+      if (isTextInput) return;
+
+      if (!mod) return;
+
+      // Ctrl+1 → Preview tab
+      if (e.key === "1") {
+        e.preventDefault();
+        setActiveTab("preview");
+        return;
+      }
+
+      // Ctrl+2 → SQL tab
+      if (e.key === "2") {
+        e.preventDefault();
+        setActiveTab("sql");
+        return;
+      }
+
+      // Ctrl+O → Open Parquet (preview tab only)
+      if (e.key === "o" || e.key === "O") {
+        if (!loading && !memoryGuardRef.current) {
+          e.preventDefault();
+          void openParquetPreview();
+        }
+        return;
+      }
+
+      // Ctrl+Enter → Run SQL (SQL tab only)
+      if (e.key === "Enter" && activeTab === "sql") {
+        if (!loading) {
+          e.preventDefault();
+          void runWorkspaceQuery();
+        }
+        return;
+      }
+
+      // Ctrl+Shift+E → Export query as CSV (SQL tab only)
+      if ((e.key === "e" || e.key === "E") && e.shiftKey && activeTab === "sql") {
+        if (!loading) {
+          e.preventDefault();
+          void exportWorkspaceQuery("csv");
+        }
+        return;
+      }
+    }
+
+    window.addEventListener("keydown", handleGlobalKeyDown);
+    return () => window.removeEventListener("keydown", handleGlobalKeyDown);
+  }, [aboutOpen, error, loading, activeTab]);
+
   function resolvePerspectiveContext(preferred?: PerspectiveContext): PerspectiveContext | null {
     if (preferred === "preview" || preferred === "workspace") {
       return preferred;
@@ -1754,7 +1996,7 @@ function App() {
       <div className="actions">
         {activeTab === "preview" ? (
           <button type="button" onClick={() => void openParquetPreview()} disabled={loading || memoryGuardActive}>
-            Open Parquet
+            Open Parquet<kbd className="shortcut-hint">Ctrl+O</kbd>
           </button>
         ) : null}
         {INTERNAL_TOOLS_ENABLED ? (
@@ -1876,6 +2118,17 @@ function App() {
           ) : null}
           {perspectiveError ? <p className="error">Perspective error: {perspectiveError}</p> : null}
 
+          {viewMode === "virtual" && !INTERNAL_TOOLS_ENABLED && perspectiveStatus === "ready" ? (
+            <p className="row-cap-banner">
+              Interactive pivot view ready.{" "}
+              <button type="button" className="row-cap-switch" onClick={() => setViewMode("perspective")}>
+                Switch to interactive view
+              </button>
+              {totalRows > PERSPECTIVE_MAX_ROWS ? (
+                <span> (first {PERSPECTIVE_MAX_ROWS.toLocaleString()} rows)</span>
+              ) : null}
+            </p>
+          ) : null}
           {viewMode === "virtual" ? (
             <>
               <div className="virtual-header-track">
@@ -1896,7 +2149,6 @@ function App() {
               </div>
               <div
                 className="virtual-grid"
-                style={{ height: `${viewportHeight}px` }}
                 onScroll={(event) => {
                   setScrollTop(event.currentTarget.scrollTop);
                   setScrollLeft(event.currentTarget.scrollLeft);
@@ -1927,6 +2179,15 @@ function App() {
                 </div>
               </div>
             </>
+          ) : null}
+          {viewMode === "perspective" && totalRows > PERSPECTIVE_MAX_ROWS ? (
+            <p className="row-cap-banner">
+              Showing first {PERSPECTIVE_MAX_ROWS.toLocaleString()} of{" "}
+              {totalRows.toLocaleString()} rows.{" "}
+              <button type="button" className="row-cap-switch" onClick={() => setViewMode("virtual")}>
+                Switch to full-scroll view
+              </button>
+            </p>
           ) : null}
           {perspectiveContext === "preview" ? (
             <div
@@ -2036,7 +2297,44 @@ function App() {
           ? "none"
           : workspaceTables.map((table) => (
               <span key={`workspace-${table.alias}`} className="workspace-table-pill">
-                {table.alias}
+                {editingAlias === table.alias ? (
+                  <input
+                    type="text"
+                    className="workspace-alias-edit"
+                    value={editingAliasValue}
+                    autoFocus
+                    onChange={(e) => setEditingAliasValue(e.currentTarget.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        const trimmed = editingAliasValue.trim();
+                        if (trimmed && trimmed !== table.alias) {
+                          void renameWorkspaceTable(table.alias, trimmed);
+                        }
+                        setEditingAlias(null);
+                      } else if (e.key === "Escape") {
+                        setEditingAlias(null);
+                      }
+                    }}
+                    onBlur={() => {
+                      const trimmed = editingAliasValue.trim();
+                      if (trimmed && trimmed !== table.alias) {
+                        void renameWorkspaceTable(table.alias, trimmed);
+                      }
+                      setEditingAlias(null);
+                    }}
+                  />
+                ) : (
+                  <span
+                    className="workspace-alias-label"
+                    title="Click to rename"
+                    onClick={() => {
+                      setEditingAlias(table.alias);
+                      setEditingAliasValue(table.alias);
+                    }}
+                  >
+                    {table.alias}
+                  </span>
+                )}
                 <span className="workspace-table-source">
                   {table.source_kind === "delimited"
                     ? `delimited | ${formatWorkspaceDelimiter(table.delimiter)}`
@@ -2176,7 +2474,7 @@ function App() {
         </div>
         <div className="workspace-editor-controls">
           <button type="button" onClick={() => void runWorkspaceQuery()} disabled={loading}>
-            Run SQL
+            Run SQL<kbd className="shortcut-hint">Ctrl+Enter</kbd>
           </button>
           <span className="editor-font-controls">
             <button type="button" onClick={() => { const s = Math.max(10, editorFontSize - 2); setEditorFontSize(s); workspaceEditorRef.current?.updateOptions({ fontSize: s }); }}>A-</button>
@@ -2336,25 +2634,35 @@ function App() {
           className={activeTab === "preview" ? "tab-button tab-active" : "tab-button"}
           onClick={() => setActiveTab("preview")}
         >
-          Preview
+          Preview<kbd className="shortcut-hint">Ctrl+1</kbd>
         </button>
         <button
           type="button"
           className={activeTab === "sql" ? "tab-button tab-active" : "tab-button"}
           onClick={() => setActiveTab("sql")}
         >
-          SQL
+          SQL<kbd className="shortcut-hint">Ctrl+2</kbd>
         </button>
       </nav>
 
       {actionsPanel}
 
       <div className="tab-content">
-        <div className={activeTab === "preview" ? "tab-pane tab-pane-visible" : "tab-pane tab-pane-hidden"}>
+        <div ref={previewPaneRef} className={activeTab === "preview" ? "tab-pane tab-pane-visible" : "tab-pane tab-pane-hidden"}>
           {previewPanel}
+          {dragOverZone === "preview" ? (
+            <div className="drop-overlay">
+              <span>Drop .parquet file to preview</span>
+            </div>
+          ) : null}
         </div>
-        <div className={activeTab === "sql" ? "tab-pane tab-pane-visible" : "tab-pane tab-pane-hidden"}>
+        <div ref={sqlPaneRef} className={activeTab === "sql" ? "tab-pane tab-pane-visible" : "tab-pane tab-pane-hidden"}>
           {workspacePanel}
+          {dragOverZone === "sql" ? (
+            <div className="drop-overlay">
+              <span>Drop files to mount as workspace tables</span>
+            </div>
+          ) : null}
         </div>
       </div>
 

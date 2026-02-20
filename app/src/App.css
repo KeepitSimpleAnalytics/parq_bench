@@ -168,7 +168,9 @@ body {
 .tab-pane {
   position: absolute;
   inset: 0;
-  overflow: auto;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .tab-pane-hidden {
@@ -408,6 +410,15 @@ button:disabled {
   background: var(--surface);
   padding: 10px;
   min-width: 0;
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.workspace-panel {
+  overflow: auto;
 }
 
 .preview-panel h3,
@@ -457,6 +468,8 @@ table {
   width: 100%;
   max-width: 100%;
   box-sizing: border-box;
+  flex: 1;
+  min-height: 0;
 }
 
 .virtual-spacer {
@@ -490,6 +503,42 @@ table {
 
 .virtual-cell-head {
   font-weight: 600;
+}
+
+.row-cap-banner {
+  border: 1px solid #b8a038;
+  background: #fefce8;
+  color: #6b5c10;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 0.84rem;
+  margin-bottom: 6px;
+  flex-shrink: 0;
+}
+
+:root[data-theme="dark"] .row-cap-banner {
+  border-color: #7a6c2e;
+  background: #2a2510;
+  color: #d4c560;
+}
+
+.row-cap-switch {
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: inherit;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  box-shadow: none;
+}
+
+.row-cap-switch:hover:not(:disabled) {
+  filter: none;
+  box-shadow: none;
+  color: var(--accent-strong);
 }
 
 .perspective-wrap {
@@ -665,6 +714,27 @@ td {
   color: var(--text-soft);
 }
 
+.workspace-alias-label {
+  cursor: pointer;
+  border-bottom: 1px dashed transparent;
+}
+
+.workspace-alias-label:hover {
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+
+.workspace-alias-edit {
+  width: 90px;
+  padding: 1px 4px;
+  font-size: 0.84rem;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  outline: none;
+}
+
 .workspace-pill-remove {
   border: none;
   background: transparent;
@@ -764,6 +834,37 @@ td {
   .workspace-register-row {
     grid-template-columns: 1fr;
   }
+}
+
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(44, 103, 216, 0.10);
+  border: 2px dashed var(--accent);
+  border-radius: 10px;
+  pointer-events: none;
+  z-index: 50;
+}
+
+.drop-overlay span {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--surface);
+  padding: 8px 18px;
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+}
+
+.shortcut-hint {
+  font-size: 0.7rem;
+  opacity: 0.7;
+  margin-left: 6px;
+  font-weight: 400;
+  letter-spacing: 0;
+  font-family: inherit;
 }
 
 @keyframes card-enter {
