@@ -2,7 +2,7 @@
 name = "parq-bench"
 version = "0.3.0"
 description = "A high-performance desktop Parquet file viewer"
-authors = ["KISA-Keep it Simple Analytics LLC"]
+authors = ["KISA-Keep it Simple Analytics"]
 edition = "2021"
 default-run = "parq-bench"
 

@@ -207,12 +207,18 @@ type AppSettings = {
   sqlRowLimit: number;
   perspectiveMaxRows: number;
   editorFontSize: number;
+  expandMode: "fullscreen" | "resize";
+  showPerspectiveConfigure: boolean;
+  showVisualization: boolean;
 };
 
 const DEFAULT_SETTINGS: AppSettings = {
   sqlRowLimit: 200,
   perspectiveMaxRows: 5000,
   editorFontSize: 13,
+  expandMode: "fullscreen",
+  showPerspectiveConfigure: true,
+  showVisualization: true,
 };
 
 type SummarizeRow = Record<string, string>;
@@ -292,6 +298,9 @@ function readSettings(): AppSettings {
       sqlRowLimit: typeof parsed.sqlRowLimit === "number" ? parsed.sqlRowLimit : DEFAULT_SETTINGS.sqlRowLimit,
       perspectiveMaxRows: typeof parsed.perspectiveMaxRows === "number" ? parsed.perspectiveMaxRows : DEFAULT_SETTINGS.perspectiveMaxRows,
       editorFontSize: typeof parsed.editorFontSize === "number" ? parsed.editorFontSize : DEFAULT_SETTINGS.editorFontSize,
+      expandMode: parsed.expandMode === "fullscreen" || parsed.expandMode === "resize" ? parsed.expandMode : DEFAULT_SETTINGS.expandMode,
+      showPerspectiveConfigure: typeof parsed.showPerspectiveConfigure === "boolean" ? parsed.showPerspectiveConfigure : DEFAULT_SETTINGS.showPerspectiveConfigure,
+      showVisualization: typeof parsed.showVisualization === "boolean" ? parsed.showVisualization : DEFAULT_SETTINGS.showVisualization,
     };
   } catch { return { ...DEFAULT_SETTINGS }; }
 }
@@ -378,6 +387,8 @@ function App() {
   );
   const [editorHeight, setEditorHeight] = useState(180);
   const [settings, setSettings] = useState<AppSettings>(() => readSettings());
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
   const [editorFontSize, setEditorFontSize] = useState(() => settings.editorFontSize);
   const [workspaceQueryResult, setWorkspaceQueryResult] = useState<WorkspaceQueryResponse | null>(null);
   const [workspaceChartPlugin, setWorkspaceChartPlugin] = useState<WorkspaceChartPlugin>("Datagrid");
@@ -403,6 +414,7 @@ function App() {
   const [dragOverZone, setDragOverZone] = useState<"preview" | "sql" | null>(null);
   const [editingAlias, setEditingAlias] = useState<string | null>(null);
   const [editingAliasValue, setEditingAliasValue] = useState("");
+  const [expandedPanel, setExpandedPanel] = useState<"preview-table" | "perspective" | "sql-results" | null>(null);
   const previewPaneRef = useRef<HTMLDivElement | null>(null);
   const sqlPaneRef = useRef<HTMLDivElement | null>(null);
   const perspectiveViewerRef = useRef<HTMLElement | null>(null);
@@ -930,42 +942,33 @@ function App() {
   async function ensurePerspectiveRuntime(setStage: (stage: string) => void) {
     if (!perspectiveRuntimeInitRef.current) {
       perspectiveRuntimeInitRef.current = (async () => {
-        const perspective = await withTimeout("perspective core import", import("@finos/perspective"));
-        const perspectiveViewer = await withTimeout(
-          "perspective-viewer import",
-          import("@finos/perspective-viewer"),
-        );
-        const perspectiveServerWasmUrl = (
-          await withTimeout(
-            "perspective-server wasm url",
+        // Stage 1: parallel import of all independent modules + WASM URLs
+        const [perspective, perspectiveViewer, serverWasmMod, viewerWasmMod] = await withTimeout(
+          "perspective parallel imports",
+          Promise.all([
+            import("@finos/perspective"),
+            import("@finos/perspective-viewer"),
             import("@finos/perspective/dist/wasm/perspective-server.wasm?url"),
-          )
-        ).default;
-        setStage("core.init_server");
-        await withTimeout(
-          "perspective init_server()",
-          Promise.resolve(perspective.init_server(fetch(perspectiveServerWasmUrl))),
-        );
-        const viewerWasmUrl = (
-          await withTimeout(
-            "perspective-viewer wasm url",
             import("@finos/perspective-viewer/dist/wasm/perspective-viewer.wasm?url"),
-          )
-        ).default;
-        setStage("viewer.init_client");
-        await withTimeout(
-          "perspective-viewer init_client()",
-          perspectiveViewer.init_client(fetch(viewerWasmUrl)),
+          ]),
         );
-        setStage("datagrid.import");
+        // Stage 2: init server + init client in parallel (independent of each other)
+        setStage("core.init");
         await withTimeout(
-          "perspective-viewer-datagrid import",
-          import("@finos/perspective-viewer-datagrid"),
+          "perspective init_server + init_client",
+          Promise.all([
+            Promise.resolve(perspective.init_server(fetch(serverWasmMod.default))),
+            perspectiveViewer.init_client(fetch(viewerWasmMod.default)),
+          ]),
         );
-        setStage("d3fc.import");
+        // Stage 3: register plugins in parallel
+        setStage("plugins.import");
         await withTimeout(
-          "perspective-viewer-d3fc import",
-          import("@finos/perspective-viewer-d3fc"),
+          "perspective plugins import",
+          Promise.all([
+            import("@finos/perspective-viewer-datagrid"),
+            import("@finos/perspective-viewer-d3fc"),
+          ]),
         );
         setStage("custom-element");
         await withTimeout(
@@ -1923,6 +1926,28 @@ function App() {
     window.localStorage.setItem(UI_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
   }, [settings]);
 
+  // Hide/show Perspective's built-in configure (settings) button via shadow DOM style injection
+  // Only runs after Perspective has fully loaded to avoid layout interference
+  useEffect(() => {
+    if (perspectiveStatus !== "ready") return;
+    const viewer = perspectiveViewerRef.current;
+    if (!viewer) return;
+    const shadow = viewer.shadowRoot;
+    if (!shadow) return;
+    const styleId = "parqbench-hide-configure";
+    let styleEl = shadow.getElementById(styleId) as HTMLStyleElement | null;
+    if (!settings.showPerspectiveConfigure) {
+      if (!styleEl) {
+        styleEl = document.createElement("style");
+        styleEl.id = styleId;
+        styleEl.textContent = "#settings_button { display: none !important; }";
+        shadow.appendChild(styleEl);
+      }
+    } else {
+      if (styleEl) styleEl.remove();
+    }
+  }, [settings.showPerspectiveConfigure, perspectiveStatus]);
+
   useEffect(() => {
     let cancelled = false;
     const unlisten = getCurrentWebview().onDragDropEvent((event) => {
@@ -2096,9 +2121,12 @@ function App() {
       const tagName = target?.tagName ?? "";
       const isTextInput = tagName === "INPUT" || tagName === "TEXTAREA";
 
-      // Escape — always allowed
+      // Escape — always allowed (only collapses in fullscreen mode)
       if (e.key === "Escape") {
-        if (settingsOpen) {
+        if (expandedPanel && settings.expandMode === "fullscreen") {
+          e.preventDefault();
+          setExpandedPanel(null);
+        } else if (settingsOpen) {
           e.preventDefault();
           setSettingsOpen(false);
         } else if (aboutOpen) {
@@ -2252,10 +2280,18 @@ function App() {
   );
 
   const previewPanel = (
-    <section className="preview-panel">
+    <section className={expandedPanel === "preview-table" ? `preview-panel ${settings.expandMode === "resize" ? "resizable-panel" : "expanded-panel"}` : "preview-panel"}>
       {preview ? (
         <>
-          <h3>Parquet Preview</h3>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <h3 style={{ margin: 0 }}>Parquet Preview</h3>
+            {viewMode === "virtual" ? (
+              <button type="button" className="expand-btn" title={expandedPanel === "preview-table" ? (settings.expandMode === "fullscreen" ? "Exit fullscreen (Esc)" : "Collapse") : "Expand table"}
+                onClick={() => setExpandedPanel(expandedPanel === "preview-table" ? null : "preview-table")}>
+                {expandedPanel === "preview-table" ? "\u2716" : (settings.expandMode === "resize" ? "\u2922" : "\u26F6")}
+              </button>
+            ) : null}
+          </div>
           <p className="meta-line">
             <span className="path-text" title={preview.file_path}>
               <strong>Path:</strong> {preview.file_path}
@@ -2321,9 +2357,9 @@ function App() {
 
           {viewMode === "virtual" && !INTERNAL_TOOLS_ENABLED && perspectiveStatus === "ready" ? (
             <p className="row-cap-banner">
-              Interactive pivot view ready.{" "}
+              Data visualization ready.{" "}
               <button type="button" className="row-cap-switch" onClick={() => setViewMode("perspective")}>
-                Switch to interactive view
+                Visualize Data
               </button>
               {totalRows > settings.perspectiveMaxRows ? (
                 <span> (first {settings.perspectiveMaxRows.toLocaleString()} rows)</span>
@@ -2394,9 +2430,16 @@ function App() {
           ) : null}
           {perspectiveContext === "preview" ? (
             <div
-              className={viewMode === "perspective" ? "perspective-wrap" : "perspective-wrap hidden"}
-              style={{ height: `${viewportHeight}px` }}
+              className={`${viewMode === "perspective" ? "perspective-wrap" : "perspective-wrap hidden"}${expandedPanel === "perspective" ? (settings.expandMode === "resize" ? " resizable-panel" : " expanded-panel") : ""}`}
+              style={expandedPanel === "perspective" ? undefined : { height: `${viewportHeight}px` }}
             >
+              {viewMode === "perspective" ? (
+                <button type="button" className="expand-btn perspective-expand-btn"
+                  title={expandedPanel === "perspective" ? (settings.expandMode === "fullscreen" ? "Exit fullscreen (Esc)" : "Collapse") : "Expand chart"}
+                  onClick={() => setExpandedPanel(expandedPanel === "perspective" ? null : "perspective")}>
+                  {expandedPanel === "perspective" ? "\u2716" : (settings.expandMode === "resize" ? "\u2922" : "\u26F6")}
+                </button>
+              ) : null}
               <perspective-viewer ref={perspectiveViewerRef} className="perspective-viewer" />
             </div>
           ) : null}
@@ -2876,6 +2919,11 @@ function App() {
               </div>
             ) : null}
           </div>
+          {settings.showVisualization ? (
+            <button type="button" onClick={() => void visualizeWorkspaceChart()} disabled={loading || workspaceQueryResult === null}>
+              Visualize Data
+            </button>
+          ) : null}
         </div>
         {explainLoading ? (
           <div className="meta-line"><span className="phase">Running EXPLAIN ANALYZE...</span></div>
@@ -2911,66 +2959,75 @@ function App() {
         </p>
       ) : null}
 
-      <div className="workspace-chart-row">
-        <label>
-          Plugin
-          <select value={workspaceChartPlugin} onChange={(event) => setWorkspaceChartPlugin(event.currentTarget.value as WorkspaceChartPlugin)}>
-            <option value="Datagrid">Datagrid</option>
-            <option value="Y Bar">Y Bar</option>
-            <option value="X Bar">X Bar</option>
-            <option value="Y Line">Y Line</option>
-            <option value="Treemap">Treemap</option>
-          </select>
-        </label>
-        <label>
-          X
-          <select value={workspaceChartX} onChange={(event) => setWorkspaceChartX(event.currentTarget.value)}>
-            {workspaceColumns.map((column) => (
-              <option key={`chart-x-${column.name}`} value={column.name}>
-                {column.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Y
-          <select value={workspaceChartY} onChange={(event) => setWorkspaceChartY(event.currentTarget.value)}>
-            {workspaceColumns.map((column) => (
-              <option key={`chart-y-${column.name}`} value={column.name}>
-                {column.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          Agg
-          <select value={workspaceChartAgg} onChange={(event) => setWorkspaceChartAgg(event.currentTarget.value)}>
-            <option value="sum">sum</option>
-            <option value="avg">avg</option>
-            <option value="count">count</option>
-            <option value="min">min</option>
-            <option value="max">max</option>
-          </select>
-        </label>
-        <button type="button" onClick={() => void visualizeWorkspaceChart()} disabled={loading || workspaceQueryResult === null}>
-          Chart In Perspective
-        </button>
-        {workspaceNumericColumns.length === 0 && workspaceQueryResult ? (
-          <span className="phase">No numeric columns detected; use Datagrid.</span>
-        ) : null}
-      </div>
+      {viewMode === "perspective" && settings.showVisualization ? (
+        <div className="workspace-chart-row">
+          <label>
+            Plugin
+            <select value={workspaceChartPlugin} onChange={(event) => setWorkspaceChartPlugin(event.currentTarget.value as WorkspaceChartPlugin)}>
+              <option value="Datagrid">Datagrid</option>
+              <option value="Y Bar">Y Bar</option>
+              <option value="X Bar">X Bar</option>
+              <option value="Y Line">Y Line</option>
+              <option value="Treemap">Treemap</option>
+            </select>
+          </label>
+          <label>
+            X
+            <select value={workspaceChartX} onChange={(event) => setWorkspaceChartX(event.currentTarget.value)}>
+              {workspaceColumns.map((column) => (
+                <option key={`chart-x-${column.name}`} value={column.name}>
+                  {column.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Y
+            <select value={workspaceChartY} onChange={(event) => setWorkspaceChartY(event.currentTarget.value)}>
+              {workspaceColumns.map((column) => (
+                <option key={`chart-y-${column.name}`} value={column.name}>
+                  {column.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Agg
+            <select value={workspaceChartAgg} onChange={(event) => setWorkspaceChartAgg(event.currentTarget.value)}>
+              <option value="sum">sum</option>
+              <option value="avg">avg</option>
+              <option value="count">count</option>
+              <option value="min">min</option>
+              <option value="max">max</option>
+            </select>
+          </label>
+          <button type="button" onClick={() => void visualizeWorkspaceChart()} disabled={loading || workspaceQueryResult === null}>
+            Re-Visualize
+          </button>
+          {workspaceNumericColumns.length === 0 && workspaceQueryResult ? (
+            <span className="phase">No numeric columns detected; use Datagrid.</span>
+          ) : null}
+        </div>
+      ) : null}
 
-      {perspectiveContext === "workspace" ? (
+      {perspectiveContext === "workspace" && settings.showVisualization ? (
         <div
-          className={viewMode === "perspective" ? "perspective-wrap" : "perspective-wrap hidden"}
-          style={{ height: `${Math.max(360, Math.floor(viewportHeight * 0.8))}px`, marginBottom: "8px" }}
+          className={`${viewMode === "perspective" ? "perspective-wrap" : "perspective-wrap hidden"}${expandedPanel === "perspective" ? (settings.expandMode === "resize" ? " resizable-panel" : " expanded-panel") : ""}`}
+          style={expandedPanel === "perspective" ? { marginBottom: "8px" } : { height: `${Math.max(360, Math.floor(viewportHeight * 0.8))}px`, marginBottom: "8px" }}
         >
+          {viewMode === "perspective" ? (
+            <button type="button" className="expand-btn perspective-expand-btn"
+              title={expandedPanel === "perspective" ? (settings.expandMode === "fullscreen" ? "Exit fullscreen (Esc)" : "Collapse") : "Expand chart"}
+              onClick={() => setExpandedPanel(expandedPanel === "perspective" ? null : "perspective")}>
+              {expandedPanel === "perspective" ? "\u2716" : (settings.expandMode === "resize" ? "\u2922" : "\u26F6")}
+            </button>
+          ) : null}
           <perspective-viewer ref={perspectiveViewerRef} className="perspective-viewer" />
         </div>
       ) : null}
 
       {workspaceQueryResult ? (
-        <>
+        <div className={expandedPanel === "sql-results" ? `sql-results-section ${settings.expandMode === "resize" ? "resizable-panel" : "expanded-panel"}` : "sql-results-section"}>
           <p className="meta-line">
             <span>
               <strong>Rows:</strong> {workspaceQueryResult.row_count}
@@ -2985,6 +3042,10 @@ function App() {
             <button type="button" style={{ padding: "2px 7px", fontSize: "0.76rem" }}
               onClick={() => void copyToClipboard(workspaceQueryResult.schema.map((c) => c.name).join(", "))}>
               Copy All Columns
+            </button>
+            <button type="button" className="expand-btn" title={expandedPanel === "sql-results" ? (settings.expandMode === "fullscreen" ? "Exit fullscreen (Esc)" : "Collapse") : "Expand results"}
+              onClick={() => setExpandedPanel(expandedPanel === "sql-results" ? null : "sql-results")}>
+              {expandedPanel === "sql-results" ? "\u2716" : (settings.expandMode === "resize" ? "\u2922" : "\u26F6")}
             </button>
           </p>
           <div className="table-wrap">
@@ -3011,13 +3072,13 @@ function App() {
               </tbody>
             </table>
           </div>
-        </>
+        </div>
       ) : null}
     </section>
   );
 
   return (
-    <main className="app-shell">
+    <main className={expandedPanel && settings.expandMode === "fullscreen" ? "app-shell panel-maximized" : "app-shell"}>
       <header className="topbar">
         <h1>Parq-Bench — High-Performance Local Data Lake</h1>
         <div className="topbar-right">
@@ -3117,6 +3178,31 @@ function App() {
                 />
                 <span className="phase">Monaco editor font size in pixels (default: 13)</span>
               </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: "0.85rem" }}>
+                Expand Mode
+                <select value={settings.expandMode}
+                  onChange={(e) => setSettings((s) => ({ ...s, expandMode: e.target.value as "fullscreen" | "resize" }))}
+                  style={{ width: 160 }}
+                >
+                  <option value="fullscreen">Fullscreen</option>
+                  <option value="resize">Resize</option>
+                </select>
+                <span className="phase">Fullscreen: fixed overlay (default). Resize: drag-to-resize panels.</span>
+              </label>
+              <label style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: 8, fontSize: "0.85rem", cursor: "pointer" }}>
+                <input type="checkbox" checked={settings.showPerspectiveConfigure}
+                  onChange={(e) => setSettings((s) => ({ ...s, showPerspectiveConfigure: e.target.checked }))}
+                />
+                Show Perspective Configure Button
+                <span className="phase" style={{ marginLeft: "auto" }}>Toggle visibility of Perspective's built-in settings button</span>
+              </label>
+              <label style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: 8, fontSize: "0.85rem", cursor: "pointer" }}>
+                <input type="checkbox" checked={settings.showVisualization}
+                  onChange={(e) => setSettings((s) => ({ ...s, showVisualization: e.target.checked }))}
+                />
+                Show Visualization
+                <span className="phase" style={{ marginLeft: "auto" }}>Show Visualize Data button and chart controls in workspace</span>
+              </label>
               <div style={{ fontSize: "0.84rem", color: "var(--text-soft)", padding: "6px 0", borderTop: "1px solid var(--border)" }}>
                 Memory guard threshold: 85% (read-only, configured in backend)
               </div>
@@ -3160,11 +3246,11 @@ function App() {
                 rel="noopener noreferrer"
                 style={{ color: "var(--accent)" }}
               >
-                KISA — Keep it Simple Analytics LLC
+                KISA — Keep it Simple Analytics
               </a>
             </p>
             <p style={{ margin: "8px 0", fontSize: "0.84rem", color: "var(--text-soft)" }}>
-              Licensed under Apache 2.0. We believe great tools should be open and accessible to everyone.
+              Licensed under GPLv3. We believe great tools should be open and accessible to everyone.
             </p>
             <div className="modal-actions">
               <button type="button" onClick={() => setAboutOpen(false)}>
