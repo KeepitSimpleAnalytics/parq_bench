@@ -122,6 +122,28 @@ type WorkspaceTableInfo = {
 type WorkspaceSchemaByAlias = Record<string, PreviewColumn[]>;
 type WorkspaceSourceKind = "parquet" | "delimited";
 
+const DELIMITED_EXTENSIONS = ["csv", "tsv", "txt", "data"];
+
+function detectSourceKind(filePath: string): WorkspaceSourceKind {
+  const lower = filePath.toLowerCase().replace(/[/\\]+$/, "");
+  // Glob patterns: check the glob suffix (e.g. "*.csv", "*.*")
+  if (lower.includes("*")) {
+    // "*.*" or patterns ending with a delimited extension
+    if (lower.endsWith("*.*")) return "delimited";
+    for (const ext of DELIMITED_EXTENSIONS) {
+      if (lower.endsWith(`*.${ext}`)) return "delimited";
+    }
+    return "parquet";
+  }
+  // Single file: check extension
+  const dot = lower.lastIndexOf(".");
+  if (dot !== -1) {
+    const ext = lower.slice(dot + 1);
+    if (DELIMITED_EXTENSIONS.includes(ext)) return "delimited";
+  }
+  return "parquet";
+}
+
 type WorkspaceQueryResponse = {
   sql: string;
   row_limit: number;
@@ -379,7 +401,7 @@ function App() {
   const [workspaceSlowModeEnabled, setWorkspaceSlowModeEnabled] = useState<boolean>(
     () => readWorkspaceSlowModeEnabled(),
   );
-  const [workspaceSourceKind, setWorkspaceSourceKind] = useState<WorkspaceSourceKind>("parquet");
+  const workspaceSourceKind = detectSourceKind(workspacePathInput);
   const [workspaceDelimiterInput, setWorkspaceDelimiterInput] = useState("");
   const [workspaceEditorReady, setWorkspaceEditorReady] = useState(false);
   const [workspaceSql, setWorkspaceSql] = useState(
@@ -488,23 +510,22 @@ function App() {
   }
 
   async function pickWorkspaceTablePath(): Promise<void> {
-    const registrationSourceKind: WorkspaceSourceKind = workspaceSlowModeEnabled ? workspaceSourceKind : "parquet";
-    const filters = workspaceSlowModeEnabled
-      ? [
+    const filters = workspaceIsGlob
+      ? []
+      : [
           { name: "Parquet", extensions: ["parquet"] },
           { name: "Delimited", extensions: ["csv", "tsv", "txt", "data"] },
-        ]
-      : [{ name: "Parquet", extensions: ["parquet"] }];
+        ];
     const selected = await open({
       title: workspaceIsGlob ? "Select Workspace Source Folder" : "Select Workspace Table Source",
       multiple: false,
       directory: workspaceIsGlob,
-      filters,
+      filters: filters.length > 0 ? filters : undefined,
     });
     if (selected && !Array.isArray(selected)) {
       if (workspaceIsGlob) {
-        const pattern = registrationSourceKind === "delimited" ? "*.*" : "*.parquet";
-        setWorkspacePathInput(appendGlobPattern(selected, pattern));
+        // User picks folder — default to *.* so all supported files are included
+        setWorkspacePathInput(appendGlobPattern(selected, "*.*"));
       } else {
         setWorkspacePathInput(selected);
       }
@@ -582,7 +603,7 @@ function App() {
     setLoading(true);
     setError(null);
     try {
-      const sourceKind: WorkspaceSourceKind = workspaceSlowModeEnabled ? workspaceSourceKind : "parquet";
+      const sourceKind = detectSourceKind(workspacePathInput.trim());
       const delimiter = sourceKind === "delimited" ? workspaceDelimiterInput.trim() || undefined : undefined;
       await invoke<WorkspaceTableInfo>("register_workspace_table", {
         alias: workspaceAliasInput.trim(),
@@ -599,7 +620,6 @@ function App() {
       setWorkspaceAliasInput("");
       setWorkspacePathInput("");
       setWorkspaceIsGlob(false);
-      setWorkspaceSourceKind("parquet");
       setWorkspaceDelimiterInput("");
     } catch (err) {
       setError(String(err));
@@ -1905,7 +1925,6 @@ function App() {
 
   useEffect(() => {
     if (!workspaceSlowModeEnabled) {
-      setWorkspaceSourceKind("parquet");
       setWorkspaceDelimiterInput("");
     }
   }, [workspaceSlowModeEnabled]);
@@ -2025,20 +2044,13 @@ function App() {
   }
 
   async function handleSqlDrop(paths: string[]) {
-    const parquetExts = [".parquet"];
-    const delimitedExts = [".csv", ".tsv", ".txt", ".data"];
+    const supportedExts = [".parquet", ".csv", ".tsv", ".txt", ".data"];
     const validPaths = paths.filter((p) => {
       const lower = p.toLowerCase();
-      if (parquetExts.some((ext) => lower.endsWith(ext))) return true;
-      if (workspaceSlowModeEnabled && delimitedExts.some((ext) => lower.endsWith(ext))) return true;
-      return false;
+      return supportedExts.some((ext) => lower.endsWith(ext));
     });
     if (validPaths.length === 0) {
-      setError(
-        workspaceSlowModeEnabled
-          ? "No supported files found. Supported: .parquet, .csv, .tsv, .txt, .data"
-          : "No .parquet files found. Enable Slo-mo to support CSV/TSV files.",
-      );
+      setError("No supported files found. Supported: .parquet, .csv, .tsv, .txt, .data");
       return;
     }
     if (loading) return;
@@ -2070,11 +2082,8 @@ function App() {
         existingAliases.add(alias);
         if (!firstAlias) firstAlias = alias;
 
-        const lower = filePath.toLowerCase();
-        const sourceKind: "parquet" | "delimited" = parquetExts.some((ext) => lower.endsWith(ext))
-          ? "parquet"
-          : "delimited";
-        const delimiter = lower.endsWith(".tsv") ? "\t" : undefined;
+        const sourceKind = detectSourceKind(filePath);
+        const delimiter = filePath.toLowerCase().endsWith(".tsv") ? "\t" : undefined;
 
         await invoke<WorkspaceTableInfo>("register_workspace_table", {
           alias,
@@ -2502,37 +2511,20 @@ function App() {
           Slo-mo enabled. You can process non-Parquet files, but at the expense of speed.
         </div>
       ) : null}
-      {workspaceSlowModeEnabled ? (
+      {workspaceSourceKind === "delimited" ? (
         <div className="workspace-source-row">
+          <span className="phase">Detected: delimited file</span>
           <label>
-            Source type
-            <select
-              value={workspaceSourceKind}
-              onChange={(event) => {
-                const next = event.currentTarget.value as WorkspaceSourceKind;
-                setWorkspaceSourceKind(next);
-                if (next === "parquet") {
-                  setWorkspaceDelimiterInput("");
-                }
-              }}
-            >
-                  <option value="parquet">Parquet (fast path)</option>
-                  <option value="delimited">Delimited (csv/txt/data/tsv)</option>
-                </select>
-              </label>
-              {workspaceSourceKind === "delimited" ? (
-                <label>
-                  Delimiter
-                  <input
-                    type="text"
-                    value={workspaceDelimiterInput}
-                    onChange={(event) => setWorkspaceDelimiterInput(event.currentTarget.value)}
-                    placeholder='Auto by extension (.csv ",", .tsv "\\t", .txt/.data ",")'
-                  />
-                </label>
-              ) : null}
-          </div>
-        ) : null}
+            Delimiter
+            <input
+              type="text"
+              value={workspaceDelimiterInput}
+              onChange={(event) => setWorkspaceDelimiterInput(event.currentTarget.value)}
+              placeholder='Auto (.csv → ",", .tsv → "\t")'
+            />
+          </label>
+        </div>
+      ) : null}
       <div className="workspace-register-row">
         <input
           type="text"
@@ -2543,11 +2535,7 @@ function App() {
         <input
           type="text"
           className="workspace-path-input"
-          placeholder={
-            workspaceSlowModeEnabled && workspaceSourceKind === "delimited"
-              ? "csv/txt/data file path or glob"
-              : "parquet file path or glob"
-          }
+          placeholder="file path or glob (e.g. *.parquet, *.csv)"
           value={workspacePathInput}
           onChange={(event) => setWorkspacePathInput(event.currentTarget.value)}
         />
