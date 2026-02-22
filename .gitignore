@@ -27,3 +27,6 @@ systematic-dev/
 # Screenshots
 *.jpg
 *.jpeg
+
+# Demo / sample data
+sample_data/

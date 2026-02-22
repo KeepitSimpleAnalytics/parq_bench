@@ -5,7 +5,7 @@ loader.config({ monaco: monacoEditor });
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { readText } from "@tauri-apps/plugin-clipboard-manager";
+import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { tableFromIPC } from "apache-arrow";
 import type * as Monaco from "monaco-editor";
 import "./App.css";
@@ -14,7 +14,6 @@ const PAGE_SIZE = 256;
 const ROW_HEIGHT = 30;
 const MIN_VIEWPORT_HEIGHT = 320;
 const OVERSCAN = 8;
-const PERSPECTIVE_MAX_ROWS = 5000;
 const COLUMN_WIDTH = 180;
 const FIRST_VIEWPORT_TARGET_MS = 500;
 const PERSPECTIVE_READY_TARGET_MS = 3000;
@@ -191,6 +190,32 @@ type ActiveTab = "preview" | "sql";
 const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";
 const UI_WORKSPACE_SLOW_MODE_STORAGE_KEY = "parqbench.ui.workspace_slow_mode_enabled";
 const UI_ACTIVE_TAB_STORAGE_KEY = "parqbench.ui.active_tab";
+const UI_RECENT_FILES_STORAGE_KEY = "parqbench.ui.recent_files";
+const UI_QUERY_HISTORY_STORAGE_KEY = "parqbench.ui.query_history";
+const UI_SETTINGS_STORAGE_KEY = "parqbench.ui.settings";
+const RECENT_FILES_MAX = 15;
+const QUERY_HISTORY_MAX = 50;
+
+type QueryHistoryEntry = {
+  sql: string;
+  timestamp: number;
+  rowCount?: number;
+  elapsedMs?: number;
+};
+
+type AppSettings = {
+  sqlRowLimit: number;
+  perspectiveMaxRows: number;
+  editorFontSize: number;
+};
+
+const DEFAULT_SETTINGS: AppSettings = {
+  sqlRowLimit: 200,
+  perspectiveMaxRows: 5000,
+  editorFontSize: 13,
+};
+
+type SummarizeRow = Record<string, string>;
 /**
  * Feature flags (compile-time, dead-code eliminated by Vite in production):
  *
@@ -235,6 +260,40 @@ function readWorkspaceSlowModeEnabled(): boolean {
     return false;
   }
   return window.localStorage.getItem(UI_WORKSPACE_SLOW_MODE_STORAGE_KEY) === "1";
+}
+
+function readRecentFiles(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(UI_RECENT_FILES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x: unknown) => typeof x === "string").slice(0, RECENT_FILES_MAX) : [];
+  } catch { return []; }
+}
+
+function readQueryHistory(): QueryHistoryEntry[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(UI_QUERY_HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.slice(0, QUERY_HISTORY_MAX) : [];
+  } catch { return []; }
+}
+
+function readSettings(): AppSettings {
+  if (typeof window === "undefined") return { ...DEFAULT_SETTINGS };
+  try {
+    const raw = window.localStorage.getItem(UI_SETTINGS_STORAGE_KEY);
+    if (!raw) return { ...DEFAULT_SETTINGS };
+    const parsed = JSON.parse(raw);
+    return {
+      sqlRowLimit: typeof parsed.sqlRowLimit === "number" ? parsed.sqlRowLimit : DEFAULT_SETTINGS.sqlRowLimit,
+      perspectiveMaxRows: typeof parsed.perspectiveMaxRows === "number" ? parsed.perspectiveMaxRows : DEFAULT_SETTINGS.perspectiveMaxRows,
+      editorFontSize: typeof parsed.editorFontSize === "number" ? parsed.editorFontSize : DEFAULT_SETTINGS.editorFontSize,
+    };
+  } catch { return { ...DEFAULT_SETTINGS }; }
 }
 
 function resolveThemeMode(mode: ThemeMode): ResolvedTheme {
@@ -318,7 +377,8 @@ function App() {
     "SELECT * FROM my_table LIMIT 100",
   );
   const [editorHeight, setEditorHeight] = useState(180);
-  const [editorFontSize, setEditorFontSize] = useState(13);
+  const [settings, setSettings] = useState<AppSettings>(() => readSettings());
+  const [editorFontSize, setEditorFontSize] = useState(() => settings.editorFontSize);
   const [workspaceQueryResult, setWorkspaceQueryResult] = useState<WorkspaceQueryResponse | null>(null);
   const [workspaceChartPlugin, setWorkspaceChartPlugin] = useState<WorkspaceChartPlugin>("Datagrid");
   const [workspaceChartX, setWorkspaceChartX] = useState("");
@@ -329,6 +389,17 @@ function App() {
   const [workspaceSchemaDiff, setWorkspaceSchemaDiff] = useState<WorkspaceSchemaDiffResponse | null>(null);
   const [workspaceExport, setWorkspaceExport] = useState<WorkspaceExportResponse | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [recentFiles, setRecentFiles] = useState<string[]>(() => readRecentFiles());
+  const [queryHistory, setQueryHistory] = useState<QueryHistoryEntry[]>(() => readQueryHistory());
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [explainPlan, setExplainPlan] = useState<string | null>(null);
+  const [explainLoading, setExplainLoading] = useState(false);
+  const [workspaceTableStats, setWorkspaceTableStats] = useState<Record<string, SummarizeRow[] | null>>({});
+  const [statsLoading, setStatsLoading] = useState<string | null>(null);
+  const [bulkSelectMode, setBulkSelectMode] = useState(false);
+  const [bulkSelectedAliases, setBulkSelectedAliases] = useState<Set<string>>(new Set());
+  const [columnSearchQuery, setColumnSearchQuery] = useState("");
   const [dragOverZone, setDragOverZone] = useState<"preview" | "sql" | null>(null);
   const [editingAlias, setEditingAlias] = useState<string | null>(null);
   const [editingAliasValue, setEditingAliasValue] = useState("");
@@ -461,6 +532,15 @@ function App() {
     }
   }
 
+  async function copyToClipboard(text: string) {
+    try {
+      await writeText(text);
+    } catch {
+      // fallback to navigator API
+      await navigator.clipboard.writeText(text);
+    }
+  }
+
   function readWorkspaceSql(): string {
     const editor = workspaceEditorRef.current;
     if (editor) {
@@ -529,6 +609,42 @@ function App() {
     }
   }
 
+  async function clearAllWorkspaceTables() {
+    if (!window.confirm(`Remove all ${workspaceTables.length} workspace tables?`)) return;
+    setLoading(true);
+    setError(null);
+    const errors: string[] = [];
+    for (const table of workspaceTables) {
+      try {
+        await invoke("remove_workspace_table", { alias: table.alias });
+      } catch (err) { errors.push(`${table.alias}: ${String(err)}`); }
+    }
+    setWorkspaceTableStats({});
+    setBulkSelectMode(false);
+    setBulkSelectedAliases(new Set());
+    await refreshWorkspaceTables();
+    if (errors.length > 0) setError(errors.join(" | "));
+    setLoading(false);
+  }
+
+  async function removeSelectedWorkspaceTables() {
+    if (bulkSelectedAliases.size === 0) return;
+    setLoading(true);
+    setError(null);
+    const errors: string[] = [];
+    for (const alias of bulkSelectedAliases) {
+      try {
+        await invoke("remove_workspace_table", { alias });
+        setWorkspaceTableStats((prev) => { const n = { ...prev }; delete n[alias]; return n; });
+      } catch (err) { errors.push(`${alias}: ${String(err)}`); }
+    }
+    setBulkSelectedAliases(new Set());
+    setBulkSelectMode(false);
+    await refreshWorkspaceTables();
+    if (errors.length > 0) setError(errors.join(" | "));
+    setLoading(false);
+  }
+
   async function runWorkspaceSchemaDiff() {
     if (!workspaceDiffLeftAlias || !workspaceDiffRightAlias) {
       setError("Select two workspace aliases before running schema diff.");
@@ -583,6 +699,8 @@ function App() {
         sql: sqlText,
         outputPath: selected,
         format,
+        queryText: sqlText,
+        tableAliases: workspaceTables.map((t) => t.alias),
       });
       setWorkspaceExport(result);
     } catch (err) {
@@ -610,9 +728,19 @@ function App() {
     try {
       const result = await invoke<WorkspaceQueryResponse>("run_workspace_query", {
         sql: sqlText,
-        rowLimit: 200,
+        rowLimit: settings.sqlRowLimit,
       });
       setWorkspaceQueryResult(result);
+      setExplainPlan(null);
+      setQueryHistory((prev) => {
+        const entry: QueryHistoryEntry = {
+          sql: result.sql,
+          timestamp: Date.now(),
+          rowCount: result.row_count,
+          elapsedMs: result.elapsed_ms,
+        };
+        return [entry, ...prev.filter((h) => h.sql !== result.sql)].slice(0, QUERY_HISTORY_MAX);
+      });
     } catch (err) {
       const message = String(err);
       if (message.includes("Referenced column")) {
@@ -634,6 +762,37 @@ function App() {
       }
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function runExplainAnalyze() {
+    const sqlText = readWorkspaceSql();
+    if (!sqlText.trim()) {
+      setError("SQL query is required for EXPLAIN ANALYZE.");
+      return;
+    }
+    setExplainLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<string>("explain_workspace_query", { sql: sqlText });
+      setExplainPlan(result);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setExplainLoading(false);
+    }
+  }
+
+  async function loadTableStats(alias: string) {
+    setStatsLoading(alias);
+    setError(null);
+    try {
+      const result = await invoke<SummarizeRow[]>("summarize_workspace_table", { alias });
+      setWorkspaceTableStats((prev) => ({ ...prev, [alias]: result }));
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setStatsLoading(null);
     }
   }
 
@@ -935,6 +1094,10 @@ function App() {
       rowLimit: PAGE_SIZE,
     });
     setPreview(data);
+    setRecentFiles((prev) => {
+      const filtered = prev.filter((p) => p !== filePath);
+      return [filePath, ...filtered].slice(0, RECENT_FILES_MAX);
+    });
     setPerspectiveContext("preview");
     setViewMode("virtual");
     setPerspectiveStatus("idle");
@@ -1678,7 +1841,7 @@ function App() {
 
     const rowIndexes = Array.from(loadedRows.keys())
       .sort((a, b) => a - b)
-      .slice(0, PERSPECTIVE_MAX_ROWS);
+      .slice(0, settings.perspectiveMaxRows);
 
     if (rowIndexes.length === 0) {
       return;
@@ -1747,6 +1910,18 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem(UI_ACTIVE_TAB_STORAGE_KEY, activeTab);
   }, [activeTab]);
+
+  useEffect(() => {
+    window.localStorage.setItem(UI_RECENT_FILES_STORAGE_KEY, JSON.stringify(recentFiles));
+  }, [recentFiles]);
+
+  useEffect(() => {
+    window.localStorage.setItem(UI_QUERY_HISTORY_STORAGE_KEY, JSON.stringify(queryHistory));
+  }, [queryHistory]);
+
+  useEffect(() => {
+    window.localStorage.setItem(UI_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  }, [settings]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1923,9 +2098,15 @@ function App() {
 
       // Escape — always allowed
       if (e.key === "Escape") {
-        if (aboutOpen) {
+        if (settingsOpen) {
+          e.preventDefault();
+          setSettingsOpen(false);
+        } else if (aboutOpen) {
           e.preventDefault();
           setAboutOpen(false);
+        } else if (historyOpen) {
+          e.preventDefault();
+          setHistoryOpen(false);
         } else if (error) {
           e.preventDefault();
           setError(null);
@@ -1961,6 +2142,15 @@ function App() {
         return;
       }
 
+      // Ctrl+Shift+Enter → Explain Analyze (SQL tab only) — must be before Ctrl+Enter
+      if (e.key === "Enter" && e.shiftKey && activeTab === "sql") {
+        if (!loading && !explainLoading) {
+          e.preventDefault();
+          void runExplainAnalyze();
+        }
+        return;
+      }
+
       // Ctrl+Enter → Run SQL (SQL tab only)
       if (e.key === "Enter" && activeTab === "sql") {
         if (!loading) {
@@ -1978,11 +2168,18 @@ function App() {
         }
         return;
       }
+
+      // Ctrl+, → Settings
+      if (e.key === ",") {
+        e.preventDefault();
+        setSettingsOpen((p) => !p);
+        return;
+      }
     }
 
     window.addEventListener("keydown", handleGlobalKeyDown);
     return () => window.removeEventListener("keydown", handleGlobalKeyDown);
-  }, [aboutOpen, error, loading, activeTab]);
+  }, [aboutOpen, settingsOpen, error, loading, explainLoading, activeTab]);
 
   function resolvePerspectiveContext(preferred?: PerspectiveContext): PerspectiveContext | null {
     if (preferred === "preview" || preferred === "workspace") {
@@ -2072,6 +2269,10 @@ function App() {
             <span>
               <strong>Columns:</strong> {preview.schema.length}
             </span>
+            <button type="button" style={{ padding: "2px 7px", fontSize: "0.76rem" }}
+              onClick={() => void copyToClipboard(preview.schema.map((c) => c.name).join(", "))}>
+              Copy All Columns
+            </button>
             {INTERNAL_TOOLS_ENABLED ? (
               <>
                 <span>
@@ -2124,8 +2325,8 @@ function App() {
               <button type="button" className="row-cap-switch" onClick={() => setViewMode("perspective")}>
                 Switch to interactive view
               </button>
-              {totalRows > PERSPECTIVE_MAX_ROWS ? (
-                <span> (first {PERSPECTIVE_MAX_ROWS.toLocaleString()} rows)</span>
+              {totalRows > settings.perspectiveMaxRows ? (
+                <span> (first {settings.perspectiveMaxRows.toLocaleString()} rows)</span>
               ) : null}
             </p>
           ) : null}
@@ -2141,7 +2342,9 @@ function App() {
                   }}
                 >
                   {preview.schema.map((col) => (
-                    <div key={col.name} className="virtual-cell virtual-cell-head" title={col.duckdb_type}>
+                    <div key={col.name} className="virtual-cell virtual-cell-head col-copyable"
+                      title={`${col.duckdb_type} — click to copy`}
+                      onClick={() => void copyToClipboard(col.name)}>
                       {col.name}
                     </div>
                   ))}
@@ -2180,9 +2383,9 @@ function App() {
               </div>
             </>
           ) : null}
-          {viewMode === "perspective" && totalRows > PERSPECTIVE_MAX_ROWS ? (
+          {viewMode === "perspective" && totalRows > settings.perspectiveMaxRows ? (
             <p className="row-cap-banner">
-              Showing first {PERSPECTIVE_MAX_ROWS.toLocaleString()} of{" "}
+              Showing first {settings.perspectiveMaxRows.toLocaleString()} of{" "}
               {totalRows.toLocaleString()} rows.{" "}
               <button type="button" className="row-cap-switch" onClick={() => setViewMode("virtual")}>
                 Switch to full-scroll view
@@ -2202,6 +2405,36 @@ function App() {
         <div className="preview-placeholder">
           <h3>Parquet Preview</h3>
           <p className="phase">Open a parquet file to inspect rows and switch between virtual and perspective views.</p>
+          {recentFiles.length > 0 ? (
+            <div style={{ marginTop: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <strong style={{ fontSize: "0.85rem" }}>Recent Files</strong>
+                <button type="button" style={{ padding: "2px 6px", fontSize: "0.75rem" }}
+                  onClick={() => setRecentFiles([])}>Clear</button>
+              </div>
+              <ul style={{ listStyle: "none", margin: 0, padding: 0, fontSize: "0.84rem" }}>
+                {recentFiles.map((filePath) => {
+                  const fileName = filePath.split(/[/\\]/).pop() ?? filePath;
+                  return (
+                    <li key={filePath} style={{ marginBottom: 3 }}>
+                      <button type="button"
+                        style={{ border: "none", background: "none", color: "var(--accent)", padding: "2px 0", cursor: "pointer", textAlign: "left", fontWeight: 600, boxShadow: "none", fontSize: "0.84rem" }}
+                        onClick={() => {
+                          setLoading(true);
+                          setError(null);
+                          void loadPreviewFromPath(filePath).catch((err) => setError(String(err))).finally(() => setLoading(false));
+                        }}
+                        disabled={loading}
+                      >
+                        {fileName}
+                      </button>
+                      <span className="phase" style={{ marginLeft: 6 }} title={filePath}>{filePath}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ) : null}
         </div>
       )}
     </section>
@@ -2293,10 +2526,40 @@ function App() {
 
       <div className="workspace-list">
         <strong>Tables:</strong>{" "}
+        {workspaceTables.length >= 2 ? (
+          <>
+            <button type="button" style={{ padding: "2px 7px", fontSize: "0.75rem" }}
+              onClick={() => void clearAllWorkspaceTables()} disabled={loading}>
+              Clear All
+            </button>
+            <button type="button" style={{ padding: "2px 7px", fontSize: "0.75rem" }}
+              onClick={() => { setBulkSelectMode((p) => !p); setBulkSelectedAliases(new Set()); }}>
+              {bulkSelectMode ? "Cancel Select" : "Select"}
+            </button>
+            {bulkSelectMode && bulkSelectedAliases.size > 0 ? (
+              <button type="button" style={{ padding: "2px 7px", fontSize: "0.75rem" }}
+                onClick={() => void removeSelectedWorkspaceTables()} disabled={loading}>
+                Remove Selected ({bulkSelectedAliases.size})
+              </button>
+            ) : null}
+          </>
+        ) : null}
         {workspaceTables.length === 0
           ? "none"
           : workspaceTables.map((table) => (
               <span key={`workspace-${table.alias}`} className="workspace-table-pill">
+                {bulkSelectMode ? (
+                  <input type="checkbox" className="bulk-checkbox"
+                    checked={bulkSelectedAliases.has(table.alias)}
+                    onChange={(e) => {
+                      setBulkSelectedAliases((prev) => {
+                        const next = new Set(prev);
+                        if (e.target.checked) next.add(table.alias); else next.delete(table.alias);
+                        return next;
+                      });
+                    }}
+                  />
+                ) : null}
                 {editingAlias === table.alias ? (
                   <input
                     type="text"
@@ -2342,8 +2605,26 @@ function App() {
                 </span>
                 <button
                   type="button"
+                  style={{ border: "none", background: "none", color: "var(--accent)", padding: "0 2px", lineHeight: 1, boxShadow: "none", fontSize: "0.75rem", fontWeight: 600 }}
+                  title="Column statistics"
+                  onClick={() => {
+                    if (workspaceTableStats[table.alias]) {
+                      setWorkspaceTableStats((prev) => ({ ...prev, [table.alias]: null }));
+                    } else {
+                      void loadTableStats(table.alias);
+                    }
+                  }}
+                  disabled={loading || statsLoading === table.alias}
+                >
+                  {statsLoading === table.alias ? "..." : "Stats"}
+                </button>
+                <button
+                  type="button"
                   className="workspace-pill-remove"
-                  onClick={() => void removeWorkspaceTable(table.alias)}
+                  onClick={() => {
+                    void removeWorkspaceTable(table.alias);
+                    setWorkspaceTableStats((prev) => { const n = { ...prev }; delete n[table.alias]; return n; });
+                  }}
                   disabled={loading}
                 >
                   x
@@ -2351,30 +2632,112 @@ function App() {
               </span>
             ))}
       </div>
+      {workspaceTables.map((table) => {
+        const stats = workspaceTableStats[table.alias];
+        if (!stats) return null;
+        return (
+          <details key={`stats-${table.alias}`} open style={{ marginBottom: 8 }}>
+            <summary style={{ cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, marginBottom: 4 }}>
+              Stats: {table.alias}
+              <button type="button" style={{ marginLeft: 8, padding: "1px 6px", fontSize: "0.72rem" }}
+                onClick={(e) => { e.stopPropagation(); setWorkspaceTableStats((prev) => ({ ...prev, [table.alias]: null })); }}>
+                Hide
+              </button>
+            </summary>
+            <div className="table-wrap" style={{ maxHeight: 240, overflowY: "auto" }}>
+              {(() => {
+                const STATS_COLS = ["column_name","column_type","min","max","approx_unique","avg","std","q25","q50","q75","count","null_percentage"];
+                return (
+                  <table>
+                    <thead>
+                      <tr>
+                        {STATS_COLS.map((key) => (
+                          <th key={`stats-th-${table.alias}-${key}`} style={{ fontSize: "0.78rem" }}>{key}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {stats.map((row, ri) => (
+                        <tr key={`stats-row-${table.alias}-${ri}`}>
+                          {STATS_COLS.map((key, ci) => (
+                            <td key={`stats-cell-${table.alias}-${ri}-${ci}`} style={{ fontSize: "0.78rem" }}>{row[key] ?? ""}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                );
+              })()}
+            </div>
+          </details>
+        );
+      })}
       {workspaceTables.length > 0 ? (
-        <div className="workspace-schema-summary">
-          {workspaceTables.map((table) => {
-            const schema = workspaceTableSchemas[table.alias] ?? [];
-            const columnsPreview = schema
-              .slice(0, 6)
-              .map((column) => column.name)
-              .join(", ");
-            const suffix = schema.length > 6 ? ", ..." : "";
-            return (
-              <span
-                key={`workspace-schema-${table.alias}`}
-                className="workspace-schema-pill"
-                title={
-                  schema.length === 0
-                    ? `${table.alias}: schema unavailable`
-                    : `${table.alias}: ${schema.map((column) => `${column.name} (${column.duckdb_type})`).join(", ")}`
+        <>
+          {workspaceTables.length >= 2 ? (
+            <div className="column-search-wrap">
+              <input
+                type="text"
+                className="column-search-input"
+                placeholder="Search columns..."
+                value={columnSearchQuery}
+                onChange={(e) => setColumnSearchQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Escape") { setColumnSearchQuery(""); e.currentTarget.blur(); } }}
+              />
+              {columnSearchQuery ? (
+                <button type="button" className="column-search-clear" onClick={() => setColumnSearchQuery("")}>x</button>
+              ) : null}
+            </div>
+          ) : null}
+          <div className="workspace-schema-summary">
+            {(() => {
+              const query = columnSearchQuery.trim().toLowerCase();
+              const filtered = workspaceTables.filter((table) => {
+                if (!query) return true;
+                const schema = workspaceTableSchemas[table.alias] ?? [];
+                return schema.some((col) => col.name.toLowerCase().includes(query));
+              });
+              if (query && filtered.length === 0) {
+                return <span className="phase">No matching columns found.</span>;
+              }
+              return filtered.map((table) => {
+                const schema = workspaceTableSchemas[table.alias] ?? [];
+                if (schema.length === 0) {
+                  return (
+                    <span key={`workspace-schema-${table.alias}`} className="workspace-schema-pill"
+                      title={`${table.alias}: schema unavailable`}>
+                      <strong>{table.alias}</strong>: schema unavailable
+                    </span>
+                  );
                 }
-              >
-                <strong>{table.alias}</strong>: {schema.length === 0 ? "schema unavailable" : `${columnsPreview}${suffix}`}
-              </span>
-            );
-          })}
-        </div>
+                const matchingCols = query
+                  ? schema.filter((col) => col.name.toLowerCase().includes(query))
+                  : schema;
+                const displayCols = query ? matchingCols : schema.slice(0, 6);
+                const suffix = !query && schema.length > 6 ? ", ..." : "";
+                const countLabel = query ? ` (${matchingCols.length}/${schema.length})` : "";
+                return (
+                  <span
+                    key={`workspace-schema-${table.alias}`}
+                    className="workspace-schema-pill"
+                    title={`${table.alias}: ${schema.map((c) => `${c.name} (${c.duckdb_type})`).join(", ")}`}
+                  >
+                    <strong>{table.alias}</strong>{countLabel}:{" "}
+                    {displayCols.map((col, i) => (
+                      <span key={col.name}>
+                        {i > 0 ? ", " : ""}
+                        <span className={query && col.name.toLowerCase().includes(query) ? "col-match" : ""}>
+                          {col.name}
+                        </span>
+                      </span>
+                    ))}
+                    {suffix}
+                  </span>
+                );
+              });
+            })()}
+          </div>
+        </>
       ) : null}
 
       {INTERNAL_TOOLS_ENABLED ? (
@@ -2476,20 +2839,59 @@ function App() {
           <button type="button" onClick={() => void runWorkspaceQuery()} disabled={loading}>
             Run SQL<kbd className="shortcut-hint">Ctrl+Enter</kbd>
           </button>
-          <span className="editor-font-controls">
-            <button type="button" onClick={() => { const s = Math.max(10, editorFontSize - 2); setEditorFontSize(s); workspaceEditorRef.current?.updateOptions({ fontSize: s }); }}>A-</button>
-            <span className="phase">{editorFontSize}px</span>
-            <button type="button" onClick={() => { const s = Math.min(28, editorFontSize + 2); setEditorFontSize(s); workspaceEditorRef.current?.updateOptions({ fontSize: s }); }}>A+</button>
-          </span>
-        </div>
-        <div className="workspace-export-row">
+          <button type="button" onClick={() => void runExplainAnalyze()} disabled={loading || explainLoading}>
+            Explain<kbd className="shortcut-hint">Ctrl+Shift+Enter</kbd>
+          </button>
           <button type="button" onClick={() => void exportWorkspaceQuery("csv")} disabled={loading}>
-            Export Query CSV
+            Export CSV<kbd className="shortcut-hint">Ctrl+Shift+E</kbd>
           </button>
           <button type="button" onClick={() => void exportWorkspaceQuery("parquet")} disabled={loading}>
-            Export Query Parquet
+            Export Parquet
           </button>
+          <div style={{ position: "relative", display: "inline-block" }}>
+            <button type="button" onClick={() => setHistoryOpen((p) => !p)} disabled={queryHistory.length === 0}>
+              History ({queryHistory.length})
+            </button>
+            {historyOpen ? (
+              <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 100, background: "var(--surface-strong)", border: "1px solid var(--border)", borderRadius: 8, padding: 6, maxHeight: 280, overflowY: "auto", minWidth: 340, boxShadow: "0 8px 24px rgba(0,0,0,0.15)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                  <strong style={{ fontSize: "0.82rem" }}>Query History</strong>
+                  <button type="button" style={{ padding: "2px 6px", fontSize: "0.72rem" }} onClick={() => { setQueryHistory([]); setHistoryOpen(false); }}>Clear</button>
+                </div>
+                {queryHistory.map((entry, idx) => (
+                  <div key={`qh-${idx}`}
+                    style={{ padding: "4px 6px", borderBottom: "1px solid var(--border)", cursor: "pointer", fontSize: "0.8rem" }}
+                    onClick={() => { replaceWorkspaceSql(entry.sql); setHistoryOpen(false); }}
+                  >
+                    <div style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 320, fontFamily: "monospace" }}>
+                      {entry.sql}
+                    </div>
+                    <div style={{ fontSize: "0.72rem", color: "var(--text-soft)" }}>
+                      {new Date(entry.timestamp).toLocaleString()}
+                      {entry.rowCount != null ? ` | ${entry.rowCount} rows` : ""}
+                      {entry.elapsedMs != null ? ` | ${entry.elapsedMs.toFixed(0)}ms` : ""}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
         </div>
+        {explainLoading ? (
+          <div className="meta-line"><span className="phase">Running EXPLAIN ANALYZE...</span></div>
+        ) : null}
+        {explainPlan ? (
+          <details open style={{ marginBottom: 8 }}>
+            <summary style={{ cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, marginBottom: 4 }}>
+              EXPLAIN ANALYZE
+              <button type="button" style={{ marginLeft: 8, padding: "1px 6px", fontSize: "0.72rem" }}
+                onClick={(e) => { e.stopPropagation(); setExplainPlan(null); }}>Dismiss</button>
+            </summary>
+            <pre style={{ background: "var(--surface-tint)", border: "1px solid var(--border)", borderRadius: 8, padding: 10, fontSize: "0.78rem", overflow: "auto", maxHeight: 300, whiteSpace: "pre-wrap", margin: 0 }}>
+              {explainPlan}
+            </pre>
+          </details>
+        ) : null}
       </div>
 
       {workspaceExport ? (
@@ -2580,13 +2982,19 @@ function App() {
             <span>
               <strong>Columns:</strong> {workspaceQueryResult.schema.length}
             </span>
+            <button type="button" style={{ padding: "2px 7px", fontSize: "0.76rem" }}
+              onClick={() => void copyToClipboard(workspaceQueryResult.schema.map((c) => c.name).join(", "))}>
+              Copy All Columns
+            </button>
           </p>
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
                   {workspaceQueryResult.schema.map((col) => (
-                    <th key={`workspace-col-${col.name}`} title={col.duckdb_type}>
+                    <th key={`workspace-col-${col.name}`} title={`${col.duckdb_type} — click to copy`}
+                      className="col-copyable"
+                      onClick={() => void copyToClipboard(col.name)}>
                       {col.name}
                     </th>
                   ))}
@@ -2621,10 +3029,13 @@ function App() {
               <option value="dark">Dark</option>
             </select>
           </label>
+          <button type="button" onClick={() => setSettingsOpen(true)}>
+            Settings<kbd className="shortcut-hint">Ctrl+,</kbd>
+          </button>
           <button type="button" onClick={() => setAboutOpen(true)}>
             About
           </button>
-          <span className="beta-badge">{PRODUCT_STAGE_LABEL} v0.1.0</span>
+          <span className="beta-badge">{PRODUCT_STAGE_LABEL} v0.3.0</span>
         </div>
       </header>
 
@@ -2666,6 +3077,66 @@ function App() {
         </div>
       </div>
 
+      {settingsOpen ? (
+        <div className="modal-backdrop" role="presentation" onClick={() => setSettingsOpen(false)}>
+          <section
+            className="modal-card"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Settings"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>Settings</h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12, margin: "12px 0" }}>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: "0.85rem" }}>
+                SQL Row Limit
+                <input type="number" min={1} max={100000} value={settings.sqlRowLimit}
+                  onChange={(e) => setSettings((s) => ({ ...s, sqlRowLimit: Math.max(1, parseInt(e.target.value) || 200) }))}
+                  style={{ width: 120 }}
+                />
+                <span className="phase">Maximum rows returned by workspace queries (default: 200)</span>
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: "0.85rem" }}>
+                Perspective Max Rows
+                <input type="number" min={100} max={100000} value={settings.perspectiveMaxRows}
+                  onChange={(e) => setSettings((s) => ({ ...s, perspectiveMaxRows: Math.max(100, parseInt(e.target.value) || 5000) }))}
+                  style={{ width: 120 }}
+                />
+                <span className="phase">Maximum rows loaded into Perspective viewer (default: 5000). Higher values increase memory usage.</span>
+              </label>
+              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: "0.85rem" }}>
+                Editor Font Size
+                <input type="number" min={8} max={32} value={settings.editorFontSize}
+                  onChange={(e) => {
+                    const v = Math.min(32, Math.max(8, parseInt(e.target.value) || 13));
+                    setSettings((s) => ({ ...s, editorFontSize: v }));
+                    setEditorFontSize(v);
+                    workspaceEditorRef.current?.updateOptions({ fontSize: v });
+                  }}
+                  style={{ width: 120 }}
+                />
+                <span className="phase">Monaco editor font size in pixels (default: 13)</span>
+              </label>
+              <div style={{ fontSize: "0.84rem", color: "var(--text-soft)", padding: "6px 0", borderTop: "1px solid var(--border)" }}>
+                Memory guard threshold: 85% (read-only, configured in backend)
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button type="button" onClick={() => {
+                setSettings({ ...DEFAULT_SETTINGS });
+                setEditorFontSize(DEFAULT_SETTINGS.editorFontSize);
+                workspaceEditorRef.current?.updateOptions({ fontSize: DEFAULT_SETTINGS.editorFontSize });
+              }}>
+                Reset to Defaults
+              </button>
+              <button type="button" onClick={() => setSettingsOpen(false)}>
+                Close
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
       {aboutOpen ? (
         <div className="modal-backdrop" role="presentation" onClick={() => setAboutOpen(false)}>
           <section
@@ -2676,7 +3147,7 @@ function App() {
             onClick={(event) => event.stopPropagation()}
           >
             <h3>Parq-Bench</h3>
-            <span className="beta-badge" style={{ marginBottom: 12, alignSelf: "flex-start" }}>{PRODUCT_STAGE_LABEL} v0.1.0</span>
+            <span className="beta-badge" style={{ marginBottom: 12, alignSelf: "flex-start" }}>{PRODUCT_STAGE_LABEL} v0.3.0</span>
             <p style={{ margin: "8px 0", lineHeight: 1.5 }}>
               A high-performance desktop application for exploring large Parquet files locally.
               No cloud, no accounts, no telemetry — all processing happens on your machine.

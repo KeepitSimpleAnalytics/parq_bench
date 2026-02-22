@@ -30,7 +30,16 @@ where
         .spawn(f)
         .map_err(|e| format!("spawn duckdb thread: {e}"))?
         .join()
-        .map_err(|_| "duckdb thread panicked".to_string())?
+        .map_err(|e| {
+            let msg = if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else {
+                "unknown panic".to_string()
+            };
+            format!("duckdb thread panicked: {msg}")
+        })?
 }
 
 #[derive(Serialize)]
@@ -795,19 +804,68 @@ fn export_workspace_query_to_file(
     sql: &str,
     output_path: &str,
     format: &str,
+    query_text: Option<&str>,
+    table_aliases: Option<&[String]>,
 ) -> Result<(), String> {
     let normalized_format = format.trim().to_ascii_lowercase();
     if normalized_format != "csv" && normalized_format != "parquet" {
         return Err("Unsupported export format. Use 'csv' or 'parquet'.".to_string());
     }
     let escaped_path = escape_sql_string_literal(output_path);
-    let copy_sql = if normalized_format == "csv" {
-        format!("COPY (SELECT * FROM ({sql}) AS _q) TO '{escaped_path}' (FORMAT CSV, HEADER TRUE);")
-    } else {
-        format!("COPY (SELECT * FROM ({sql}) AS _q) TO '{escaped_path}' (FORMAT PARQUET);")
+    let timestamp = {
+        let d = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{}Z", d.as_secs())
     };
-    conn.execute_batch(&copy_sql)
-        .map_err(|e| format!("export workspace query: {e}"))?;
+
+    if normalized_format == "csv" {
+        // Write metadata comment header then COPY output
+        let mut meta_header = String::new();
+        if let Some(qt) = query_text {
+            meta_header.push_str(&format!("# Query: {}\n", qt.replace('\n', " ")));
+        }
+        meta_header.push_str(&format!("# Exported: {timestamp}\n"));
+        if let Some(aliases) = table_aliases {
+            if !aliases.is_empty() {
+                meta_header.push_str(&format!("# Tables: {}\n", aliases.join(", ")));
+            }
+        }
+        // First export COPY to file, then prepend metadata
+        let temp_path = format!("{output_path}.tmp");
+        let escaped_temp = escape_sql_string_literal(&temp_path);
+        let copy_sql = format!(
+            "COPY (SELECT * FROM ({sql}) AS _q) TO '{escaped_temp}' (FORMAT CSV, HEADER TRUE);"
+        );
+        conn.execute_batch(&copy_sql)
+            .map_err(|e| format!("export workspace query: {e}"))?;
+        let csv_content = fs::read_to_string(&temp_path)
+            .map_err(|e| format!("read temp csv: {e}"))?;
+        let _ = fs::remove_file(&temp_path);
+        fs::write(output_path, format!("{meta_header}{csv_content}"))
+            .map_err(|e| format!("write csv with metadata: {e}"))?;
+    } else {
+        // Parquet with KV_METADATA
+        let mut kv_pairs = Vec::new();
+        if let Some(qt) = query_text {
+            let escaped_qt = escape_sql_literal(&qt.replace('\n', " "));
+            kv_pairs.push(format!("'query' : '{escaped_qt}'"));
+        }
+        let escaped_ts = escape_sql_literal(&timestamp);
+        kv_pairs.push(format!("'exported_at' : '{escaped_ts}'"));
+        if let Some(aliases) = table_aliases {
+            if !aliases.is_empty() {
+                let escaped_aliases = escape_sql_literal(&aliases.join(", "));
+                kv_pairs.push(format!("'tables' : '{escaped_aliases}'"));
+            }
+        }
+        let kv_metadata = kv_pairs.join(", ");
+        let copy_sql = format!(
+            "COPY (SELECT * FROM ({sql}) AS _q) TO '{escaped_path}' (FORMAT PARQUET, KV_METADATA {{{kv_metadata}}});"
+        );
+        conn.execute_batch(&copy_sql)
+            .map_err(|e| format!("export workspace query: {e}"))?;
+    }
     Ok(())
 }
 
@@ -1592,6 +1650,8 @@ fn export_workspace_query(
     sql: String,
     output_path: String,
     format: String,
+    query_text: Option<String>,
+    table_aliases: Option<Vec<String>>,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<WorkspaceExportResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
@@ -1614,7 +1674,14 @@ fn export_workspace_query(
         let started = Instant::now();
         let conn = open_configured_duckdb(&st)?;
         apply_workspace_tables(&conn, &tables)?;
-        export_workspace_query_to_file(&conn, &normalized_sql, &trimmed_path, &format)?;
+        export_workspace_query_to_file(
+            &conn,
+            &normalized_sql,
+            &trimmed_path,
+            &format,
+            query_text.as_deref(),
+            table_aliases.as_deref(),
+        )?;
 
         let file_size_bytes = fs::metadata(&trimmed_path)
             .map(|meta| meta.len())
@@ -1640,6 +1707,123 @@ fn export_workspace_query(
             file_size_bytes,
             elapsed_ms,
         })
+    })
+}
+
+#[tauri::command]
+fn explain_workspace_query(
+    sql: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<String, String> {
+    ensure_memory_guard_clear(state.as_ref())?;
+    let st = state.inner().clone();
+    on_duckdb_thread(move || {
+        let normalized_sql = normalize_single_sql_statement(&sql)?;
+        let tables = {
+            let lock = st
+                .workspace_tables
+                .lock()
+                .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+            lock.clone()
+        };
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        let explain_sql = format!("EXPLAIN ANALYZE {normalized_sql}");
+        let mut stmt = conn
+            .prepare(&explain_sql)
+            .map_err(|e| format!("prepare explain: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| format!("run explain: {e}"))?;
+        let lines: Vec<String> = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect explain rows: {e}"))?;
+        Ok(lines.join("\n"))
+    })
+}
+
+#[tauri::command]
+fn summarize_workspace_table(
+    alias: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<std::collections::HashMap<String, String>>, String> {
+    ensure_memory_guard_clear(state.as_ref())?;
+    let alias_trimmed = alias.trim().to_string();
+    if alias_trimmed.is_empty() {
+        return Err("Workspace alias is required.".to_string());
+    }
+
+    let tables = {
+        let lock = state
+            .workspace_tables
+            .lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+    let exists = tables
+        .iter()
+        .any(|entry| entry.alias.eq_ignore_ascii_case(&alias_trimmed));
+    if !exists {
+        return Err(format!("Workspace alias not found: {alias_trimmed}"));
+    }
+
+    let st = state.inner().clone();
+    on_duckdb_thread(move || {
+        let started = Instant::now();
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        let ident = escape_sql_ident(&alias_trimmed);
+        // DuckDB SUMMARIZE has fixed output columns. Cast all to VARCHAR
+        // to avoid type-mismatch panics in row.get().
+        let summarize_sql = format!(
+            concat!(
+                "SELECT ",
+                "CAST(column_name AS VARCHAR) AS column_name, ",
+                "CAST(column_type AS VARCHAR) AS column_type, ",
+                "CAST(min AS VARCHAR) AS min, ",
+                "CAST(max AS VARCHAR) AS max, ",
+                "CAST(approx_unique AS VARCHAR) AS approx_unique, ",
+                "CAST(avg AS VARCHAR) AS avg, ",
+                "CAST(std AS VARCHAR) AS std, ",
+                "CAST(q25 AS VARCHAR) AS q25, ",
+                "CAST(q50 AS VARCHAR) AS q50, ",
+                "CAST(q75 AS VARCHAR) AS q75, ",
+                "CAST(count AS VARCHAR) AS count, ",
+                "CAST(null_percentage AS VARCHAR) AS null_percentage ",
+                "FROM (SUMMARIZE \"{}\")"
+            ),
+            ident
+        );
+        let col_names = vec![
+            "column_name", "column_type", "min", "max", "approx_unique",
+            "avg", "std", "q25", "q50", "q75", "count", "null_percentage",
+        ];
+        let mut stmt = conn
+            .prepare(&summarize_sql)
+            .map_err(|e| format!("prepare summarize: {e}"))?;
+        let row_iter = stmt
+            .query_map([], |row| {
+                let mut map = std::collections::HashMap::new();
+                for (i, name) in col_names.iter().enumerate() {
+                    let val: String = row.get::<_, Option<String>>(i)?.unwrap_or_default();
+                    map.insert(name.to_string(), val);
+                }
+                Ok(map)
+            })
+            .map_err(|e| format!("run summarize: {e}"))?;
+        let results: Vec<std::collections::HashMap<String, String>> = row_iter
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect summarize rows: {e}"))?;
+        log_perf(
+            "summarize_workspace_table",
+            &format!(
+                "alias={} duration_ms={} rows={}",
+                alias_trimmed,
+                started.elapsed().as_millis(),
+                results.len()
+            ),
+        );
+        Ok(results)
     })
 }
 
@@ -2086,8 +2270,8 @@ mod tests {
         let csv_path = unique_test_output_path("csv");
         let parquet_path = unique_test_output_path("parquet");
 
-        export_workspace_query_to_file(&conn, sql, &csv_path, "csv").expect("export csv");
-        export_workspace_query_to_file(&conn, sql, &parquet_path, "parquet")
+        export_workspace_query_to_file(&conn, sql, &csv_path, "csv", None, None).expect("export csv");
+        export_workspace_query_to_file(&conn, sql, &parquet_path, "parquet", None, None)
             .expect("export parquet");
 
         let csv_contents = fs::read_to_string(&csv_path).expect("read csv");
@@ -2198,7 +2382,14 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let state = app.state::<Arc<AppRuntimeState>>().inner().clone();
-            spawn_memory_monitor(state);
+            spawn_memory_monitor(Arc::clone(&state));
+            // Warm up DuckDB: pre-load the parquet extension in background
+            thread::spawn(move || {
+                if let Ok(conn) = Connection::open_in_memory() {
+                    let _ = conn.execute_batch("INSTALL parquet; LOAD parquet;");
+                    log_perf("duckdb_warmup", "parquet extension preloaded");
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2218,6 +2409,8 @@ pub fn run() {
             run_workspace_query,
             describe_workspace_table,
             export_workspace_query,
+            explain_workspace_query,
+            summarize_workspace_table,
             diff_workspace_schema
         ])
         .run(tauri::generate_context!())

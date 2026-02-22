@@ -1,6 +1,6 @@
 [package]
 name = "parq-bench"
-version = "0.1.0"
+version = "0.3.0"
 description = "A high-performance desktop Parquet file viewer"
 authors = ["KISA-Keep it Simple Analytics LLC"]
 edition = "2021"
