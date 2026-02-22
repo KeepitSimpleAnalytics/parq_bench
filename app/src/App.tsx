@@ -126,10 +126,9 @@ const DELIMITED_EXTENSIONS = ["csv", "tsv", "txt", "data"];
 
 function detectSourceKind(filePath: string): WorkspaceSourceKind {
   const lower = filePath.toLowerCase().replace(/[/\\]+$/, "");
-  // Glob patterns: check the glob suffix (e.g. "*.csv", "*.*")
+  // Glob patterns: only detect delimited for explicit extensions (*.csv, *.tsv, etc.)
+  // *.* is ambiguous and defaults to parquet (safest — parquet ignores non-parquet silently)
   if (lower.includes("*")) {
-    // "*.*" or patterns ending with a delimited extension
-    if (lower.endsWith("*.*")) return "delimited";
     for (const ext of DELIMITED_EXTENSIONS) {
       if (lower.endsWith(`*.${ext}`)) return "delimited";
     }
@@ -524,8 +523,8 @@ function App() {
     });
     if (selected && !Array.isArray(selected)) {
       if (workspaceIsGlob) {
-        // User picks folder — default to *.* so all supported files are included
-        setWorkspacePathInput(appendGlobPattern(selected, "*.*"));
+        // Default to *.parquet — user can change to *.csv etc. and detection auto-adjusts
+        setWorkspacePathInput(appendGlobPattern(selected, "*.parquet"));
       } else {
         setWorkspacePathInput(selected);
       }
