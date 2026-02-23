@@ -26,7 +26,7 @@ where
 {
     thread::Builder::new()
         .name("duckdb-work".into())
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(16 * 1024 * 1024)
         .spawn(f)
         .map_err(|e| format!("spawn duckdb thread: {e}"))?
         .join()
@@ -670,6 +670,24 @@ fn normalize_single_sql_statement(sql: &str) -> Result<String, String> {
         return Err("Only a single SQL statement is supported.".to_string());
     }
     Ok(normalized)
+}
+
+/// Returns true if the SQL is a SELECT-like statement that returns rows
+/// (SELECT, WITH, VALUES, TABLE, FROM). Everything else (INSTALL, LOAD,
+/// CALL, CREATE, DROP, INSERT, etc.) is a utility/DDL/DML statement.
+fn is_select_like(sql: &str) -> bool {
+    let upper = sql.trim_start().to_uppercase();
+    upper.starts_with("SELECT ")
+        || upper.starts_with("SELECT\n")
+        || upper.starts_with("SELECT\t")
+        || upper.starts_with("WITH ")
+        || upper.starts_with("WITH\n")
+        || upper.starts_with("WITH\t")
+        || upper.starts_with("VALUES ")
+        || upper.starts_with("VALUES(")
+        || upper.starts_with("TABLE ")
+        || upper.starts_with("FROM ")
+        || upper.starts_with("(")
 }
 
 fn is_valid_workspace_alias(alias: &str) -> bool {
@@ -1637,31 +1655,83 @@ fn run_workspace_query(
     let st = state.inner().clone();
     with_workspace_conn(&st, move |conn| {
         let started = Instant::now();
-        let normalized_sql = normalize_single_sql_statement(&sql)?;
+        let trimmed = sql.trim().trim_end_matches(';').trim().to_string();
+        if trimmed.is_empty() {
+            return Err("SQL query is required.".to_string());
+        }
         let safe_limit = row_limit.max(1);
-        let schema = query_schema(conn, &normalized_sql)?;
-        let (rows, truncated) = query_rows_with_limit(conn, &normalized_sql, &schema, safe_limit)?;
-        let elapsed_ms = started.elapsed().as_millis();
-        log_perf(
-            "run_workspace_query",
-            &format!(
-                "duration_ms={} row_limit={} row_count={} truncated={}",
-                elapsed_ms,
-                safe_limit,
-                rows.len(),
-                truncated,
-            ),
-        );
 
-        Ok(WorkspaceQueryResponse {
-            sql: normalized_sql,
-            row_limit: safe_limit,
-            row_count: rows.len(),
-            truncated,
-            elapsed_ms,
-            schema,
-            rows,
-        })
+        // Multi-statement batch (contains semicolons) — execute as utility batch
+        if trimmed.contains(';') {
+            conn.execute_batch(&sql.trim())
+                .map_err(|e| format!("execute batch: {e}"))?;
+            let elapsed_ms = started.elapsed().as_millis();
+            log_perf(
+                "run_workspace_query",
+                &format!("duration_ms={} batch_statement=true", elapsed_ms),
+            );
+            return Ok(WorkspaceQueryResponse {
+                sql: trimmed,
+                row_limit: safe_limit,
+                row_count: 0,
+                truncated: false,
+                elapsed_ms,
+                schema: vec![ParquetSchemaColumn {
+                    name: "result".to_string(),
+                    duckdb_type: "VARCHAR".to_string(),
+                }],
+                rows: vec![vec![Some("Batch executed successfully.".to_string())]],
+            });
+        }
+
+        if is_select_like(&trimmed) {
+            let schema = query_schema(conn, &trimmed)?;
+            let (rows, truncated) =
+                query_rows_with_limit(conn, &trimmed, &schema, safe_limit)?;
+            let elapsed_ms = started.elapsed().as_millis();
+            log_perf(
+                "run_workspace_query",
+                &format!(
+                    "duration_ms={} row_limit={} row_count={} truncated={}",
+                    elapsed_ms,
+                    safe_limit,
+                    rows.len(),
+                    truncated,
+                ),
+            );
+
+            Ok(WorkspaceQueryResponse {
+                sql: trimmed,
+                row_limit: safe_limit,
+                row_count: rows.len(),
+                truncated,
+                elapsed_ms,
+                schema,
+                rows,
+            })
+        } else {
+            // Utility / DDL / DML statement — execute directly, no rows returned
+            conn.execute_batch(&trimmed)
+                .map_err(|e| format!("execute statement: {e}"))?;
+            let elapsed_ms = started.elapsed().as_millis();
+            log_perf(
+                "run_workspace_query",
+                &format!("duration_ms={} utility_statement=true", elapsed_ms),
+            );
+
+            Ok(WorkspaceQueryResponse {
+                sql: trimmed,
+                row_limit: safe_limit,
+                row_count: 0,
+                truncated: false,
+                elapsed_ms,
+                schema: vec![ParquetSchemaColumn {
+                    name: "result".to_string(),
+                    duckdb_type: "VARCHAR".to_string(),
+                }],
+                rows: vec![vec![Some("Statement executed successfully.".to_string())]],
+            })
+        }
     })
 }
 
@@ -1916,11 +1986,11 @@ mod tests {
     use super::{
         apply_workspace_tables, build_workspace_schema_diff, compute_duckdb_memory_limit_bytes,
         compute_duckdb_threads, escape_sql_string_literal, export_workspace_query_to_file,
-        flattened_columns_for_source, normalize_single_sql_statement, open_configured_duckdb,
-        parquet_rows_page, parquet_total_rows, query_rows_with_limit, query_schema,
-        schema_from_flattened, start_socket_server_for_payload, table_schema_for_alias,
-        AppRuntimeState, ParquetSchemaColumn, WorkspaceSourceKind, WorkspaceTableRegistration,
-        DUCKDB_MEMORY_CAP_BYTES,
+        flattened_columns_for_source, is_select_like, normalize_single_sql_statement,
+        open_configured_duckdb, parquet_rows_page, parquet_total_rows, query_rows_with_limit,
+        query_schema, schema_from_flattened, start_socket_server_for_payload,
+        table_schema_for_alias, AppRuntimeState, ParquetSchemaColumn, WorkspaceSourceKind,
+        WorkspaceTableRegistration, DUCKDB_MEMORY_CAP_BYTES,
     };
     use futures_util::StreamExt;
     use std::fs;
@@ -2371,6 +2441,64 @@ mod tests {
         assert_eq!(rows[1][1].as_deref(), Some("beta"));
 
         let _ = fs::remove_file(&tsv_path);
+    }
+
+    #[test]
+    fn is_select_like_detects_select_statements() {
+        assert!(is_select_like("SELECT 1"));
+        assert!(is_select_like("  SELECT * FROM t"));
+        assert!(is_select_like("WITH cte AS (SELECT 1) SELECT * FROM cte"));
+        assert!(is_select_like("VALUES (1, 2), (3, 4)"));
+        assert!(is_select_like("(SELECT 1 UNION SELECT 2)"));
+        assert!(is_select_like("TABLE my_table"));
+        assert!(is_select_like("FROM my_table SELECT *"));
+    }
+
+    #[test]
+    fn is_select_like_rejects_non_select_statements() {
+        assert!(!is_select_like("INSTALL tpch"));
+        assert!(!is_select_like("LOAD parquet"));
+        assert!(!is_select_like("CALL dbgen(sf=0.1)"));
+        assert!(!is_select_like("CREATE TABLE t (id INT)"));
+        assert!(!is_select_like("DROP TABLE t"));
+        assert!(!is_select_like("INSERT INTO t VALUES (1)"));
+        assert!(!is_select_like("UPDATE t SET x = 1"));
+        assert!(!is_select_like("DELETE FROM t"));
+        assert!(!is_select_like("PRAGMA memory_limit"));
+        assert!(!is_select_like("ALTER TABLE t ADD COLUMN x INT"));
+    }
+
+    #[test]
+    fn utility_statements_execute_without_describe() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+
+        // DDL should work via execute_batch
+        conn.execute_batch("CREATE TABLE test_util (id INTEGER, name VARCHAR)")
+            .expect("create table");
+        conn.execute_batch("INSERT INTO test_util VALUES (1, 'alpha'), (2, 'beta')")
+            .expect("insert rows");
+
+        // SELECT on the created table should work via query_schema + query_rows
+        let schema = query_schema(&conn, "SELECT * FROM test_util ORDER BY id")
+            .expect("schema from created table");
+        assert_eq!(schema.len(), 2);
+        assert_eq!(schema[0].name, "id");
+        assert_eq!(schema[1].name, "name");
+
+        let (rows, _) = query_rows_with_limit(
+            &conn,
+            "SELECT * FROM test_util ORDER BY id",
+            &schema,
+            10,
+        )
+        .expect("rows from created table");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].as_deref(), Some("1"));
+        assert_eq!(rows[0][1].as_deref(), Some("alpha"));
+
+        // Cleanup
+        conn.execute_batch("DROP TABLE test_util").expect("drop table");
     }
 
     fn unique_test_parquet_path() -> String {
