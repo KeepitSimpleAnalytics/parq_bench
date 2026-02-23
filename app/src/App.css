@@ -1011,6 +1011,9 @@ td {
 .perspective-wrap.resizable-panel {
   padding: 0;
   overflow: hidden;
+  height: 70vh;
+  min-height: 200px;
+  max-height: 90vh;
 }
 .perspective-wrap.resizable-panel .perspective-viewer {
   width: 100%;
