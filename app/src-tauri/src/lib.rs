@@ -185,8 +185,6 @@ struct AppRuntimeState {
     process_rss_bytes: AtomicU64,
     total_memory_bytes: AtomicU64,
     workspace_tables: Mutex<Vec<WorkspaceTableRegistration>>,
-    db_conn: Mutex<Option<Connection>>,
-    workspace_views_stale: AtomicBool,
 }
 
 impl AppRuntimeState {
@@ -196,8 +194,6 @@ impl AppRuntimeState {
             process_rss_bytes: AtomicU64::new(0),
             total_memory_bytes: AtomicU64::new(0),
             workspace_tables: Mutex::new(Vec::new()),
-            db_conn: Mutex::new(None),
-            workspace_views_stale: AtomicBool::new(false),
         }
     }
 }
@@ -267,79 +263,6 @@ fn open_configured_duckdb(state: &AppRuntimeState) -> Result<Connection, String>
     Ok(conn)
 }
 
-/// Take the pooled connection, run a closure on a DuckDB thread, then return
-/// the connection to the pool.  If the closure or thread panics the connection
-/// is automatically recreated so subsequent commands still work.
-fn with_pooled_conn<F, T>(state: &AppRuntimeState, f: F) -> Result<T, String>
-where
-    F: FnOnce(&Connection) -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    let conn = {
-        state
-            .db_conn
-            .lock()
-            .map_err(|_| "DB connection lock poisoned".to_string())?
-            .take()
-            .ok_or_else(|| "DuckDB connection busy (concurrent call?)".to_string())?
-    };
-
-    let result = on_duckdb_thread(move || f(&conn).map(|val| (val, conn)));
-
-    match result {
-        Ok((value, conn)) => {
-            let mut guard = state
-                .db_conn
-                .lock()
-                .map_err(|_| "DB connection lock poisoned".to_string())?;
-            *guard = Some(conn);
-            Ok(value)
-        }
-        Err(e) => {
-            // Connection lost (panic or error) — recreate it
-            if let Ok(new_conn) = open_configured_duckdb(state) {
-                if let Ok(mut guard) = state.db_conn.lock() {
-                    *guard = Some(new_conn);
-                }
-            }
-            Err(e)
-        }
-    }
-}
-
-/// Like `with_pooled_conn` but ensures workspace table views are current
-/// before running the closure.
-fn with_workspace_conn<F, T>(state: &AppRuntimeState, f: F) -> Result<T, String>
-where
-    F: FnOnce(&Connection) -> Result<T, String> + Send + 'static,
-    T: Send + 'static,
-{
-    let needs_apply = state.workspace_views_stale.load(Ordering::Acquire);
-    let tables = if needs_apply {
-        let lock = state
-            .workspace_tables
-            .lock()
-            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
-        Some(lock.clone())
-    } else {
-        None
-    };
-
-    let result = with_pooled_conn(state, move |conn| {
-        if let Some(tables) = &tables {
-            apply_workspace_tables(conn, tables)?;
-        }
-        f(conn)
-    });
-
-    if result.is_ok() && needs_apply {
-        state
-            .workspace_views_stale
-            .store(false, Ordering::Release);
-    }
-
-    result
-}
 
 fn escape_sql_string_literal(value: &str) -> String {
     value.replace('\\', "/").replace('\'', "''")
@@ -687,6 +610,9 @@ fn is_select_like(sql: &str) -> bool {
         || upper.starts_with("VALUES(")
         || upper.starts_with("TABLE ")
         || upper.starts_with("FROM ")
+        || upper.starts_with("SUMMARIZE ")
+        || upper.starts_with("SUMMARIZE\n")
+        || upper.starts_with("SUMMARIZE\t")
         || upper.starts_with("(")
 }
 
@@ -1171,7 +1097,9 @@ fn duckdb_smoke_query(
 ) -> Result<SmokeQueryResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
     let st = state.inner().clone();
-    with_pooled_conn(&st, |conn| {
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        let conn = &conn;
         let started = Instant::now();
         let duckdb_version: String = conn
             .query_row("SELECT version()", [], |row| row.get(0))
@@ -1279,7 +1207,9 @@ fn preview_parquet(
 ) -> Result<ParquetPreviewResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
     let st = state.inner().clone();
-    with_pooled_conn(&st, move |conn| {
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        let conn = &conn;
         let started = Instant::now();
         let file_size_bytes = fs::metadata(&file_path)
             .map_err(|e| format!("read file metadata: {e}"))?
@@ -1324,7 +1254,9 @@ fn fetch_parquet_rows(
 ) -> Result<ParquetRowsPage, String> {
     ensure_memory_guard_clear(state.as_ref())?;
     let st = state.inner().clone();
-    with_pooled_conn(&st, move |conn| {
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        let conn = &conn;
         let started = Instant::now();
         let normalized = escape_sql_string_literal(&file_path);
         let source = format!("read_parquet('{normalized}')");
@@ -1422,7 +1354,9 @@ async fn fetch_parquet_rows_transport(
 ) -> Result<ParquetRowsTransportResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
     let st = state.inner().clone();
-    let (row_count, payload, started) = with_pooled_conn(&st, move |conn| {
+    let (row_count, payload, started) = on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        let conn = &conn;
         let started = Instant::now();
         let normalized = escape_sql_string_literal(&file_path);
         let source = format!("read_parquet('{normalized}')");
@@ -1567,7 +1501,6 @@ fn register_workspace_table(
     } else {
         tables.push(next_entry.clone());
     }
-    state.workspace_views_stale.store(true, Ordering::Release);
     Ok(workspace_table_info(&next_entry))
 }
 
@@ -1623,7 +1556,6 @@ fn rename_workspace_table(
     }
 
     tables[entry_idx].alias = trimmed_new.to_string();
-    state.workspace_views_stale.store(true, Ordering::Release);
     Ok(workspace_table_info(&tables[entry_idx]))
 }
 
@@ -1641,7 +1573,6 @@ fn remove_workspace_table(
     if tables.len() == initial {
         return Err("Workspace alias not found.".to_string());
     }
-    state.workspace_views_stale.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -1653,7 +1584,15 @@ fn run_workspace_query(
 ) -> Result<WorkspaceQueryResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
     let st = state.inner().clone();
-    with_workspace_conn(&st, move |conn| {
+    let tables = {
+        let lock = st.workspace_tables.lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        let conn = &conn;
         let started = Instant::now();
         let trimmed = sql.trim().trim_end_matches(';').trim().to_string();
         if trimmed.is_empty() {
@@ -1760,8 +1699,15 @@ fn describe_workspace_table(
     }
 
     let st = state.inner().clone();
-    with_workspace_conn(&st, move |conn| {
-        table_schema_for_alias(conn, &alias_trimmed)
+    let tables = {
+        let lock = st.workspace_tables.lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        table_schema_for_alias(&conn, &alias_trimmed)
     })
 }
 
@@ -1782,7 +1728,15 @@ fn export_workspace_query(
     }
 
     let st = state.inner().clone();
-    with_workspace_conn(&st, move |conn| {
+    let tables = {
+        let lock = st.workspace_tables.lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        let conn = &conn;
         let started = Instant::now();
         export_workspace_query_to_file(
             conn,
@@ -1826,7 +1780,15 @@ fn explain_workspace_query(
 ) -> Result<String, String> {
     ensure_memory_guard_clear(state.as_ref())?;
     let st = state.inner().clone();
-    with_workspace_conn(&st, move |conn| {
+    let tables = {
+        let lock = st.workspace_tables.lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        let conn = &conn;
         let normalized_sql = normalize_single_sql_statement(&sql)?;
         let explain_sql = format!("EXPLAIN ANALYZE {normalized_sql}");
         let mut stmt = conn
@@ -1867,9 +1829,18 @@ fn summarize_workspace_table(
     }
 
     let st = state.inner().clone();
-    with_workspace_conn(&st, move |conn| {
+    let tables = {
+        let lock = st.workspace_tables.lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        let conn = &conn;
         let started = Instant::now();
         let ident = escape_sql_ident(&alias_trimmed);
+
         // DuckDB SUMMARIZE has fixed output columns. Cast all to VARCHAR
         // to avoid type-mismatch panics in row.get().
         let summarize_sql = format!(
@@ -1917,7 +1888,7 @@ fn summarize_workspace_table(
                 "alias={} duration_ms={} rows={}",
                 alias_trimmed,
                 started.elapsed().as_millis(),
-                results.len()
+                results.len(),
             ),
         );
         Ok(results)
@@ -1960,7 +1931,15 @@ fn diff_workspace_schema(
     }
 
     let st = state.inner().clone();
-    with_workspace_conn(&st, move |conn| {
+    let tables = {
+        let lock = st.workspace_tables.lock()
+            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
+        lock.clone()
+    };
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        apply_workspace_tables(&conn, &tables)?;
+        let conn = &conn;
         let left_schema = table_schema_for_alias(conn, &left_trimmed)?;
         let right_schema = table_schema_for_alias(conn, &right_trimmed)?;
         let diff =
@@ -2452,6 +2431,8 @@ mod tests {
         assert!(is_select_like("(SELECT 1 UNION SELECT 2)"));
         assert!(is_select_like("TABLE my_table"));
         assert!(is_select_like("FROM my_table SELECT *"));
+        assert!(is_select_like("SUMMARIZE my_table"));
+        assert!(is_select_like("SUMMARIZE SELECT * FROM t"));
     }
 
     #[test]
@@ -2538,18 +2519,14 @@ pub fn run() {
         .setup(|app| {
             let state = app.state::<Arc<AppRuntimeState>>().inner().clone();
             spawn_memory_monitor(Arc::clone(&state));
-            // Create the persistent DuckDB connection and preload the parquet extension
-            match open_configured_duckdb(&state) {
-                Ok(conn) => {
+            // Warm up: install + load the parquet extension on a throwaway
+            // connection so the first real user query doesn't pay the cost.
+            thread::spawn(move || {
+                if let Ok(conn) = Connection::open_in_memory() {
                     let _ = conn.execute_batch("INSTALL parquet; LOAD parquet;");
-                    log_perf("duckdb_setup", "persistent connection created, parquet extension preloaded");
-                    let mut guard = state.db_conn.lock().expect("db_conn lock on setup");
-                    *guard = Some(conn);
+                    log_perf("duckdb_warmup", "parquet extension preloaded");
                 }
-                Err(e) => {
-                    eprintln!("WARNING: failed to create DuckDB connection on startup: {e}");
-                }
-            }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
