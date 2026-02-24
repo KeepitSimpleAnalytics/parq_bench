@@ -773,6 +773,12 @@ td {
   gap: 8px;
 }
 
+.run-sql-btn {
+  padding: 8px 20px !important;
+  font-size: 0.95rem !important;
+  font-weight: 600;
+}
+
 .editor-font-controls {
   display: inline-flex;
   align-items: center;
