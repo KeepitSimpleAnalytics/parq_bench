@@ -31,11 +31,9 @@ import type {
   ActiveTab,
   QueryHistoryEntry,
   AppSettings,
-  SummarizeRow,
 } from "./types";
 import {
   PAGE_SIZE,
-  ROW_HEIGHT,
   FIRST_VIEWPORT_TARGET_MS,
   PERSPECTIVE_READY_TARGET_MS,
   ACCEPTANCE_GATE_TIMEOUT_MS,
@@ -56,8 +54,6 @@ import {
   readRecentFiles,
   readQueryHistory,
   readSettings,
-  formatWorkspaceDelimiter,
-  appendGlobPattern,
   sqlIdentifierInsertText,
   isNumericDuckType,
   coerceWorkspaceCell,
@@ -74,6 +70,9 @@ import { useVirtualScroll } from "./hooks/useVirtualScroll";
 import { SettingsModal } from "./components/SettingsModal";
 import { AboutModal } from "./components/AboutModal";
 import { QueryHistoryDropdown } from "./components/QueryHistoryDropdown";
+import { VirtualScrollGrid } from "./components/VirtualScrollGrid";
+import { SqlResultsTable } from "./components/SqlResultsTable";
+import { WorkspaceTableRegistry } from "./components/WorkspaceTableRegistry";
 
 
 
@@ -101,14 +100,9 @@ function App() {
   const [, setLastExportPath] = useState<string | null>(null);
   const [workspaceTables, setWorkspaceTables] = useState<WorkspaceTableInfo[]>([]);
   const [workspaceTableSchemas, setWorkspaceTableSchemas] = useState<WorkspaceSchemaByAlias>({});
-  const [workspaceAliasInput, setWorkspaceAliasInput] = useState("");
-  const [workspacePathInput, setWorkspacePathInput] = useState("");
-  const [workspaceIsGlob, setWorkspaceIsGlob] = useState(false);
   const [workspaceSlowModeEnabled, setWorkspaceSlowModeEnabled] = useState<boolean>(
     () => readWorkspaceSlowModeEnabled(),
   );
-  const workspaceSourceKind = detectSourceKind(workspacePathInput);
-  const [workspaceDelimiterInput, setWorkspaceDelimiterInput] = useState("");
   const [workspaceEditorReady, setWorkspaceEditorReady] = useState(false);
   const [workspaceSql, setWorkspaceSql] = useState(
     "SELECT * FROM my_table LIMIT 100",
@@ -134,14 +128,7 @@ function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [explainPlan, setExplainPlan] = useState<string | null>(null);
   const [explainLoading, setExplainLoading] = useState(false);
-  const [workspaceTableStats, setWorkspaceTableStats] = useState<Record<string, SummarizeRow[] | null>>({});
-  const [statsLoading, setStatsLoading] = useState<string | null>(null);
-  const [bulkSelectMode, setBulkSelectMode] = useState(false);
-  const [bulkSelectedAliases, setBulkSelectedAliases] = useState<Set<string>>(new Set());
-  const [columnSearchQuery, setColumnSearchQuery] = useState("");
   const [dragOverZone, setDragOverZone] = useState<"preview" | "sql" | null>(null);
-  const [editingAlias, setEditingAlias] = useState<string | null>(null);
-  const [editingAliasValue, setEditingAliasValue] = useState("");
   const [expandedPanel, setExpandedPanel] = useState<"preview-table" | "perspective" | "sql-results" | null>(null);
 
   // Virtual scroll hook
@@ -208,29 +195,6 @@ function App() {
     return selected;
   }
 
-  async function pickWorkspaceTablePath(): Promise<void> {
-    const filters = workspaceIsGlob
-      ? []
-      : [
-          { name: "Parquet", extensions: ["parquet"] },
-          { name: "Delimited", extensions: ["csv", "tsv", "txt", "data"] },
-        ];
-    const selected = await open({
-      title: workspaceIsGlob ? "Select Workspace Source Folder" : "Select Workspace Table Source",
-      multiple: false,
-      directory: workspaceIsGlob,
-      filters: filters.length > 0 ? filters : undefined,
-    });
-    if (selected && !Array.isArray(selected)) {
-      if (workspaceIsGlob) {
-        // Default to *.parquet — user can change to *.csv etc. and detection auto-adjusts
-        setWorkspacePathInput(appendGlobPattern(selected, "*.parquet"));
-      } else {
-        setWorkspacePathInput(selected);
-      }
-    }
-  }
-
   async function refreshWorkspaceTables() {
     const tables = await invoke<WorkspaceTableInfo[]>("list_workspace_tables");
     setWorkspaceTables(tables);
@@ -291,89 +255,6 @@ function App() {
     if (editor) {
       editor.setValue(nextSql);
     }
-  }
-
-  async function registerWorkspaceTable() {
-    if (!workspaceAliasInput.trim() || !workspacePathInput.trim()) {
-      setError("Workspace alias and file path are required.");
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-    try {
-      const sourceKind = detectSourceKind(workspacePathInput.trim());
-      const delimiter = sourceKind === "delimited" ? workspaceDelimiterInput.trim() || undefined : undefined;
-      await invoke<WorkspaceTableInfo>("register_workspace_table", {
-        alias: workspaceAliasInput.trim(),
-        filePath: workspacePathInput.trim(),
-        isGlob: workspaceIsGlob,
-        sourceKind,
-        delimiter,
-      });
-      await refreshWorkspaceTables();
-      const alias = workspaceAliasInput.trim();
-      if (!readWorkspaceSql().includes(alias)) {
-        replaceWorkspaceSql(`SELECT * FROM ${alias} LIMIT 100`);
-      }
-      setWorkspaceAliasInput("");
-      setWorkspacePathInput("");
-      setWorkspaceIsGlob(false);
-      setWorkspaceDelimiterInput("");
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function removeWorkspaceTable(alias: string) {
-    setLoading(true);
-    setError(null);
-    try {
-      await invoke("remove_workspace_table", { alias });
-      await refreshWorkspaceTables();
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function clearAllWorkspaceTables() {
-    if (!window.confirm(`Remove all ${workspaceTables.length} workspace tables?`)) return;
-    setLoading(true);
-    setError(null);
-    const errors: string[] = [];
-    for (const table of workspaceTables) {
-      try {
-        await invoke("remove_workspace_table", { alias: table.alias });
-      } catch (err) { errors.push(`${table.alias}: ${String(err)}`); }
-    }
-    setWorkspaceTableStats({});
-    setBulkSelectMode(false);
-    setBulkSelectedAliases(new Set());
-    await refreshWorkspaceTables();
-    if (errors.length > 0) setError(errors.join(" | "));
-    setLoading(false);
-  }
-
-  async function removeSelectedWorkspaceTables() {
-    if (bulkSelectedAliases.size === 0) return;
-    setLoading(true);
-    setError(null);
-    const errors: string[] = [];
-    for (const alias of bulkSelectedAliases) {
-      try {
-        await invoke("remove_workspace_table", { alias });
-        setWorkspaceTableStats((prev) => { const n = { ...prev }; delete n[alias]; return n; });
-      } catch (err) { errors.push(`${alias}: ${String(err)}`); }
-    }
-    setBulkSelectedAliases(new Set());
-    setBulkSelectMode(false);
-    await refreshWorkspaceTables();
-    if (errors.length > 0) setError(errors.join(" | "));
-    setLoading(false);
   }
 
   async function runWorkspaceSchemaDiff() {
@@ -511,19 +392,6 @@ function App() {
       setError(String(err));
     } finally {
       setExplainLoading(false);
-    }
-  }
-
-  async function loadTableStats(alias: string) {
-    setStatsLoading(alias);
-    setError(null);
-    try {
-      const result = await invoke<SummarizeRow[]>("summarize_workspace_table", { alias });
-      setWorkspaceTableStats((prev) => ({ ...prev, [alias]: result }));
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setStatsLoading(null);
     }
   }
 
@@ -1375,12 +1243,6 @@ function App() {
     })();
   }, []);
 
-  useEffect(() => {
-    if (!workspaceSlowModeEnabled) {
-      setWorkspaceDelimiterInput("");
-    }
-  }, [workspaceSlowModeEnabled]);
-
   // Hide/show Perspective's built-in configure (settings) button via shadow DOM style injection
   // Only runs after Perspective has fully loaded to avoid layout interference
   useEffect(() => {
@@ -1538,19 +1400,6 @@ function App() {
         }
       }
       setActiveTab("sql");
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function renameWorkspaceTable(oldAlias: string, newAlias: string) {
-    setLoading(true);
-    setError(null);
-    try {
-      await invoke<WorkspaceTableInfo>("rename_workspace_table", { oldAlias, newAlias });
-      await refreshWorkspaceTables();
     } catch (err) {
       setError(String(err));
     } finally {
@@ -1808,57 +1657,17 @@ function App() {
             </p>
           ) : null}
           {viewMode === "virtual" ? (
-            <>
-              <div className="virtual-header-track">
-                <div
-                  className="virtual-header-row"
-                  style={{
-                    gridTemplateColumns: columnGridTemplate,
-                    width: `${gridContentWidth}px`,
-                    transform: `translateX(-${scrollLeft}px)`,
-                  }}
-                >
-                  {preview.schema.map((col) => (
-                    <div key={col.name} className="virtual-cell virtual-cell-head col-copyable"
-                      title={`${col.duckdb_type} — click to copy`}
-                      onClick={() => void copyToClipboard(col.name)}>
-                      {col.name}
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <div
-                className="virtual-grid"
-                onScroll={(event) => {
-                  setScrollTop(event.currentTarget.scrollTop);
-                  setScrollLeft(event.currentTarget.scrollLeft);
-                }}
-              >
-                <div className="virtual-spacer" style={{ height: `${totalRows * ROW_HEIGHT}px`, width: `${gridContentWidth}px` }}>
-                  {visibleIndices.map((index) => {
-                    const row = loadedRows.get(index);
-                    return (
-                      <div
-                        key={`virtual-row-${index}`}
-                        className="virtual-row"
-                        style={{
-                          top: `${index * ROW_HEIGHT}px`,
-                          height: `${ROW_HEIGHT}px`,
-                          width: `${gridContentWidth}px`,
-                          gridTemplateColumns: columnGridTemplate,
-                        }}
-                      >
-                        {preview.schema.map((col, colIndex) => (
-                          <div key={`virtual-cell-${index}-${col.name}`} className="virtual-cell" title={row?.[colIndex] ?? "NULL"}>
-                            {row ? (row[colIndex] ?? "NULL") : "..."}
-                          </div>
-                        ))}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </>
+            <VirtualScrollGrid
+              schema={preview.schema}
+              loadedRows={loadedRows}
+              visibleIndices={visibleIndices}
+              totalRows={totalRows}
+              scrollLeft={scrollLeft}
+              gridContentWidth={gridContentWidth}
+              columnGridTemplate={columnGridTemplate}
+              onScroll={(st, sl) => { setScrollTop(st); setScrollLeft(sl); }}
+              onCopyColumn={(name) => void copyToClipboard(name)}
+            />
           ) : null}
           {viewMode === "perspective" && totalRows > settings.perspectiveMaxRows ? (
             <p className="row-cap-banner">
@@ -1926,353 +1735,69 @@ function App() {
 
   const workspacePanel = (
     <section className="workspace-panel">
-      <h3>Workspace Explorer</h3>
-      <div className="workspace-mode-row">
-        <label className="workspace-slow-toggle">
-          <input
-            type="checkbox"
-            checked={workspaceSlowModeEnabled}
-            onChange={(event) => setWorkspaceSlowModeEnabled(event.currentTarget.checked)}
-          />
-          Enable Slo-mo
-        </label>
-        {workspaceSlowModeEnabled ? <span className="metric-chip metric-bad">Slo-mo enabled</span> : null}
-      </div>
-      {workspaceSlowModeEnabled ? (
-        <div className="workspace-slow-warning">
-          Slo-mo enabled. You can process non-Parquet files, but at the expense of speed.
-        </div>
-      ) : null}
-      {workspaceSourceKind === "delimited" ? (
-        <div className="workspace-source-row">
-          <span className="phase">Detected: delimited file</span>
-          <label>
-            Delimiter
-            <input
-              type="text"
-              value={workspaceDelimiterInput}
-              onChange={(event) => setWorkspaceDelimiterInput(event.currentTarget.value)}
-              placeholder='Auto (.csv → ",", .tsv → "\t")'
-            />
-          </label>
-        </div>
-      ) : null}
-      <div className="workspace-register-row">
-        <input
-          type="text"
-          placeholder="alias (e.g. my_table)"
-          value={workspaceAliasInput}
-          onChange={(event) => setWorkspaceAliasInput(event.currentTarget.value)}
-        />
-        <input
-          type="text"
-          className="workspace-path-input"
-          placeholder="file path or glob (e.g. *.parquet, *.csv)"
-          value={workspacePathInput}
-          onChange={(event) => setWorkspacePathInput(event.currentTarget.value)}
-        />
-        <label className="workspace-checkbox">
-          <input
-            type="checkbox"
-            checked={workspaceIsGlob}
-            onChange={(event) => setWorkspaceIsGlob(event.currentTarget.checked)}
-          />
-          glob
-        </label>
-        <button type="button" onClick={() => void pickWorkspaceTablePath()} disabled={loading}>
-          Browse
-        </button>
-        <button type="button" onClick={() => void registerWorkspaceTable()} disabled={loading}>
-          Mount
-        </button>
-      </div>
-
-      <div className="workspace-list">
-        <strong>Tables:</strong>{" "}
-        {workspaceTables.length >= 2 ? (
-          <>
-            <button type="button" style={{ padding: "2px 7px", fontSize: "0.75rem" }}
-              onClick={() => void clearAllWorkspaceTables()} disabled={loading}>
-              Clear All
-            </button>
-            <button type="button" style={{ padding: "2px 7px", fontSize: "0.75rem" }}
-              onClick={() => { setBulkSelectMode((p) => !p); setBulkSelectedAliases(new Set()); }}>
-              {bulkSelectMode ? "Cancel Select" : "Select"}
-            </button>
-            {bulkSelectMode && bulkSelectedAliases.size > 0 ? (
-              <button type="button" style={{ padding: "2px 7px", fontSize: "0.75rem" }}
-                onClick={() => void removeSelectedWorkspaceTables()} disabled={loading}>
-                Remove Selected ({bulkSelectedAliases.size})
-              </button>
-            ) : null}
-          </>
-        ) : null}
-        {workspaceTables.length === 0
-          ? "none"
-          : workspaceTables.map((table) => (
-              <span key={`workspace-${table.alias}`} className="workspace-table-pill">
-                {bulkSelectMode ? (
-                  <input type="checkbox" className="bulk-checkbox"
-                    checked={bulkSelectedAliases.has(table.alias)}
-                    onChange={(e) => {
-                      setBulkSelectedAliases((prev) => {
-                        const next = new Set(prev);
-                        if (e.target.checked) next.add(table.alias); else next.delete(table.alias);
-                        return next;
-                      });
-                    }}
-                  />
-                ) : null}
-                {editingAlias === table.alias ? (
-                  <input
-                    type="text"
-                    className="workspace-alias-edit"
-                    value={editingAliasValue}
-                    autoFocus
-                    onChange={(e) => setEditingAliasValue(e.currentTarget.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        const trimmed = editingAliasValue.trim();
-                        if (trimmed && trimmed !== table.alias) {
-                          void renameWorkspaceTable(table.alias, trimmed);
-                        }
-                        setEditingAlias(null);
-                      } else if (e.key === "Escape") {
-                        setEditingAlias(null);
-                      }
-                    }}
-                    onBlur={() => {
-                      const trimmed = editingAliasValue.trim();
-                      if (trimmed && trimmed !== table.alias) {
-                        void renameWorkspaceTable(table.alias, trimmed);
-                      }
-                      setEditingAlias(null);
-                    }}
-                  />
-                ) : (
-                  <span
-                    className="workspace-alias-label"
-                    title="Click to rename"
-                    onClick={() => {
-                      setEditingAlias(table.alias);
-                      setEditingAliasValue(table.alias);
-                    }}
-                  >
-                    {table.alias}
-                  </span>
-                )}
-                <span className="workspace-table-source">
-                  {table.source_kind === "delimited"
-                    ? `delimited | ${formatWorkspaceDelimiter(table.delimiter)}`
-                    : "parquet"}
-                </span>
-                <button
-                  type="button"
-                  style={{ border: "none", background: "none", color: "var(--accent)", padding: "0 2px", lineHeight: 1, boxShadow: "none", fontSize: "0.75rem", fontWeight: 600 }}
-                  title="Column statistics"
-                  onClick={() => {
-                    if (workspaceTableStats[table.alias]) {
-                      setWorkspaceTableStats((prev) => ({ ...prev, [table.alias]: null }));
-                    } else {
-                      void loadTableStats(table.alias);
-                    }
-                  }}
-                  disabled={loading || statsLoading === table.alias}
-                >
-                  {statsLoading === table.alias ? "..." : "Stats"}
-                </button>
-                <button
-                  type="button"
-                  className="workspace-pill-remove"
-                  onClick={() => {
-                    void removeWorkspaceTable(table.alias);
-                    setWorkspaceTableStats((prev) => { const n = { ...prev }; delete n[table.alias]; return n; });
-                  }}
-                  disabled={loading}
-                >
-                  x
-                </button>
-              </span>
-            ))}
-      </div>
-      {workspaceTables.map((table) => {
-        const stats = workspaceTableStats[table.alias];
-        if (!stats) return null;
-        return (
-          <details key={`stats-${table.alias}`} open style={{ marginBottom: 8 }}>
-            <summary style={{ cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, marginBottom: 4 }}>
-              Stats: {table.alias}
-              <button type="button" style={{ marginLeft: 8, padding: "1px 6px", fontSize: "0.72rem" }}
-                onClick={(e) => { e.stopPropagation(); setWorkspaceTableStats((prev) => ({ ...prev, [table.alias]: null })); }}>
-                Hide
-              </button>
-            </summary>
-            <div className="table-wrap" style={{ maxHeight: 240, overflowY: "auto" }}>
-              {(() => {
-                const STATS_COLS = ["column_name","column_type","min","max","approx_unique","avg","std","q25","q50","q75","count","null_percentage"];
-                return (
-                  <table>
-                    <thead>
-                      <tr>
-                        {STATS_COLS.map((key) => (
-                          <th key={`stats-th-${table.alias}-${key}`} style={{ fontSize: "0.78rem" }}>{key}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {stats.map((row, ri) => (
-                        <tr key={`stats-row-${table.alias}-${ri}`}>
-                          {STATS_COLS.map((key, ci) => (
-                            <td key={`stats-cell-${table.alias}-${ri}-${ci}`} style={{ fontSize: "0.78rem" }}>{row[key] ?? ""}</td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                );
-              })()}
-            </div>
-          </details>
-        );
-      })}
-      {workspaceTables.length > 0 ? (
-        <>
-          {workspaceTables.length >= 2 ? (
-            <div className="column-search-wrap">
-              <input
-                type="text"
-                className="column-search-input"
-                placeholder="Search columns..."
-                value={columnSearchQuery}
-                onChange={(e) => setColumnSearchQuery(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Escape") { setColumnSearchQuery(""); e.currentTarget.blur(); } }}
-              />
-              {columnSearchQuery ? (
-                <button type="button" className="column-search-clear" onClick={() => setColumnSearchQuery("")}>x</button>
-              ) : null}
-            </div>
-          ) : null}
-          <div className="workspace-schema-summary">
-            {(() => {
-              const query = columnSearchQuery.trim().toLowerCase();
-              const filtered = workspaceTables.filter((table) => {
-                if (!query) return true;
-                const schema = workspaceTableSchemas[table.alias] ?? [];
-                return schema.some((col) => col.name.toLowerCase().includes(query));
-              });
-              if (query && filtered.length === 0) {
-                return <span className="phase">No matching columns found.</span>;
-              }
-              return filtered.map((table) => {
-                const schema = workspaceTableSchemas[table.alias] ?? [];
-                if (schema.length === 0) {
-                  return (
-                    <span key={`workspace-schema-${table.alias}`} className="workspace-schema-pill"
-                      title={`${table.alias}: schema unavailable`}>
-                      <strong>{table.alias}</strong>: schema unavailable
-                    </span>
-                  );
-                }
-                const matchingCols = query
-                  ? schema.filter((col) => col.name.toLowerCase().includes(query))
-                  : schema;
-                const displayCols = query ? matchingCols : schema.slice(0, 6);
-                const suffix = !query && schema.length > 6 ? ", ..." : "";
-                const countLabel = query ? ` (${matchingCols.length}/${schema.length})` : "";
-                return (
-                  <span
-                    key={`workspace-schema-${table.alias}`}
-                    className="workspace-schema-pill"
-                    title={`${table.alias}: ${schema.map((c) => `${c.name} (${c.duckdb_type})`).join(", ")}`}
-                  >
-                    <strong>{table.alias}</strong>{countLabel}:{" "}
-                    {displayCols.map((col, i) => (
-                      <span key={col.name}>
-                        {i > 0 ? ", " : ""}
-                        <span className={query && col.name.toLowerCase().includes(query) ? "col-match" : ""}>
-                          {col.name}
-                        </span>
-                      </span>
-                    ))}
-                    {suffix}
-                  </span>
-                );
-              });
-            })()}
-          </div>
-        </>
-      ) : null}
-
-      {INTERNAL_TOOLS_ENABLED ? (
-        <div className="workspace-diff-row">
-          <label>
-            Diff Left
-            <select value={workspaceDiffLeftAlias} onChange={(event) => setWorkspaceDiffLeftAlias(event.currentTarget.value)}>
-              <option value="">Select table</option>
-              {workspaceTables.map((table) => (
-                <option key={`diff-left-${table.alias}`} value={table.alias}>
-                  {table.alias}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Diff Right
-            <select value={workspaceDiffRightAlias} onChange={(event) => setWorkspaceDiffRightAlias(event.currentTarget.value)}>
-              <option value="">Select table</option>
-              {workspaceTables.map((table) => (
-                <option key={`diff-right-${table.alias}`} value={table.alias}>
-                  {table.alias}
-                </option>
-              ))}
-            </select>
-          </label>
-          <button type="button" onClick={() => void runWorkspaceSchemaDiff()} disabled={loading || workspaceTables.length < 2}>
-            Run Schema Diff
-          </button>
-        </div>
-      ) : null}
-
-      {INTERNAL_TOOLS_ENABLED && workspaceSchemaDiff ? (
-        <>
-          <p className="meta-line">
-            <span>
-              <strong>Added:</strong> {workspaceSchemaDiff.added_count}
-            </span>
-            <span>
-              <strong>Removed:</strong> {workspaceSchemaDiff.removed_count}
-            </span>
-            <span>
-              <strong>Type Changed:</strong> {workspaceSchemaDiff.type_changed_count}
-            </span>
-            <span>
-              <strong>Unchanged:</strong> {workspaceSchemaDiff.unchanged_count}
-            </span>
-          </p>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Column</th>
-                  <th>{workspaceSchemaDiff.left_alias}</th>
-                  <th>{workspaceSchemaDiff.right_alias}</th>
-                  <th>Change</th>
-                </tr>
-              </thead>
-              <tbody>
-                {workspaceSchemaDiff.columns.map((column) => (
-                  <tr key={`schema-diff-${column.name}`}>
-                    <td>{column.name}</td>
-                    <td>{column.left_type ?? "-"}</td>
-                    <td>{column.right_type ?? "-"}</td>
-                    <td>{column.change}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </>
-      ) : null}
+      <WorkspaceTableRegistry
+        tables={workspaceTables}
+        schemas={workspaceTableSchemas}
+        loading={loading}
+        workspaceSlowModeEnabled={workspaceSlowModeEnabled}
+        onSlowModeChange={setWorkspaceSlowModeEnabled}
+        onRegister={async (alias, filePath, isGlob, sourceKind, delimiter) => {
+          setLoading(true);
+          setError(null);
+          try {
+            await invoke("register_workspace_table", { alias, filePath, isGlob, sourceKind, delimiter });
+            await refreshWorkspaceTables();
+            if (!readWorkspaceSql().includes(alias)) {
+              replaceWorkspaceSql(`SELECT * FROM ${alias} LIMIT 100`);
+            }
+          } catch (err) { setError(String(err)); }
+          finally { setLoading(false); }
+        }}
+        onRemove={async (alias) => {
+          setLoading(true); setError(null);
+          try { await invoke("remove_workspace_table", { alias }); await refreshWorkspaceTables(); }
+          catch (err) { setError(String(err)); }
+          finally { setLoading(false); }
+        }}
+        onRename={async (oldAlias, newAlias) => {
+          setLoading(true); setError(null);
+          try { await invoke("rename_workspace_table", { oldAlias, newAlias }); await refreshWorkspaceTables(); }
+          catch (err) { setError(String(err)); }
+          finally { setLoading(false); }
+        }}
+        onClearAll={async () => {
+          if (!window.confirm(`Remove all ${workspaceTables.length} workspace tables?`)) return;
+          setLoading(true); setError(null);
+          const errors: string[] = [];
+          for (const table of workspaceTables) {
+            try { await invoke("remove_workspace_table", { alias: table.alias }); }
+            catch (err) { errors.push(`${table.alias}: ${String(err)}`); }
+          }
+          await refreshWorkspaceTables();
+          if (errors.length > 0) setError(errors.join(" | "));
+          setLoading(false);
+        }}
+        onRemoveSelected={async (aliases) => {
+          setLoading(true); setError(null);
+          const errors: string[] = [];
+          for (const alias of aliases) {
+            try { await invoke("remove_workspace_table", { alias }); }
+            catch (err) { errors.push(`${alias}: ${String(err)}`); }
+          }
+          await refreshWorkspaceTables();
+          if (errors.length > 0) setError(errors.join(" | "));
+          setLoading(false);
+        }}
+        onError={setError}
+        schemaDiff={{
+          leftAlias: workspaceDiffLeftAlias,
+          rightAlias: workspaceDiffRightAlias,
+          result: workspaceSchemaDiff,
+          setLeftAlias: setWorkspaceDiffLeftAlias,
+          setRightAlias: setWorkspaceDiffRightAlias,
+          run: () => void runWorkspaceSchemaDiff(),
+        }}
+      />
 
       <div className="workspace-sql-row">
         <div className="workspace-editor" style={{ height: editorHeight, resize: "vertical", overflow: "hidden" }}
@@ -2426,52 +1951,13 @@ function App() {
       ) : null}
 
       {workspaceQueryResult ? (
-        <div className={expandedPanel === "sql-results" ? `sql-results-section ${settings.expandMode === "resize" ? "resizable-panel" : "expanded-panel"}` : "sql-results-section"}>
-          <p className="meta-line">
-            <span>
-              <strong>Rows:</strong> {workspaceQueryResult.row_count}
-              {workspaceQueryResult.truncated ? ` (truncated to ${workspaceQueryResult.row_limit})` : ""}
-            </span>
-            <span>
-              <strong>Elapsed:</strong> {workspaceQueryResult.elapsed_ms.toFixed(0)}ms
-            </span>
-            <span>
-              <strong>Columns:</strong> {workspaceQueryResult.schema.length}
-            </span>
-            <button type="button" style={{ padding: "2px 7px", fontSize: "0.76rem" }}
-              onClick={() => void copyToClipboard(workspaceQueryResult.schema.map((c) => c.name).join(", "))}>
-              Copy All Columns
-            </button>
-            <button type="button" className="expand-btn" title={expandedPanel === "sql-results" ? (settings.expandMode === "fullscreen" ? "Exit fullscreen (Esc)" : "Collapse") : "Expand results"}
-              onClick={() => setExpandedPanel(expandedPanel === "sql-results" ? null : "sql-results")}>
-              {expandedPanel === "sql-results" ? "\u2716" : (settings.expandMode === "resize" ? "\u2922" : "\u26F6")}
-            </button>
-          </p>
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  {workspaceQueryResult.schema.map((col) => (
-                    <th key={`workspace-col-${col.name}`} title={`${col.duckdb_type} — click to copy`}
-                      className="col-copyable"
-                      onClick={() => void copyToClipboard(col.name)}>
-                      {col.name}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {workspaceQueryResult.rows.map((row, rowIndex) => (
-                  <tr key={`workspace-row-${rowIndex}`}>
-                    {row.map((value, colIndex) => (
-                      <td key={`workspace-cell-${rowIndex}-${colIndex}`}>{value ?? "NULL"}</td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <SqlResultsTable
+          result={workspaceQueryResult}
+          expandedPanel={expandedPanel}
+          expandMode={settings.expandMode}
+          onToggleExpand={() => setExpandedPanel(expandedPanel === "sql-results" ? null : "sql-results")}
+          onCopyColumns={(text) => void copyToClipboard(text)}
+        />
       ) : null}
     </section>
   );
