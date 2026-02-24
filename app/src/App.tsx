@@ -6,7 +6,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { tableFromIPC } from "apache-arrow";
 import type * as Monaco from "monaco-editor";
 import "./App.css";
@@ -47,7 +46,6 @@ import {
   UI_WORKSPACE_SLOW_MODE_STORAGE_KEY,
   RECENT_FILES_MAX,
   QUERY_HISTORY_MAX,
-  DEFAULT_SETTINGS,
   INTERNAL_TOOLS_ENABLED,
   PRODUCT_STAGE_LABEL,
 } from "./constants";
@@ -73,6 +71,9 @@ import { useTheme } from "./hooks/useTheme";
 import { useLocalStorageSync } from "./hooks/useLocalStorageSync";
 import { useRuntimeHealth } from "./hooks/useRuntimeHealth";
 import { useVirtualScroll } from "./hooks/useVirtualScroll";
+import { SettingsModal } from "./components/SettingsModal";
+import { AboutModal } from "./components/AboutModal";
+import { QueryHistoryDropdown } from "./components/QueryHistoryDropdown";
 
 
 
@@ -2310,34 +2311,13 @@ function App() {
           <button type="button" onClick={() => void exportWorkspaceQuery("parquet")} disabled={loading}>
             Export Parquet
           </button>
-          <div style={{ position: "relative", display: "inline-block" }}>
-            <button type="button" onClick={() => setHistoryOpen((p) => !p)} disabled={queryHistory.length === 0}>
-              History ({queryHistory.length})
-            </button>
-            {historyOpen ? (
-              <div style={{ position: "absolute", top: "100%", left: 0, zIndex: 100, background: "var(--surface-strong)", border: "1px solid var(--border)", borderRadius: 8, padding: 6, maxHeight: 280, overflowY: "auto", minWidth: 340, boxShadow: "0 8px 24px rgba(0,0,0,0.15)" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
-                  <strong style={{ fontSize: "0.82rem" }}>Query History</strong>
-                  <button type="button" style={{ padding: "2px 6px", fontSize: "0.72rem" }} onClick={() => { setQueryHistory([]); setHistoryOpen(false); }}>Clear</button>
-                </div>
-                {queryHistory.map((entry, idx) => (
-                  <div key={`qh-${idx}`}
-                    style={{ padding: "4px 6px", borderBottom: "1px solid var(--border)", cursor: "pointer", fontSize: "0.8rem" }}
-                    onClick={() => { replaceWorkspaceSql(entry.sql); setHistoryOpen(false); }}
-                  >
-                    <div style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 320, fontFamily: "monospace" }}>
-                      {entry.sql}
-                    </div>
-                    <div style={{ fontSize: "0.72rem", color: "var(--text-soft)" }}>
-                      {new Date(entry.timestamp).toLocaleString()}
-                      {entry.rowCount != null ? ` | ${entry.rowCount} rows` : ""}
-                      {entry.elapsedMs != null ? ` | ${entry.elapsedMs.toFixed(0)}ms` : ""}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-          </div>
+          <QueryHistoryDropdown
+            history={queryHistory}
+            open={historyOpen}
+            onToggle={() => setHistoryOpen((p) => !p)}
+            onSelect={(sql) => { replaceWorkspaceSql(sql); setHistoryOpen(false); }}
+            onClear={() => { setQueryHistory([]); setHistoryOpen(false); }}
+          />
           {settings.showVisualization ? (
             <button type="button" onClick={() => void visualizeWorkspaceChart()} disabled={loading || workspaceQueryResult === null}>
               Visualize Data
@@ -2557,161 +2537,20 @@ function App() {
         </div>
       </div>
 
-      {settingsOpen ? (
-        <div className="modal-backdrop" role="presentation" onClick={() => setSettingsOpen(false)}>
-          <section
-            className="modal-card"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Settings"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <h3>Settings</h3>
-            <div style={{ display: "flex", flexDirection: "column", gap: 12, margin: "12px 0" }}>
-              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: "0.85rem" }}>
-                SQL Row Limit
-                <input type="number" min={1} max={100000} value={settings.sqlRowLimit}
-                  onChange={(e) => setSettings((s) => ({ ...s, sqlRowLimit: Math.max(1, parseInt(e.target.value) || 200) }))}
-                  style={{ width: 120 }}
-                />
-                <span className="phase">Maximum rows returned by workspace queries (default: 200)</span>
-              </label>
-              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: "0.85rem" }}>
-                Perspective Max Rows
-                <input type="number" min={100} max={100000} value={settings.perspectiveMaxRows}
-                  onChange={(e) => setSettings((s) => ({ ...s, perspectiveMaxRows: Math.max(100, parseInt(e.target.value) || 5000) }))}
-                  style={{ width: 120 }}
-                />
-                <span className="phase">Maximum rows loaded into Perspective viewer (default: 5000). Higher values increase memory usage.</span>
-              </label>
-              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: "0.85rem" }}>
-                Editor Font Size
-                <input type="number" min={8} max={32} value={settings.editorFontSize}
-                  onChange={(e) => {
-                    const v = Math.min(32, Math.max(8, parseInt(e.target.value) || 13));
-                    setSettings((s) => ({ ...s, editorFontSize: v }));
-                    setEditorFontSize(v);
-                    workspaceEditorRef.current?.updateOptions({ fontSize: v });
-                  }}
-                  style={{ width: 120 }}
-                />
-                <span className="phase">Monaco editor font size in pixels (default: 13)</span>
-              </label>
-              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: "0.85rem" }}>
-                Expand Mode
-                <select value={settings.expandMode}
-                  onChange={(e) => setSettings((s) => ({ ...s, expandMode: e.target.value as "fullscreen" | "resize" }))}
-                  style={{ width: 160 }}
-                >
-                  <option value="fullscreen">Fullscreen</option>
-                  <option value="resize">Resize</option>
-                </select>
-                <span className="phase">Fullscreen: fixed overlay (default). Resize: drag-to-resize panels.</span>
-              </label>
-              <label style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: 8, fontSize: "0.85rem", cursor: "pointer" }}>
-                <input type="checkbox" checked={settings.showPerspectiveConfigure}
-                  onChange={(e) => setSettings((s) => ({ ...s, showPerspectiveConfigure: e.target.checked }))}
-                />
-                Show Perspective Configure Button
-                <span className="phase" style={{ marginLeft: "auto" }}>Toggle visibility of Perspective's built-in settings button</span>
-              </label>
-              <label style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: 8, fontSize: "0.85rem", cursor: "pointer" }}>
-                <input type="checkbox" checked={settings.showVisualization}
-                  onChange={(e) => setSettings((s) => ({ ...s, showVisualization: e.target.checked }))}
-                />
-                Show Visualization
-                <span className="phase" style={{ marginLeft: "auto" }}>Show Visualize Data button and chart controls in workspace</span>
-              </label>
-              <div style={{ fontSize: "0.84rem", color: "var(--text-soft)", padding: "6px 0", borderTop: "1px solid var(--border)" }}>
-                Memory guard threshold: 85% (read-only, configured in backend)
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button type="button" onClick={() => {
-                setSettings({ ...DEFAULT_SETTINGS });
-                setEditorFontSize(DEFAULT_SETTINGS.editorFontSize);
-                workspaceEditorRef.current?.updateOptions({ fontSize: DEFAULT_SETTINGS.editorFontSize });
-              }}>
-                Reset to Defaults
-              </button>
-              <button type="button" onClick={() => setSettingsOpen(false)}>
-                Close
-              </button>
-            </div>
-          </section>
-        </div>
-      ) : null}
+      <SettingsModal
+        open={settingsOpen}
+        settings={settings}
+        onSettingsChange={setSettings}
+        onClose={() => setSettingsOpen(false)}
+        onEditorFontSizeChange={setEditorFontSize}
+        editorRef={workspaceEditorRef}
+      />
 
-      {aboutOpen ? (
-        <div className="modal-backdrop" role="presentation" onClick={() => setAboutOpen(false)}>
-          <section
-            className="modal-card"
-            role="dialog"
-            aria-modal="true"
-            aria-label="About Parq-Bench"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <h3>Parq-Bench</h3>
-            <span className="beta-badge" style={{ marginBottom: 12, alignSelf: "flex-start" }}>{PRODUCT_STAGE_LABEL} v0.3.0</span>
-            <p style={{ margin: "8px 0", lineHeight: 1.5 }}>
-              A high-performance desktop application for exploring and querying Parquet and CSV files locally.
-              No cloud, no accounts, no telemetry — all processing happens on your machine.
-            </p>
-            <p style={{ margin: "8px 0", lineHeight: 1.5, color: "var(--text-soft)" }}>
-              Built by{" "}
-              <a
-                href="#"
-                onClick={(e) => { e.preventDefault(); void openUrl("https://www.keepitsimpleanalytics.com/"); }}
-                style={{ color: "var(--accent)" }}
-              >
-                KISA — Keep it Simple Analytics
-              </a>
-            </p>
-            <div style={{ margin: "8px 0", fontSize: "0.82rem", color: "var(--text-soft)" }}>
-              <strong style={{ fontSize: "0.84rem" }}>Tech Stack</strong>
-              <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "2px 12px", marginTop: 4 }}>
-                <span>Tauri</span><span>v2</span>
-                <span>DuckDB</span><span>{result?.duckdb_version ?? "—"}</span>
-                <span>React</span><span>19</span>
-                <span>Perspective</span><span>Streaming analytics</span>
-                <span>Monaco</span><span>SQL editor</span>
-              </div>
-            </div>
-            <div style={{ margin: "8px 0", fontSize: "0.82rem", color: "var(--text-soft)" }}>
-              <strong style={{ fontSize: "0.84rem" }}>Keyboard Shortcuts</strong>
-              <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "2px 12px", marginTop: 4 }}>
-                <kbd className="shortcut-hint" style={{ fontSize: "0.78rem" }}>Ctrl+O</kbd><span>Open Parquet file</span>
-                <kbd className="shortcut-hint" style={{ fontSize: "0.78rem" }}>Ctrl+1</kbd><span>Preview tab</span>
-                <kbd className="shortcut-hint" style={{ fontSize: "0.78rem" }}>Ctrl+2</kbd><span>SQL Workspace tab</span>
-                <kbd className="shortcut-hint" style={{ fontSize: "0.78rem" }}>Ctrl+Enter</kbd><span>Run SQL query</span>
-                <kbd className="shortcut-hint" style={{ fontSize: "0.78rem" }}>Ctrl+Shift+Enter</kbd><span>Explain Analyze</span>
-                <kbd className="shortcut-hint" style={{ fontSize: "0.78rem" }}>Ctrl+Shift+E</kbd><span>Export query as CSV</span>
-                <kbd className="shortcut-hint" style={{ fontSize: "0.78rem" }}>Ctrl+,</kbd><span>Settings</span>
-                <kbd className="shortcut-hint" style={{ fontSize: "0.78rem" }}>Esc</kbd><span>Close modal / exit fullscreen</span>
-              </div>
-            </div>
-            <p style={{ margin: "8px 0", fontSize: "0.84rem", color: "var(--text-soft)" }}>
-              Licensed under{" "}
-              <a href="#" onClick={(e) => { e.preventDefault(); void openUrl("https://github.com/KeepitSimpleAnalytics/parq_bench/blob/main/LICENSE"); }} style={{ color: "var(--accent)" }}>GPLv3</a>.
-              {" "}We believe great tools should be open and accessible to everyone.
-            </p>
-            <p style={{ margin: "4px 0", fontSize: "0.82rem" }}>
-              <a href="#" onClick={(e) => { e.preventDefault(); void openUrl("https://github.com/KeepitSimpleAnalytics/parq_bench"); }} style={{ color: "var(--accent)" }}>
-                GitHub Repository
-              </a>
-              {" — "}
-              <a href="#" onClick={(e) => { e.preventDefault(); void openUrl("https://github.com/KeepitSimpleAnalytics/parq_bench/issues"); }} style={{ color: "var(--accent)" }}>
-                Report an Issue
-              </a>
-            </p>
-            <div className="modal-actions">
-              <button type="button" onClick={() => setAboutOpen(false)}>
-                Close
-              </button>
-            </div>
-          </section>
-        </div>
-      ) : null}
+      <AboutModal
+        open={aboutOpen}
+        onClose={() => setAboutOpen(false)}
+        duckdbVersion={result?.duckdb_version ?? null}
+      />
     </main>
   );
 }
