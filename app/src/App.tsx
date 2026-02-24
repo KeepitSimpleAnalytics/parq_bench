@@ -354,6 +354,12 @@ function App() {
       } catch (_) { /* clipboard unavailable */ }
     };
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, pasteFromClipboard);
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => {
+      void runWorkspaceQuery();
+    });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => {
+      void runExplainAnalyze();
+    });
     editor.addAction({
       id: "tauri-paste",
       label: "Paste",
@@ -1356,7 +1362,7 @@ function App() {
           />
         </div>
         <div className="workspace-editor-controls">
-          <button type="button" onClick={() => void runWorkspaceQuery()} disabled={loading}>
+          <button type="button" className="run-sql-btn" onClick={() => void runWorkspaceQuery()} disabled={loading}>
             Run SQL<kbd className="shortcut-hint">Ctrl+Enter</kbd>
           </button>
           <button type="button" onClick={() => void runExplainAnalyze()} disabled={loading || explainLoading}>
