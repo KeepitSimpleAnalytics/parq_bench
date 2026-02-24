@@ -3,7 +3,6 @@ import Editor, { loader, type OnMount } from "@monaco-editor/react";
 import * as monacoEditor from "monaco-editor";
 loader.config({ monaco: monacoEditor });
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { tableFromIPC } from "apache-arrow";
@@ -21,8 +20,6 @@ import type {
   WorkspaceSchemaByAlias,
   WorkspaceQueryResponse,
   WorkspaceChartPlugin,
-  WorkspaceSchemaDiffResponse,
-  WorkspaceExportResponse,
   ExportPayload,
   ThemeMode,
   ActiveTab,
@@ -53,7 +50,6 @@ import {
   readSettings,
   sqlIdentifierInsertText,
   isNumericDuckType,
-  coerceWorkspaceCell,
   escapeCsvCell,
   waitForNextPaint,
 } from "./utils";
@@ -67,6 +63,8 @@ import { QueryHistoryDropdown } from "./components/QueryHistoryDropdown";
 import { VirtualScrollGrid } from "./components/VirtualScrollGrid";
 import { SqlResultsTable } from "./components/SqlResultsTable";
 import { usePerspective } from "./hooks/usePerspective";
+import { useWorkspace } from "./hooks/useWorkspace";
+import { useDragDrop } from "./hooks/useDragDrop";
 import { WorkspaceTableRegistry } from "./components/WorkspaceTableRegistry";
 
 
@@ -102,14 +100,6 @@ function App() {
   settingsRef.current = settings;
   const [editorFontSize, setEditorFontSize] = useState(() => settings.editorFontSize);
   const [workspaceQueryResult, setWorkspaceQueryResult] = useState<WorkspaceQueryResponse | null>(null);
-  const [workspaceChartPlugin, setWorkspaceChartPlugin] = useState<WorkspaceChartPlugin>("Datagrid");
-  const [workspaceChartX, setWorkspaceChartX] = useState("");
-  const [workspaceChartY, setWorkspaceChartY] = useState("");
-  const [workspaceChartAgg, setWorkspaceChartAgg] = useState("sum");
-  const [workspaceDiffLeftAlias, setWorkspaceDiffLeftAlias] = useState("");
-  const [workspaceDiffRightAlias, setWorkspaceDiffRightAlias] = useState("");
-  const [workspaceSchemaDiff, setWorkspaceSchemaDiff] = useState<WorkspaceSchemaDiffResponse | null>(null);
-  const [workspaceExport, setWorkspaceExport] = useState<WorkspaceExportResponse | null>(null);
   const [aboutOpen, setAboutOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [recentFiles, setRecentFiles] = useState<string[]>(() => readRecentFiles());
@@ -117,7 +107,6 @@ function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [explainPlan, setExplainPlan] = useState<string | null>(null);
   const [explainLoading, setExplainLoading] = useState(false);
-  const [dragOverZone, setDragOverZone] = useState<"preview" | "sql" | null>(null);
   const [expandedPanel, setExpandedPanel] = useState<"preview-table" | "perspective" | "sql-results" | null>(null);
 
   // Virtual scroll hook
@@ -153,6 +142,30 @@ function App() {
   useLocalStorageSync(UI_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
   useLocalStorageSync(UI_WORKSPACE_SLOW_MODE_STORAGE_KEY, workspaceSlowModeEnabled ? "1" : "0");
 
+  // Workspace chart/diff/export hook
+  const {
+    workspaceChartPlugin, setWorkspaceChartPlugin,
+    workspaceChartX, setWorkspaceChartX,
+    workspaceChartY, setWorkspaceChartY,
+    workspaceChartAgg, setWorkspaceChartAgg,
+    workspaceDiffLeftAlias, setWorkspaceDiffLeftAlias,
+    workspaceDiffRightAlias, setWorkspaceDiffRightAlias,
+    workspaceSchemaDiff,
+    workspaceExport,
+    runWorkspaceSchemaDiff,
+    exportWorkspaceQuery,
+    visualizeWorkspaceChart,
+  } = useWorkspace({
+    workspaceTables, workspaceQueryResult, readWorkspaceSql,
+    loadPerspectiveDataset, setLoading, setError,
+  });
+
+  // Drag-and-drop hook
+  const { dragOverZone } = useDragDrop({
+    activeTab, previewPaneRef, sqlPaneRef,
+    onPreviewDrop: (paths) => void handlePreviewDrop(paths),
+    onSqlDrop: (paths) => void handleSqlDrop(paths),
+  });
 
   function buildFailedGateReport(
     filePath: string,
@@ -249,71 +262,6 @@ function App() {
     }
   }
 
-  async function runWorkspaceSchemaDiff() {
-    if (!workspaceDiffLeftAlias || !workspaceDiffRightAlias) {
-      setError("Select two workspace aliases before running schema diff.");
-      return;
-    }
-    if (workspaceDiffLeftAlias === workspaceDiffRightAlias) {
-      setError("Select two different workspace aliases for schema diff.");
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await invoke<WorkspaceSchemaDiffResponse>("diff_workspace_schema", {
-        leftAlias: workspaceDiffLeftAlias,
-        rightAlias: workspaceDiffRightAlias,
-      });
-      setWorkspaceSchemaDiff(result);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function exportWorkspaceQuery(format: "csv" | "parquet") {
-    const sqlText = readWorkspaceSql();
-    if (!sqlText.trim()) {
-      setError("Workspace SQL query is required before export.");
-      return;
-    }
-
-    const nowIso = new Date().toISOString().replace(/[:.]/g, "-");
-    const selected = await save({
-      title: `Export Workspace Query (${format.toUpperCase()})`,
-      defaultPath: `workspace_query_${nowIso}.${format}`,
-      filters: [
-        {
-          name: format.toUpperCase(),
-          extensions: [format],
-        },
-      ],
-    });
-    if (!selected) {
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await invoke<WorkspaceExportResponse>("export_workspace_query", {
-        sql: sqlText,
-        outputPath: selected,
-        format,
-        queryText: sqlText,
-        tableAliases: workspaceTables.map((t) => t.alias),
-      });
-      setWorkspaceExport(result);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
-    }
-  }
-
   async function runWorkspaceQuery() {
     const sqlText = readWorkspaceSql();
     if (!sqlText.trim()) {
@@ -385,39 +333,6 @@ function App() {
     } finally {
       setExplainLoading(false);
     }
-  }
-
-  async function visualizeWorkspaceChart() {
-    if (!workspaceQueryResult || workspaceQueryResult.rows.length === 0) {
-      setError("Run a workspace query with rows before charting.");
-      return;
-    }
-
-    const dataset = workspaceQueryResult.rows.map((row) => {
-      const item: Record<string, string | number | null> = {};
-      workspaceQueryResult.schema.forEach((column, index) => {
-        item[column.name] = coerceWorkspaceCell(row[index] ?? null, column.duckdb_type);
-      });
-      return item;
-    });
-
-    let restoreConfig: Record<string, unknown> = { plugin: workspaceChartPlugin };
-    if (workspaceChartPlugin !== "Datagrid") {
-      if (!workspaceChartX || !workspaceChartY) {
-        setError("Select X and Y columns for chart visualization.");
-        return;
-      }
-      restoreConfig = {
-        plugin: workspaceChartPlugin,
-        group_by: [workspaceChartX],
-        columns: [workspaceChartY],
-        aggregates: {
-          [workspaceChartY]: workspaceChartAgg,
-        },
-      };
-    }
-
-    await loadPerspectiveDataset(dataset, restoreConfig, { context: "workspace" });
   }
 
   const onWorkspaceEditorMount: OnMount = (editor, monaco) => {
@@ -818,45 +733,6 @@ function App() {
     };
   }, [workspaceEditorReady, workspaceQueryResult, workspaceTableSchemas, workspaceTables]);
 
-  useEffect(() => {
-    const columns = workspaceQueryResult?.schema ?? [];
-    const numericColumns = columns.filter((column) => isNumericDuckType(column.duckdb_type));
-
-    if (columns.length === 0) {
-      setWorkspaceChartX("");
-      setWorkspaceChartY("");
-      return;
-    }
-
-    const firstColumn = columns[0]?.name ?? "";
-    const firstNumeric = numericColumns[0]?.name ?? firstColumn;
-
-    setWorkspaceChartX((prev) =>
-      prev && columns.some((column) => column.name === prev) ? prev : firstColumn,
-    );
-    setWorkspaceChartY((prev) =>
-      prev && columns.some((column) => column.name === prev) ? prev : firstNumeric,
-    );
-  }, [workspaceQueryResult]);
-
-  useEffect(() => {
-    if (workspaceTables.length < 2) {
-      setWorkspaceDiffLeftAlias(workspaceTables[0]?.alias ?? "");
-      setWorkspaceDiffRightAlias("");
-      setWorkspaceSchemaDiff(null);
-      return;
-    }
-
-    const aliases = workspaceTables.map((table) => table.alias);
-    const defaultLeft = aliases[0] ?? "";
-    const defaultRight = aliases[1] ?? aliases[0] ?? "";
-
-    setWorkspaceDiffLeftAlias((prev) => (aliases.includes(prev) ? prev : defaultLeft));
-    setWorkspaceDiffRightAlias((prev) =>
-      aliases.includes(prev) && prev !== (workspaceDiffLeftAlias || defaultLeft) ? prev : defaultRight,
-    );
-  }, [workspaceTables, workspaceDiffLeftAlias]);
-
   async function runSmokeQuery() {
     const response = await invoke<SmokeQueryResponse>("duckdb_smoke_query");
     setResult(response);
@@ -983,58 +859,6 @@ function App() {
       }
     })();
   }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-    const unlisten = getCurrentWebview().onDragDropEvent((event) => {
-      if (cancelled) return;
-      const payload = event.payload;
-      if (payload.type === "over") {
-        const pos = payload.position;
-        const previewRect = previewPaneRef.current?.getBoundingClientRect();
-        const sqlRect = sqlPaneRef.current?.getBoundingClientRect();
-        if (
-          previewRect &&
-          activeTab === "preview" &&
-          pos.x >= previewRect.left &&
-          pos.x <= previewRect.right &&
-          pos.y >= previewRect.top &&
-          pos.y <= previewRect.bottom
-        ) {
-          setDragOverZone("preview");
-        } else if (
-          sqlRect &&
-          activeTab === "sql" &&
-          pos.x >= sqlRect.left &&
-          pos.x <= sqlRect.right &&
-          pos.y >= sqlRect.top &&
-          pos.y <= sqlRect.bottom
-        ) {
-          setDragOverZone("sql");
-        } else {
-          setDragOverZone(activeTab);
-        }
-      } else if (payload.type === "leave") {
-        setDragOverZone(null);
-      } else if (payload.type === "drop") {
-        const zone = dragOverZone ?? activeTab;
-        setDragOverZone(null);
-        const paths = payload.paths;
-        if (!paths || paths.length === 0) return;
-        if (zone === "preview") {
-          void handlePreviewDrop(paths);
-        } else {
-          void handleSqlDrop(paths);
-        }
-      }
-    });
-
-    return () => {
-      cancelled = true;
-      unlisten.then((fn) => fn());
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, dragOverZone]);
 
   async function handlePreviewDrop(paths: string[]) {
     const parquetPaths = paths.filter((p) => p.toLowerCase().endsWith(".parquet"));
