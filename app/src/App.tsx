@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Editor, { loader, type OnMount } from "@monaco-editor/react";
 import * as monacoEditor from "monaco-editor";
 loader.config({ monaco: monacoEditor });
@@ -14,10 +14,8 @@ import "./App.css";
 import type {
   SmokeQueryResponse,
   ArrowRow,
-  RuntimeHealth,
   PreviewColumn,
   PreviewResponse,
-  ParquetRowsTransport,
   ViewMode,
   PerspectiveStatus,
   PerspectiveContext,
@@ -31,7 +29,6 @@ import type {
   WorkspaceExportResponse,
   ExportPayload,
   ThemeMode,
-  ResolvedTheme,
   ActiveTab,
   QueryHistoryEntry,
   AppSettings,
@@ -40,33 +37,27 @@ import type {
 import {
   PAGE_SIZE,
   ROW_HEIGHT,
-  COLUMN_WIDTH,
   FIRST_VIEWPORT_TARGET_MS,
   PERSPECTIVE_READY_TARGET_MS,
   ACCEPTANCE_GATE_TIMEOUT_MS,
-  UI_THEME_STORAGE_KEY,
-  UI_WORKSPACE_SLOW_MODE_STORAGE_KEY,
   UI_ACTIVE_TAB_STORAGE_KEY,
   UI_RECENT_FILES_STORAGE_KEY,
   UI_QUERY_HISTORY_STORAGE_KEY,
   UI_SETTINGS_STORAGE_KEY,
+  UI_WORKSPACE_SLOW_MODE_STORAGE_KEY,
   RECENT_FILES_MAX,
   QUERY_HISTORY_MAX,
   DEFAULT_SETTINGS,
   INTERNAL_TOOLS_ENABLED,
   PRODUCT_STAGE_LABEL,
-  MIN_VIEWPORT_HEIGHT,
-  OVERSCAN,
 } from "./constants";
 import {
   detectSourceKind,
   readActiveTab,
-  readThemeMode,
   readWorkspaceSlowModeEnabled,
   readRecentFiles,
   readQueryHistory,
   readSettings,
-  resolveThemeMode,
   formatWorkspaceDelimiter,
   appendGlobPattern,
   sqlIdentifierInsertText,
@@ -78,25 +69,23 @@ import {
   waitForNextPaint,
   sleepMs,
 } from "./utils";
+import { useTheme } from "./hooks/useTheme";
+import { useLocalStorageSync } from "./hooks/useLocalStorageSync";
+import { useRuntimeHealth } from "./hooks/useRuntimeHealth";
+import { useVirtualScroll } from "./hooks/useVirtualScroll";
 
 
 
 function App() {
-  const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
-  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>(() => resolveThemeMode(readThemeMode()));
-  const [activeTab, setActiveTab] = useState<ActiveTab>(() => readActiveTab());
+  // Extracted hooks
+  const { themeMode, resolvedTheme, setThemeMode } = useTheme();
+  const { runtimeHealth, memoryGuardActive, memoryGuardRef, refreshRuntimeHealth } = useRuntimeHealth();
 
+  const [activeTab, setActiveTab] = useState<ActiveTab>(() => readActiveTab());
   const [result, setResult] = useState<SmokeQueryResponse | null>(null);
   const [, setArrowRows] = useState<ArrowRow[]>([]);
   const [, setArrowBytes] = useState(0);
-  const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth | null>(null);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
-  const [loadedRows, setLoadedRows] = useState<Map<number, Array<string | null>>>(new Map());
-  const [loadedPages, setLoadedPages] = useState<Set<number>>(new Set());
-  const [inFlightPages, setInFlightPages] = useState<Set<number>>(new Set());
-  const [scrollTop, setScrollTop] = useState(0);
-  const [scrollLeft, setScrollLeft] = useState(0);
-  const [viewportHeight, setViewportHeight] = useState(520);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("virtual");
@@ -153,11 +142,18 @@ function App() {
   const [editingAlias, setEditingAlias] = useState<string | null>(null);
   const [editingAliasValue, setEditingAliasValue] = useState("");
   const [expandedPanel, setExpandedPanel] = useState<"preview-table" | "perspective" | "sql-results" | null>(null);
+
+  // Virtual scroll hook
+  const {
+    loadedRows, scrollLeft, setScrollTop, setScrollLeft,
+    viewportHeight, visibleIndices, totalRows, gridContentWidth,
+    columnGridTemplate, resetScroll, setInitialPage, setInFlightPages,
+  } = useVirtualScroll({ preview, memoryGuardRef, onError: setError });
+
   const previewPaneRef = useRef<HTMLDivElement | null>(null);
   const sqlPaneRef = useRef<HTMLDivElement | null>(null);
   const perspectiveViewerRef = useRef<HTMLElement | null>(null);
   const perspectiveTableRef = useRef<{ delete?: () => Promise<void> | void } | null>(null);
-  const memoryGuardRef = useRef(false);
   const openStartRef = useRef<number | null>(null);
   const perspectiveStatusRef = useRef<PerspectiveStatus>("idle");
   const perspectiveErrorRef = useRef<string | null>(null);
@@ -169,6 +165,13 @@ function App() {
   const workspaceEditorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const workspaceMonacoRef = useRef<typeof Monaco | null>(null);
   const workspaceCompletionRef = useRef<Monaco.IDisposable | null>(null);
+
+  // localStorage sync for simple values
+  useLocalStorageSync(UI_ACTIVE_TAB_STORAGE_KEY, activeTab);
+  useLocalStorageSync(UI_RECENT_FILES_STORAGE_KEY, JSON.stringify(recentFiles));
+  useLocalStorageSync(UI_QUERY_HISTORY_STORAGE_KEY, JSON.stringify(queryHistory));
+  useLocalStorageSync(UI_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  useLocalStorageSync(UI_WORKSPACE_SLOW_MODE_STORAGE_KEY, workspaceSlowModeEnabled ? "1" : "0");
 
 
   function buildFailedGateReport(
@@ -779,15 +782,7 @@ function App() {
     setPerspectiveStage("idle");
     setPerspectiveError(null);
     setPerspectiveLoadedForFile(null);
-    setScrollTop(0);
-    setScrollLeft(0);
-    setLoadedPages(new Set([0]));
-    setInFlightPages(new Set());
-    setLoadedRows(() => {
-      const next = new Map<number, Array<string | null>>();
-      data.rows.forEach((row, idx) => next.set(data.row_offset + idx, row));
-      return next;
-    });
+    setInitialPage(data);
 
     await waitForNextPaint();
     const elapsed = openStartRef.current === null ? 0 : performance.now() - openStartRef.current;
@@ -821,11 +816,6 @@ function App() {
     return { status: "timeout", readyMs: perspectiveReadyMsRef.current, error: "Perspective timeout" };
   }
 
-  async function refreshRuntimeHealth() {
-    const health = await invoke<RuntimeHealth>("runtime_health");
-    setRuntimeHealth(health);
-    memoryGuardRef.current = health.memory_guard_tripped;
-  }
 
   function buildExportPayload(exportedAt: string): ExportPayload {
     return {
@@ -1029,41 +1019,6 @@ function App() {
     }
   }
 
-  useEffect(() => {
-    const updateViewportHeight = () => {
-      setViewportHeight(Math.max(MIN_VIEWPORT_HEIGHT, Math.floor(window.innerHeight * 0.62)));
-    };
-
-    updateViewportHeight();
-    window.addEventListener("resize", updateViewportHeight);
-    return () => window.removeEventListener("resize", updateViewportHeight);
-  }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const poll = async () => {
-      try {
-        const health = await invoke<RuntimeHealth>("runtime_health");
-        if (!cancelled) {
-          setRuntimeHealth(health);
-          memoryGuardRef.current = health.memory_guard_tripped;
-        }
-      } catch {
-        // runtime health polling is best-effort
-      }
-    };
-
-    void poll();
-    const id = window.setInterval(() => {
-      void poll();
-    }, 1500);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(id);
-    };
-  }, []);
 
   useEffect(() => {
     perspectiveStatusRef.current = perspectiveStatus;
@@ -1276,102 +1231,7 @@ function App() {
     setArrowRows(rows);
   }
 
-  async function readSocketPayload(url: string): Promise<Uint8Array> {
-    return new Promise<Uint8Array>((resolve, reject) => {
-      const chunks: Uint8Array[] = [];
-      let totalBytes = 0;
-      const ws = new WebSocket(url);
-      ws.binaryType = "arraybuffer";
 
-      ws.onmessage = (event) => {
-        if (typeof event.data === "string") {
-          return;
-        }
-
-        if (event.data instanceof ArrayBuffer) {
-          const chunk = new Uint8Array(event.data);
-          chunks.push(chunk);
-          totalBytes += chunk.byteLength;
-        }
-      };
-
-      ws.onerror = () => reject(new Error("Socket page stream failed"));
-      ws.onclose = () => {
-        const merged = new Uint8Array(totalBytes);
-        let offset = 0;
-        for (const chunk of chunks) {
-          merged.set(chunk, offset);
-          offset += chunk.byteLength;
-        }
-        resolve(merged);
-      };
-    });
-  }
-
-  const setRowsAtOffset = useCallback((rowOffset: number, rows: Array<Array<string | null>>) => {
-    setLoadedRows((prev) => {
-      const next = new Map(prev);
-      rows.forEach((row, idx) => next.set(rowOffset + idx, row));
-      return next;
-    });
-  }, []);
-
-  const fetchPage = useCallback(
-    async (pageIndex: number) => {
-      if (memoryGuardRef.current) {
-        return;
-      }
-      if (!preview || loadedPages.has(pageIndex) || inFlightPages.has(pageIndex)) {
-        return;
-      }
-
-      setInFlightPages((prev) => new Set(prev).add(pageIndex));
-      try {
-        const rowOffset = pageIndex * PAGE_SIZE;
-        const page = await invoke<ParquetRowsTransport>("fetch_parquet_rows_transport", {
-          filePath: preview.file_path,
-          rowOffset,
-          rowLimit: PAGE_SIZE,
-        });
-
-        let payloadBytes: Uint8Array;
-        if (page.mode === "ipc") {
-          if (!page.ipc_payload) {
-            throw new Error("Missing IPC payload for parquet page transport.");
-          }
-          payloadBytes = Uint8Array.from(page.ipc_payload);
-        } else {
-          if (!page.socket_url) {
-            throw new Error("Missing socket URL for parquet page transport.");
-          }
-          payloadBytes = await readSocketPayload(page.socket_url);
-        }
-
-        const table = tableFromIPC(payloadBytes);
-        const rows = Array.from(table).map((record) =>
-          preview.schema.map((col) => {
-            const value = (record as Record<string, unknown>)[col.name];
-            return value === null || value === undefined ? null : String(value);
-          }),
-        );
-
-        if (memoryGuardRef.current) {
-          return;
-        }
-        setRowsAtOffset(page.row_offset, rows);
-        setLoadedPages((prev) => new Set(prev).add(pageIndex));
-      } catch (err) {
-        setError(String(err));
-      } finally {
-        setInFlightPages((prev) => {
-          const next = new Set(prev);
-          next.delete(pageIndex);
-          return next;
-        });
-      }
-    },
-    [inFlightPages, loadedPages, preview, setRowsAtOffset],
-  );
 
   async function openParquetPreview() {
     await refreshRuntimeHealth();
@@ -1449,44 +1309,11 @@ function App() {
     }
   }
 
-  const totalRows = preview?.total_rows ?? 0;
   const canExportResults = true;
-  const memoryGuardActive = runtimeHealth?.memory_guard_tripped ?? false;
   const workspaceColumns = workspaceQueryResult?.schema ?? [];
   const workspaceNumericColumns = workspaceColumns.filter((column) =>
     isNumericDuckType(column.duckdb_type),
   );
-  const gridContentWidth = preview ? preview.schema.length * COLUMN_WIDTH : 0;
-  const columnGridTemplate = preview ? `repeat(${preview.schema.length}, ${COLUMN_WIDTH}px)` : "";
-  const visibleStart = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
-  const visibleCount = Math.ceil(viewportHeight / ROW_HEIGHT) + OVERSCAN * 2;
-  const visibleEnd = Math.max(
-    visibleStart,
-    Math.min(totalRows - 1, visibleStart + visibleCount - 1),
-  );
-
-  const visibleIndices = useMemo(() => {
-    const rows: number[] = [];
-    for (let idx = visibleStart; idx <= visibleEnd; idx += 1) {
-      rows.push(idx);
-    }
-    return rows;
-  }, [visibleEnd, visibleStart]);
-
-  useEffect(() => {
-    if (!preview || totalRows === 0) {
-      return;
-    }
-
-    const firstPage = Math.floor(visibleStart / PAGE_SIZE);
-    const lastPage = Math.floor(visibleEnd / PAGE_SIZE);
-
-    for (let page = firstPage; page <= lastPage; page += 1) {
-      if (!loadedPages.has(page) && !inFlightPages.has(page)) {
-        void fetchPage(page);
-      }
-    }
-  }, [fetchPage, inFlightPages, loadedPages, preview, totalRows, visibleEnd, visibleStart]);
 
   useEffect(() => {
     if (runtimeHealth?.memory_guard_tripped) {
@@ -1548,47 +1375,10 @@ function App() {
   }, []);
 
   useEffect(() => {
-    window.localStorage.setItem(UI_THEME_STORAGE_KEY, themeMode);
-    if (themeMode === "light" || themeMode === "dark") {
-      setResolvedTheme(themeMode);
-      return;
-    }
-    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
-    const applySystemTheme = () => setResolvedTheme(mediaQuery.matches ? "dark" : "light");
-    applySystemTheme();
-    mediaQuery.addEventListener("change", applySystemTheme);
-    return () => mediaQuery.removeEventListener("change", applySystemTheme);
-  }, [themeMode]);
-
-  useEffect(() => {
-    document.documentElement.setAttribute("data-theme", resolvedTheme);
-  }, [resolvedTheme]);
-
-  useEffect(() => {
-    window.localStorage.setItem(UI_WORKSPACE_SLOW_MODE_STORAGE_KEY, workspaceSlowModeEnabled ? "1" : "0");
-  }, [workspaceSlowModeEnabled]);
-
-  useEffect(() => {
     if (!workspaceSlowModeEnabled) {
       setWorkspaceDelimiterInput("");
     }
   }, [workspaceSlowModeEnabled]);
-
-  useEffect(() => {
-    window.localStorage.setItem(UI_ACTIVE_TAB_STORAGE_KEY, activeTab);
-  }, [activeTab]);
-
-  useEffect(() => {
-    window.localStorage.setItem(UI_RECENT_FILES_STORAGE_KEY, JSON.stringify(recentFiles));
-  }, [recentFiles]);
-
-  useEffect(() => {
-    window.localStorage.setItem(UI_QUERY_HISTORY_STORAGE_KEY, JSON.stringify(queryHistory));
-  }, [queryHistory]);
-
-  useEffect(() => {
-    window.localStorage.setItem(UI_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-  }, [settings]);
 
   // Hide/show Perspective's built-in configure (settings) button via shadow DOM style injection
   // Only runs after Perspective has fully loaded to avoid layout interference
@@ -1916,11 +1706,7 @@ function App() {
               setPerspectiveLoadedForFile(null);
               setFirstViewportMs(null);
               setPerspectiveReadyMs(null);
-              setLoadedRows(new Map());
-              setLoadedPages(new Set());
-              setInFlightPages(new Set());
-              setScrollTop(0);
-              setScrollLeft(0);
+              resetScroll();
               setAcceptanceGate(null);
             }}>
               Close File
