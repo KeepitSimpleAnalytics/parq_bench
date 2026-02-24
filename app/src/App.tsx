@@ -11,359 +11,75 @@ import { tableFromIPC } from "apache-arrow";
 import type * as Monaco from "monaco-editor";
 import "./App.css";
 
-const PAGE_SIZE = 256;
-const ROW_HEIGHT = 30;
-const MIN_VIEWPORT_HEIGHT = 320;
-const OVERSCAN = 8;
-const COLUMN_WIDTH = 180;
-const FIRST_VIEWPORT_TARGET_MS = 500;
-const PERSPECTIVE_READY_TARGET_MS = 3000;
-const ACCEPTANCE_GATE_TIMEOUT_MS = 15000;
-const PERSPECTIVE_RESTORE_TIMEOUT_DEFAULT_MS = 8000;
-const PERSPECTIVE_RESTORE_TIMEOUT_CHART_MS = 20000;
-
-type SmokeRow = {
-  id: number;
-  label: string;
-};
-
-type SmokeQueryResponse = {
-  duckdb_version: string;
-  rows: SmokeRow[];
-};
-
-type ArrowRow = {
-  id: number;
-  label: string;
-};
-
-
-type BenchmarkResult = {
-  mode: "ipc" | "socket";
-  sizeMb: number;
-  bytes: number;
-  elapsedMs: number;
-  throughputMbps: number;
-};
-
-type RuntimeHealth = {
-  memory_guard_tripped: boolean;
-  process_rss_bytes: number;
-  total_memory_bytes: number;
-  usage_ratio: number;
-  message: string | null;
-};
-
-type PreviewColumn = {
-  name: string;
-  duckdb_type: string;
-};
-
-type PreviewResponse = {
-  file_path: string;
-  file_size_bytes: number;
-  total_rows: number;
-  row_offset: number;
-  row_limit: number;
-  schema: PreviewColumn[];
-  rows: Array<Array<string | null>>;
-};
-
-type ParquetRowsTransport = {
-  mode: "ipc" | "socket";
-  payload_bytes: number;
-  ipc_payload: number[] | null;
-  socket_url: string | null;
-  row_offset: number;
-  row_limit: number;
-  row_count: number;
-};
-
-type ViewMode = "virtual" | "perspective";
-type PerspectiveStatus = "idle" | "loading" | "ready" | "error";
-type PerspectiveContext = "preview" | "workspace";
-type GatePerspectiveStatus = "ready" | "error" | "timeout";
-
-type AcceptanceGateReport = {
-  filePath: string;
-  evaluatedAt: string;
-  firstViewportMs: number | null;
-  perspectiveReadyMs: number | null;
-  firstViewportPass: boolean;
-  perspectivePass: boolean;
-  perspectiveStatus: GatePerspectiveStatus;
-  passed: boolean;
-  details: string;
-};
-
-type PerfSweepSummary = {
-  filePath: string;
-  evaluatedAt: string;
-  runCount: number;
-  completedRuns: number;
-  passCount: number;
-  failCount: number;
-  firstViewportP50: number | null;
-  firstViewportP95: number | null;
-  perspectiveReadyP50: number | null;
-  perspectiveReadyP95: number | null;
-  perspectiveReadySamples: number;
-  runs: AcceptanceGateReport[];
-};
-
-type WorkspaceTableInfo = {
-  alias: string;
-  file_path: string;
-  is_glob: boolean;
-  source_kind: "parquet" | "delimited";
-  delimiter: string | null;
-  file_size_bytes: number | null;
-};
-
-type WorkspaceSchemaByAlias = Record<string, PreviewColumn[]>;
-type WorkspaceSourceKind = "parquet" | "delimited";
-
-const DELIMITED_EXTENSIONS = ["csv", "tsv", "txt", "data"];
-
-function detectSourceKind(filePath: string): WorkspaceSourceKind {
-  const lower = filePath.toLowerCase().replace(/[/\\]+$/, "");
-  // Glob patterns: only detect delimited for explicit extensions (*.csv, *.tsv, etc.)
-  // *.* is ambiguous and defaults to parquet (safest — parquet ignores non-parquet silently)
-  if (lower.includes("*")) {
-    for (const ext of DELIMITED_EXTENSIONS) {
-      if (lower.endsWith(`*.${ext}`)) return "delimited";
-    }
-    return "parquet";
-  }
-  // Single file: check extension
-  const dot = lower.lastIndexOf(".");
-  if (dot !== -1) {
-    const ext = lower.slice(dot + 1);
-    if (DELIMITED_EXTENSIONS.includes(ext)) return "delimited";
-  }
-  return "parquet";
-}
-
-type WorkspaceQueryResponse = {
-  sql: string;
-  row_limit: number;
-  row_count: number;
-  truncated: boolean;
-  elapsed_ms: number;
-  schema: PreviewColumn[];
-  rows: Array<Array<string | null>>;
-};
-
-type WorkspaceChartPlugin = "Datagrid" | "Y Bar" | "X Bar" | "Y Line" | "Treemap";
-
-type WorkspaceSchemaDiffColumn = {
-  name: string;
-  left_type: string | null;
-  right_type: string | null;
-  change: "added" | "removed" | "type_changed" | "unchanged";
-};
-
-type WorkspaceSchemaDiffResponse = {
-  left_alias: string;
-  right_alias: string;
-  added_count: number;
-  removed_count: number;
-  type_changed_count: number;
-  unchanged_count: number;
-  columns: WorkspaceSchemaDiffColumn[];
-};
-
-type WorkspaceExportResponse = {
-  sql: string;
-  format: "csv" | "parquet";
-  output_path: string;
-  file_size_bytes: number;
-  elapsed_ms: number;
-};
-
-type ExportPayload = {
-  exported_at: string;
-  targets: {
-    first_viewport_ms: number;
-    perspective_ready_ms: number;
-  };
-  acceptance_gate: AcceptanceGateReport | null;
-  benchmarks: BenchmarkResult[];
-  latest_view: {
-    file_path: string | null;
-    first_viewport_ms: number | null;
-    perspective_ready_ms: number | null;
-    perspective_status: PerspectiveStatus;
-    perspective_stage: string;
-  };
-  workspace: {
-    table_count: number;
-    tables: WorkspaceTableInfo[];
-    last_query: WorkspaceQueryResponse | null;
-    last_schema_diff: WorkspaceSchemaDiffResponse | null;
-  };
-  perf_sweep: PerfSweepSummary | null;
-};
-
-type ThemeMode = "system" | "light" | "dark";
-type ResolvedTheme = "light" | "dark";
-type ActiveTab = "preview" | "sql";
-
-const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";
-const UI_WORKSPACE_SLOW_MODE_STORAGE_KEY = "parqbench.ui.workspace_slow_mode_enabled";
-const UI_ACTIVE_TAB_STORAGE_KEY = "parqbench.ui.active_tab";
-const UI_RECENT_FILES_STORAGE_KEY = "parqbench.ui.recent_files";
-const UI_QUERY_HISTORY_STORAGE_KEY = "parqbench.ui.query_history";
-const UI_SETTINGS_STORAGE_KEY = "parqbench.ui.settings";
-const RECENT_FILES_MAX = 15;
-const QUERY_HISTORY_MAX = 50;
-
-type QueryHistoryEntry = {
-  sql: string;
-  timestamp: number;
-  rowCount?: number;
-  elapsedMs?: number;
-};
-
-type AppSettings = {
-  sqlRowLimit: number;
-  perspectiveMaxRows: number;
-  editorFontSize: number;
-  expandMode: "fullscreen" | "resize";
-  showPerspectiveConfigure: boolean;
-  showVisualization: boolean;
-};
-
-const DEFAULT_SETTINGS: AppSettings = {
-  sqlRowLimit: 200,
-  perspectiveMaxRows: 5000,
-  editorFontSize: 13,
-  expandMode: "fullscreen",
-  showPerspectiveConfigure: true,
-  showVisualization: true,
-};
-
-type SummarizeRow = Record<string, string>;
-/**
- * Feature flags (compile-time, dead-code eliminated by Vite in production):
- *
- * INTERNAL_TOOLS_ENABLED — gates acceptance gate, perf sweeps, transport
- *   benchmarks, diagnostics panel, runtime metrics, and export buttons.
- *   Always on in dev. In production builds, set the env var
- *   VITE_PARQBENCH_INTERNAL_TOOLS=1 at build time to enable.
- *
- */
-const INTERNAL_TOOLS_ENABLED =
-  import.meta.env.DEV || import.meta.env.VITE_PARQBENCH_INTERNAL_TOOLS === "1";
-const PRODUCT_STAGE_LABEL = "Beta";
+import type {
+  SmokeQueryResponse,
+  ArrowRow,
+  RuntimeHealth,
+  PreviewColumn,
+  PreviewResponse,
+  ParquetRowsTransport,
+  ViewMode,
+  PerspectiveStatus,
+  PerspectiveContext,
+  GatePerspectiveStatus,
+  AcceptanceGateReport,
+  WorkspaceTableInfo,
+  WorkspaceSchemaByAlias,
+  WorkspaceQueryResponse,
+  WorkspaceChartPlugin,
+  WorkspaceSchemaDiffResponse,
+  WorkspaceExportResponse,
+  ExportPayload,
+  ThemeMode,
+  ResolvedTheme,
+  ActiveTab,
+  QueryHistoryEntry,
+  AppSettings,
+  SummarizeRow,
+} from "./types";
+import {
+  PAGE_SIZE,
+  ROW_HEIGHT,
+  COLUMN_WIDTH,
+  FIRST_VIEWPORT_TARGET_MS,
+  PERSPECTIVE_READY_TARGET_MS,
+  ACCEPTANCE_GATE_TIMEOUT_MS,
+  UI_THEME_STORAGE_KEY,
+  UI_WORKSPACE_SLOW_MODE_STORAGE_KEY,
+  UI_ACTIVE_TAB_STORAGE_KEY,
+  UI_RECENT_FILES_STORAGE_KEY,
+  UI_QUERY_HISTORY_STORAGE_KEY,
+  UI_SETTINGS_STORAGE_KEY,
+  RECENT_FILES_MAX,
+  QUERY_HISTORY_MAX,
+  DEFAULT_SETTINGS,
+  INTERNAL_TOOLS_ENABLED,
+  PRODUCT_STAGE_LABEL,
+  MIN_VIEWPORT_HEIGHT,
+  OVERSCAN,
+} from "./constants";
+import {
+  detectSourceKind,
+  readActiveTab,
+  readThemeMode,
+  readWorkspaceSlowModeEnabled,
+  readRecentFiles,
+  readQueryHistory,
+  readSettings,
+  resolveThemeMode,
+  formatWorkspaceDelimiter,
+  appendGlobPattern,
+  sqlIdentifierInsertText,
+  isNumericDuckType,
+  coerceWorkspaceCell,
+  perspectiveRestoreTimeoutMs,
+  escapeCsvCell,
+  withTimeout,
+  waitForNextPaint,
+  sleepMs,
+} from "./utils";
 
 
-
-
-
-function readActiveTab(): ActiveTab {
-  if (typeof window === "undefined") {
-    return "preview";
-  }
-  const value = window.localStorage.getItem(UI_ACTIVE_TAB_STORAGE_KEY);
-  if (value === "preview" || value === "sql") {
-    return value;
-  }
-  return "preview";
-}
-
-function readThemeMode(): ThemeMode {
-  if (typeof window === "undefined") {
-    return "system";
-  }
-  const value = window.localStorage.getItem(UI_THEME_STORAGE_KEY);
-  if (value === "light" || value === "dark" || value === "system") {
-    return value;
-  }
-  return "system";
-}
-
-function readWorkspaceSlowModeEnabled(): boolean {
-  if (typeof window === "undefined") {
-    return false;
-  }
-  return window.localStorage.getItem(UI_WORKSPACE_SLOW_MODE_STORAGE_KEY) === "1";
-}
-
-function readRecentFiles(): string[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(UI_RECENT_FILES_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x: unknown) => typeof x === "string").slice(0, RECENT_FILES_MAX) : [];
-  } catch { return []; }
-}
-
-function readQueryHistory(): QueryHistoryEntry[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = window.localStorage.getItem(UI_QUERY_HISTORY_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.slice(0, QUERY_HISTORY_MAX) : [];
-  } catch { return []; }
-}
-
-function readSettings(): AppSettings {
-  if (typeof window === "undefined") return { ...DEFAULT_SETTINGS };
-  try {
-    const raw = window.localStorage.getItem(UI_SETTINGS_STORAGE_KEY);
-    if (!raw) return { ...DEFAULT_SETTINGS };
-    const parsed = JSON.parse(raw);
-    return {
-      sqlRowLimit: typeof parsed.sqlRowLimit === "number" ? parsed.sqlRowLimit : DEFAULT_SETTINGS.sqlRowLimit,
-      perspectiveMaxRows: typeof parsed.perspectiveMaxRows === "number" ? parsed.perspectiveMaxRows : DEFAULT_SETTINGS.perspectiveMaxRows,
-      editorFontSize: typeof parsed.editorFontSize === "number" ? parsed.editorFontSize : DEFAULT_SETTINGS.editorFontSize,
-      expandMode: parsed.expandMode === "fullscreen" || parsed.expandMode === "resize" ? parsed.expandMode : DEFAULT_SETTINGS.expandMode,
-      showPerspectiveConfigure: typeof parsed.showPerspectiveConfigure === "boolean" ? parsed.showPerspectiveConfigure : DEFAULT_SETTINGS.showPerspectiveConfigure,
-      showVisualization: typeof parsed.showVisualization === "boolean" ? parsed.showVisualization : DEFAULT_SETTINGS.showVisualization,
-    };
-  } catch { return { ...DEFAULT_SETTINGS }; }
-}
-
-function resolveThemeMode(mode: ThemeMode): ResolvedTheme {
-  if (mode === "light" || mode === "dark") {
-    return mode;
-  }
-  if (typeof window !== "undefined" && window.matchMedia("(prefers-color-scheme: dark)").matches) {
-    return "dark";
-  }
-  return "light";
-}
-
-function formatWorkspaceDelimiter(value: string | null): string {
-  if (value === null) {
-    return "auto";
-  }
-  if (value === "\t") {
-    return "\\t";
-  }
-  if (value === "\n") {
-    return "\\n";
-  }
-  if (value === "\r") {
-    return "\\r";
-  }
-  return value;
-}
-
-function appendGlobPattern(folderPath: string, pattern: string): string {
-  const trimmed = folderPath.trim();
-  if (trimmed.length === 0) {
-    return pattern;
-  }
-  if (trimmed.endsWith("\\") || trimmed.endsWith("/")) {
-    return `${trimmed}${pattern}`;
-  }
-  const separator = trimmed.includes("\\") ? "\\" : "/";
-  return `${trimmed}${separator}${pattern}`;
-}
 
 function App() {
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => readThemeMode());
@@ -454,27 +170,6 @@ function App() {
   const workspaceMonacoRef = useRef<typeof Monaco | null>(null);
   const workspaceCompletionRef = useRef<Monaco.IDisposable | null>(null);
 
-  async function withTimeout<T>(label: string, promise: Promise<T>, ms = 8000): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-    });
-    try {
-      return await Promise.race([promise, timeout]);
-    } finally {
-      if (timer) {
-        clearTimeout(timer);
-      }
-    }
-  }
-
-  async function waitForNextPaint() {
-    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
-  }
-
-  async function sleepMs(ms: number) {
-    await new Promise<void>((resolve) => setTimeout(resolve, ms));
-  }
 
   function buildFailedGateReport(
     filePath: string,
@@ -890,49 +585,6 @@ function App() {
     setWorkspaceEditorReady(true);
   };
 
-  function sqlIdentifierInsertText(identifier: string): string {
-    if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
-      return identifier;
-    }
-    return `"${identifier.replace(/"/g, "\"\"")}"`;
-  }
-
-  function isNumericDuckType(duckType: string): boolean {
-    const upper = duckType.toUpperCase();
-    return (
-      upper.includes("INT") ||
-      upper.includes("DECIMAL") ||
-      upper.includes("DOUBLE") ||
-      upper.includes("FLOAT") ||
-      upper.includes("REAL") ||
-      upper.includes("HUGEINT")
-    );
-  }
-
-  function coerceWorkspaceCell(value: string | null, duckType: string): string | number | null {
-    if (value === null) {
-      return null;
-    }
-    if (isNumericDuckType(duckType)) {
-      const numeric = Number(value);
-      return Number.isFinite(numeric) ? numeric : null;
-    }
-    return value;
-  }
-
-  function perspectiveRestoreTimeoutMs(restoreConfig: Record<string, unknown>): number {
-    const plugin = String(restoreConfig.plugin ?? "");
-    if (
-      plugin === "Treemap" ||
-      plugin === "Y Bar" ||
-      plugin === "X Bar" ||
-      plugin === "Y Line" ||
-      plugin === "Line"
-    ) {
-      return PERSPECTIVE_RESTORE_TIMEOUT_CHART_MS;
-    }
-    return PERSPECTIVE_RESTORE_TIMEOUT_DEFAULT_MS;
-  }
 
   async function waitForPerspectiveViewerReady(timeoutMs = 3000): Promise<
     HTMLElement & {
@@ -1199,13 +851,6 @@ function App() {
       },
       perf_sweep: null,
     };
-  }
-
-  function escapeCsvCell(value: string): string {
-    if (value.includes(",") || value.includes("\"") || value.includes("\n")) {
-      return `"${value.replace(/"/g, "\"\"")}"`;
-    }
-    return value;
   }
 
   function buildExportCsv(payload: ExportPayload): string {
