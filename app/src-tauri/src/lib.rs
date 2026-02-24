@@ -6,7 +6,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Write as _};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -185,6 +186,7 @@ struct AppRuntimeState {
     process_rss_bytes: AtomicU64,
     total_memory_bytes: AtomicU64,
     workspace_tables: Mutex<Vec<WorkspaceTableRegistration>>,
+    log_file: Mutex<Option<PathBuf>>,
 }
 
 impl AppRuntimeState {
@@ -194,6 +196,7 @@ impl AppRuntimeState {
             process_rss_bytes: AtomicU64::new(0),
             total_memory_bytes: AtomicU64::new(0),
             workspace_tables: Mutex::new(Vec::new()),
+            log_file: Mutex::new(None),
         }
     }
 }
@@ -227,8 +230,50 @@ fn detect_total_memory_bytes() -> u64 {
     system.total_memory()
 }
 
-fn log_perf(event: &str, details: &str) {
+fn format_timestamp() -> String {
+    let now = std::time::SystemTime::now();
+    let secs = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    // Decompose epoch millis into date/time components (UTC)
+    let total_secs = (secs / 1000) as i64;
+    let millis_part = (secs % 1000) as u32;
+    let days = total_secs.div_euclid(86400);
+    let day_secs = total_secs.rem_euclid(86400);
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    // Civil date from days since 1970-01-01 (algorithm from Howard Hinnant)
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mon = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mon <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mon:02}-{d:02}T{h:02}:{m:02}:{s:02}.{millis_part:03}")
+}
+
+fn log_perf(state: &AppRuntimeState, event: &str, details: &str) {
     eprintln!("event={event} {details}");
+
+    let log_path = match state.log_file.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    if let Some(path) = log_path {
+        let ts = format_timestamp();
+        let line = format!("[{ts}] event={event} {details}\n");
+        let _ = fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(line.as_bytes()));
+    }
 }
 
 fn open_configured_duckdb(state: &AppRuntimeState) -> Result<Connection, String> {
@@ -253,6 +298,7 @@ fn open_configured_duckdb(state: &AppRuntimeState) -> Result<Connection, String>
     .map_err(|e| format!("configure DuckDB pragmas: {e}"))?;
 
     log_perf(
+        state,
         "duckdb_config",
         &format!(
             "threads={} cpu_cores={} memory_limit_mib={} total_memory_bytes={}",
@@ -1124,6 +1170,7 @@ fn duckdb_smoke_query(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect smoke rows: {e}"))?;
         log_perf(
+            &st,
             "duckdb_smoke_query",
             &format!(
                 "duration_ms={} rows={}",
@@ -1168,6 +1215,7 @@ fn arrow_ipc_smoke_batch(state: tauri::State<'_, Arc<AppRuntimeState>>) -> Resul
         .map_err(|e| format!("finish IPC stream: {e}"))?;
     let payload = cursor.into_inner();
     log_perf(
+        state.as_ref(),
         "arrow_ipc_smoke_batch",
         &format!(
             "duration_ms={} payload_bytes={}",
@@ -1188,6 +1236,7 @@ fn arrow_ipc_payload(
     let started = Instant::now();
     let payload = build_arrow_ipc_payload(size_mb)?;
     log_perf(
+        state.as_ref(),
         "arrow_ipc_payload",
         &format!(
             "duration_ms={} size_mb={} payload_bytes={}",
@@ -1223,6 +1272,7 @@ fn preview_parquet(
         let row_limit = row_limit.max(1);
         let rows = parquet_rows_page(conn, &source, &flattened, row_offset, row_limit)?;
         log_perf(
+            &st,
             "preview_parquet",
             &format!(
                 "duration_ms={} file_size_bytes={} schema_cols={} rows={}",
@@ -1263,6 +1313,7 @@ fn fetch_parquet_rows(
         let flattened = flattened_columns_for_source(conn, &source)?;
         let rows = parquet_rows_page(conn, &source, &flattened, row_offset, row_limit.max(1))?;
         log_perf(
+            &st,
             "fetch_parquet_rows",
             &format!(
                 "duration_ms={} row_offset={} row_limit={} rows={}",
@@ -1281,7 +1332,7 @@ fn fetch_parquet_rows(
     })
 }
 
-async fn start_socket_server_for_payload(payload: Vec<u8>) -> Result<SocketServerInfo, String> {
+async fn start_socket_server_for_payload(state: Arc<AppRuntimeState>, payload: Vec<u8>) -> Result<SocketServerInfo, String> {
     let payload_bytes = payload.len();
     let chunk_size = 1024 * 1024;
     let chunk_count = payload_bytes.div_ceil(chunk_size);
@@ -1294,6 +1345,7 @@ async fn start_socket_server_for_payload(payload: Vec<u8>) -> Result<SocketServe
         .port();
     let url = format!("ws://127.0.0.1:{port}");
     log_perf(
+        &state,
         "socket_payload_server_start",
         &format!(
             "url={} payload_bytes={} chunk_count={}",
@@ -1332,6 +1384,7 @@ async fn start_socket_server_for_payload(payload: Vec<u8>) -> Result<SocketServe
             eprintln!("websocket close error: {err}");
         }
         log_perf(
+            &state,
             "socket_payload_server_complete",
             &format!(
                 "duration_ms={} payload_bytes={} chunk_count={}",
@@ -1373,6 +1426,7 @@ async fn fetch_parquet_rows_transport(
 
     if payload_bytes < INLINE_IPC_MAX_BYTES {
         log_perf(
+            state.as_ref(),
             "fetch_parquet_rows_transport",
             &format!(
                 "duration_ms={} mode=ipc row_offset={} row_limit={} row_count={} payload_bytes={}",
@@ -1393,8 +1447,9 @@ async fn fetch_parquet_rows_transport(
             socket_url: None,
         })
     } else {
-        let socket = start_socket_server_for_payload(payload).await?;
+        let socket = start_socket_server_for_payload(state.inner().clone(), payload).await?;
         log_perf(
+            state.as_ref(),
             "fetch_parquet_rows_transport",
             &format!(
                 "duration_ms={} mode=socket row_offset={} row_limit={} row_count={} payload_bytes={}",
@@ -1426,9 +1481,10 @@ async fn start_arrow_socket_server(
     let started = Instant::now();
     let payload = build_arrow_ipc_payload(size_mb)?;
     let payload_bytes = payload.len();
-    let result = start_socket_server_for_payload(payload).await;
+    let result = start_socket_server_for_payload(state.inner().clone(), payload).await;
     if result.is_ok() {
         log_perf(
+            state.as_ref(),
             "start_arrow_socket_server",
             &format!(
                 "duration_ms={} size_mb={} payload_bytes={}",
@@ -1606,6 +1662,7 @@ fn run_workspace_query(
                 .map_err(|e| format!("execute batch: {e}"))?;
             let elapsed_ms = started.elapsed().as_millis();
             log_perf(
+                &st,
                 "run_workspace_query",
                 &format!("duration_ms={} batch_statement=true", elapsed_ms),
             );
@@ -1629,6 +1686,7 @@ fn run_workspace_query(
                 query_rows_with_limit(conn, &trimmed, &schema, safe_limit)?;
             let elapsed_ms = started.elapsed().as_millis();
             log_perf(
+                &st,
                 "run_workspace_query",
                 &format!(
                     "duration_ms={} row_limit={} row_count={} truncated={}",
@@ -1654,6 +1712,7 @@ fn run_workspace_query(
                 .map_err(|e| format!("execute statement: {e}"))?;
             let elapsed_ms = started.elapsed().as_millis();
             log_perf(
+                &st,
                 "run_workspace_query",
                 &format!("duration_ms={} utility_statement=true", elapsed_ms),
             );
@@ -1753,6 +1812,7 @@ fn export_workspace_query(
         let elapsed_ms = started.elapsed().as_millis();
         let normalized_format = format.trim().to_ascii_lowercase();
         log_perf(
+            &st,
             "export_workspace_query",
             &format!(
                 "duration_ms={} format={} output_path={} file_size_bytes={}",
@@ -1883,6 +1943,7 @@ fn summarize_workspace_table(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect summarize rows: {e}"))?;
         log_perf(
+            &st,
             "summarize_workspace_table",
             &format!(
                 "alias={} duration_ms={} rows={}",
@@ -1945,6 +2006,7 @@ fn diff_workspace_schema(
         let diff =
             build_workspace_schema_diff(&left_trimmed, &left_schema, &right_trimmed, &right_schema);
         log_perf(
+            &st,
             "diff_workspace_schema",
             &format!(
                 "left_alias={} right_alias={} added={} removed={} type_changed={} unchanged={}",
@@ -1958,6 +2020,20 @@ fn diff_workspace_schema(
         );
         Ok(diff)
     })
+}
+
+#[tauri::command]
+fn get_log_path(
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<String, String> {
+    let guard = state
+        .log_file
+        .lock()
+        .map_err(|_| "Log file lock poisoned.".to_string())?;
+    match guard.as_ref() {
+        Some(path) => Ok(path.to_string_lossy().to_string()),
+        None => Err("Log file path not initialized.".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1974,6 +2050,7 @@ mod tests {
     use futures_util::StreamExt;
     use std::fs;
     use std::io::ErrorKind;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::runtime::Builder;
 
@@ -2113,7 +2190,8 @@ mod tests {
             .expect("build tokio runtime");
 
         runtime.block_on(async {
-            let server = start_socket_server_for_payload(payload.clone())
+            let state = Arc::new(AppRuntimeState::new());
+            let server = start_socket_server_for_payload(state, payload.clone())
                 .await
                 .expect("start socket payload server");
             assert_eq!(server.payload_bytes, payload.len());
@@ -2519,12 +2597,33 @@ pub fn run() {
         .setup(|app| {
             let state = app.state::<Arc<AppRuntimeState>>().inner().clone();
             spawn_memory_monitor(Arc::clone(&state));
+
+            // Initialize log file path
+            if let Ok(log_dir) = app.path().app_log_dir() {
+                let _ = fs::create_dir_all(&log_dir);
+                let log_path = log_dir.join("parq_bench.log");
+
+                // Rotate if existing log exceeds 5 MB
+                const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+                if let Ok(meta) = fs::metadata(&log_path) {
+                    if meta.len() > MAX_LOG_BYTES {
+                        let backup = log_dir.join("parq_bench.log.1");
+                        let _ = fs::rename(&log_path, &backup);
+                    }
+                }
+
+                if let Ok(mut guard) = state.log_file.lock() {
+                    *guard = Some(log_path);
+                }
+            }
+
             // Warm up: install + load the parquet extension on a throwaway
             // connection so the first real user query doesn't pay the cost.
+            let warmup_state = Arc::clone(&state);
             thread::spawn(move || {
                 if let Ok(conn) = Connection::open_in_memory() {
                     let _ = conn.execute_batch("INSTALL parquet; LOAD parquet;");
-                    log_perf("duckdb_warmup", "parquet extension preloaded");
+                    log_perf(&warmup_state, "duckdb_warmup", "parquet extension preloaded");
                 }
             });
             Ok(())
@@ -2548,7 +2647,8 @@ pub fn run() {
             export_workspace_query,
             explain_workspace_query,
             summarize_workspace_table,
-            diff_workspace_schema
+            diff_workspace_schema,
+            get_log_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
