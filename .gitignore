@@ -30,3 +30,7 @@ systematic-dev/
 
 # Demo / sample data
 sample_data/
+
+# Internal docs (not part of release)
+YOUTUBE_SCRIPT.md
+potential_enhancements.md
