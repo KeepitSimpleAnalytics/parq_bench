@@ -99,6 +99,7 @@ export function readSettings(): AppSettings {
       expandMode: parsed.expandMode === "fullscreen" || parsed.expandMode === "resize" ? parsed.expandMode : DEFAULT_SETTINGS.expandMode,
       showPerspectiveConfigure: typeof parsed.showPerspectiveConfigure === "boolean" ? parsed.showPerspectiveConfigure : DEFAULT_SETTINGS.showPerspectiveConfigure,
       showVisualization: typeof parsed.showVisualization === "boolean" ? parsed.showVisualization : DEFAULT_SETTINGS.showVisualization,
+      deepStats: typeof parsed.deepStats === "boolean" ? parsed.deepStats : DEFAULT_SETTINGS.deepStats,
     };
   } catch { return { ...DEFAULT_SETTINGS }; }
 }
@@ -204,6 +205,61 @@ export async function withTimeout<T>(label: string, promise: Promise<T>, ms = 80
       clearTimeout(timer);
     }
   }
+}
+
+export function friendlyError(raw: string): string {
+  let msg = raw;
+
+  // Strip internal wrapper prefix
+  msg = msg.replace(/^prepare workspace schema query:\s*/i, "");
+
+  // Strip LINE N: ... ^ caret trace (internal SQL pointer noise)
+  msg = msg.replace(/\s*LINE \d+:[\s\S]*\^$/, "").trim();
+
+  // File not found
+  if (/read file metadata:.*No such file/i.test(msg)) {
+    return "File not found. Check that the path is correct.";
+  }
+
+  // Permission denied
+  if (/read file metadata:.*Permission denied/i.test(msg)) {
+    return "Permission denied. Check file permissions.";
+  }
+
+  // Lock poisoned
+  if (/Workspace table lock poisoned/i.test(msg)) {
+    return "Internal error \u2014 please restart Parq-Bench.";
+  }
+
+  // Strip Catalog Error prefix before checking table-not-found
+  msg = msg.replace(/^Catalog Error:\s*/i, "");
+
+  // Table not found
+  const tableMatch = msg.match(/Table with name (\S+) does not exist/i);
+  if (tableMatch) {
+    const name = tableMatch[1];
+    if (name === "my_table") {
+      return "No tables mounted yet. Drop a file onto the SQL panel or use the Register Table form to get started.";
+    }
+    return `Table "${name}" not found. Check the alias name, or mount a file first.`;
+  }
+
+  // Parser / syntax error
+  if (/^Parser Error:/i.test(msg)) {
+    return `SQL syntax error: ${msg.replace(/^Parser Error:\s*/i, "")}`;
+  }
+
+  // Binder Error
+  if (/^Binder Error:/i.test(msg)) {
+    return `Query error: ${msg.replace(/^Binder Error:\s*/i, "")}`;
+  }
+
+  // Conversion / type mismatch
+  if (/^Conversion Error:/i.test(msg) || /type mismatch/i.test(msg)) {
+    return `Type error: ${msg.replace(/^Conversion Error:\s*/i, "")}`;
+  }
+
+  return msg;
 }
 
 export async function waitForNextPaint() {

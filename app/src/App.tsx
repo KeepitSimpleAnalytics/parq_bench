@@ -5,13 +5,11 @@ loader.config({ monaco: monacoEditor });
 import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
-import { tableFromIPC } from "apache-arrow";
 import type * as Monaco from "monaco-editor";
 import "./App.css";
 
 import type {
   SmokeQueryResponse,
-  ArrowRow,
   PreviewColumn,
   PreviewResponse,
   ViewMode,
@@ -39,6 +37,7 @@ import {
   RECENT_FILES_MAX,
   QUERY_HISTORY_MAX,
   INTERNAL_TOOLS_ENABLED,
+  APP_VERSION,
   PRODUCT_STAGE_LABEL,
 } from "./constants";
 import {
@@ -52,6 +51,7 @@ import {
   isNumericDuckType,
   escapeCsvCell,
   waitForNextPaint,
+  friendlyError,
 } from "./utils";
 import { useTheme } from "./hooks/useTheme";
 import { useLocalStorageSync } from "./hooks/useLocalStorageSync";
@@ -76,15 +76,12 @@ function App() {
 
   const [activeTab, setActiveTab] = useState<ActiveTab>(() => readActiveTab());
   const [result, setResult] = useState<SmokeQueryResponse | null>(null);
-  const [, setArrowRows] = useState<ArrowRow[]>([]);
-  const [, setArrowBytes] = useState(0);
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [viewMode, setViewMode] = useState<ViewMode>("virtual");
   const [firstViewportMs, setFirstViewportMs] = useState<number | null>(null);
   const [acceptanceGate, setAcceptanceGate] = useState<AcceptanceGateReport | null>(null);
-  const [, setLastExportPath] = useState<string | null>(null);
   const [workspaceTables, setWorkspaceTables] = useState<WorkspaceTableInfo[]>([]);
   const [workspaceTableSchemas, setWorkspaceTableSchemas] = useState<WorkspaceSchemaByAlias>({});
   const [workspaceSlowModeEnabled, setWorkspaceSlowModeEnabled] = useState<boolean>(
@@ -294,7 +291,7 @@ function App() {
         return [entry, ...prev.filter((h) => h.sql !== result.sql)].slice(0, QUERY_HISTORY_MAX);
       });
     } catch (err) {
-      const message = String(err);
+      const message = friendlyError(String(err));
       if (message.includes("Referenced column")) {
         const availableColumns = Array.from(
           new Set(
@@ -329,7 +326,7 @@ function App() {
       const result = await invoke<string>("explain_workspace_query", { sql: sqlText });
       setExplainPlan(result);
     } catch (err) {
-      setError(String(err));
+      setError(friendlyError(String(err)));
     } finally {
       setExplainLoading(false);
     }
@@ -564,6 +561,10 @@ function App() {
   }
 
   async function exportResults(format: "json" | "csv") {
+    if (!preview) {
+      setError("Open a file before exporting results.");
+      return;
+    }
     setLoading(true);
     setError(null);
 
@@ -588,9 +589,8 @@ function App() {
 
       const contents = format === "json" ? JSON.stringify(payload, null, 2) : buildExportCsv(payload);
       await invoke("write_text_report", { path: selected, contents });
-      setLastExportPath(selected);
     } catch (err) {
-      setError(String(err));
+      setError(friendlyError(String(err)));
     } finally {
       setLoading(false);
     }
@@ -744,20 +744,6 @@ function App() {
     setResult(response);
   }
 
-  async function runArrowIpcSmoke() {
-    const payload = await invoke<number[]>("arrow_ipc_smoke_batch");
-    const bytes = Uint8Array.from(payload);
-    const table = tableFromIPC(bytes);
-    const rows = Array.from(table).map((row) => ({
-      id: Number(row.id),
-      label: String(row.label),
-    }));
-
-    setArrowBytes(bytes.byteLength);
-    setArrowRows(rows);
-  }
-
-
 
   async function openParquetPreview() {
     await refreshRuntimeHealth();
@@ -777,7 +763,7 @@ function App() {
       }
       await loadPreviewFromPath(selected);
     } catch (err) {
-      setError(String(err));
+      setError(friendlyError(String(err)));
     } finally {
       setLoading(false);
     }
@@ -828,14 +814,13 @@ function App() {
       setAcceptanceGate(report);
     } catch (err) {
       const message = String(err);
-      setError(message);
+      setError(friendlyError(message));
       setAcceptanceGate(buildFailedGateReport(preview?.file_path ?? "unknown", message));
     } finally {
       setLoading(false);
     }
   }
 
-  const canExportResults = true;
   const workspaceColumns = workspaceQueryResult?.schema ?? [];
   const workspaceNumericColumns = workspaceColumns.filter((column) =>
     isNumericDuckType(column.duckdb_type),
@@ -856,10 +841,9 @@ function App() {
       setError(null);
       try {
         await runSmokeQuery();
-        await runArrowIpcSmoke();
         await refreshWorkspaceTables();
       } catch (err) {
-        setError(String(err));
+        setError(friendlyError(String(err)));
       } finally {
         setLoading(false);
       }
@@ -884,7 +868,7 @@ function App() {
       await loadPreviewFromPath(parquetPaths[0]);
       setActiveTab("preview");
     } catch (err) {
-      setError(String(err));
+      setError(friendlyError(String(err)));
     } finally {
       setLoading(false);
     }
@@ -950,7 +934,7 @@ function App() {
       }
       setActiveTab("sql");
     } catch (err) {
-      setError(String(err));
+      setError(friendlyError(String(err)));
     } finally {
       setLoading(false);
     }
@@ -1050,7 +1034,7 @@ function App() {
 
     window.addEventListener("keydown", handleGlobalKeyDown);
     return () => window.removeEventListener("keydown", handleGlobalKeyDown);
-  }, [aboutOpen, settingsOpen, error, loading, explainLoading, activeTab]);
+  }, [aboutOpen, settingsOpen, error, loading, explainLoading, activeTab, expandedPanel, settings.expandMode, historyOpen]);
 
   const actionsPanel = (
     <section className="actions-toolbar">
@@ -1060,15 +1044,15 @@ function App() {
             Open Parquet<kbd className="shortcut-hint">Ctrl+O</kbd>
           </button>
         ) : null}
-        {INTERNAL_TOOLS_ENABLED ? (
+        {INTERNAL_TOOLS_ENABLED && activeTab === "preview" ? (
           <>
             <button type="button" onClick={() => void runAcceptanceGate()} disabled={loading || memoryGuardActive}>
               {loading ? "Running..." : "Run Acceptance Gate"}
             </button>
-            <button type="button" onClick={() => void exportResults("json")} disabled={loading || !canExportResults}>
+            <button type="button" onClick={() => void exportResults("json")} disabled={loading}>
               Export JSON
             </button>
-            <button type="button" onClick={() => void exportResults("csv")} disabled={loading || !canExportResults}>
+            <button type="button" onClick={() => void exportResults("csv")} disabled={loading}>
               Export CSV
             </button>
           </>
@@ -1253,7 +1237,7 @@ function App() {
                         onClick={() => {
                           setLoading(true);
                           setError(null);
-                          void loadPreviewFromPath(filePath).catch((err) => setError(String(err))).finally(() => setLoading(false));
+                          void loadPreviewFromPath(filePath).catch((err) => setError(friendlyError(String(err)))).finally(() => setLoading(false));
                         }}
                         disabled={loading}
                       >
@@ -1277,6 +1261,7 @@ function App() {
         tables={workspaceTables}
         schemas={workspaceTableSchemas}
         loading={loading}
+        deepStats={settings.deepStats}
         workspaceSlowModeEnabled={workspaceSlowModeEnabled}
         onSlowModeChange={setWorkspaceSlowModeEnabled}
         onRegister={async (alias, filePath, isGlob, sourceKind, delimiter) => {
@@ -1288,19 +1273,19 @@ function App() {
             if (!readWorkspaceSql().includes(alias)) {
               replaceWorkspaceSql(`SELECT * FROM ${alias} LIMIT 100`);
             }
-          } catch (err) { setError(String(err)); }
+          } catch (err) { setError(friendlyError(String(err))); }
           finally { setLoading(false); }
         }}
         onRemove={async (alias) => {
           setLoading(true); setError(null);
           try { await invoke("remove_workspace_table", { alias }); await refreshWorkspaceTables(); }
-          catch (err) { setError(String(err)); }
+          catch (err) { setError(friendlyError(String(err))); }
           finally { setLoading(false); }
         }}
         onRename={async (oldAlias, newAlias) => {
           setLoading(true); setError(null);
           try { await invoke("rename_workspace_table", { oldAlias, newAlias }); await refreshWorkspaceTables(); }
-          catch (err) { setError(String(err)); }
+          catch (err) { setError(friendlyError(String(err))); }
           finally { setLoading(false); }
         }}
         onClearAll={async () => {
@@ -1519,7 +1504,7 @@ function App() {
           <button type="button" onClick={() => setAboutOpen(true)}>
             About
           </button>
-          <span className="beta-badge">{PRODUCT_STAGE_LABEL} v0.3.0</span>
+          <span className="beta-badge">{PRODUCT_STAGE_LABEL} v{APP_VERSION}</span>
         </div>
       </header>
 

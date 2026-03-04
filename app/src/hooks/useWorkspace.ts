@@ -9,7 +9,7 @@ import type {
   WorkspaceTableInfo,
   PerspectiveContext,
 } from "../types";
-import { isNumericDuckType, coerceWorkspaceCell } from "../utils";
+import { isNumericDuckType, coerceWorkspaceCell, friendlyError } from "../utils";
 
 interface UseWorkspaceParams {
   workspaceTables: WorkspaceTableInfo[];
@@ -101,13 +101,17 @@ export function useWorkspace({
       });
       setWorkspaceSchemaDiff(result);
     } catch (err) {
-      setError(String(err));
+      setError(friendlyError(String(err)));
     } finally {
       setLoading(false);
     }
   }
 
   async function exportWorkspaceQuery(format: "csv" | "parquet") {
+    if (!workspaceQueryResult || workspaceQueryResult.rows.length === 0) {
+      setError("Run a query with results before exporting.");
+      return;
+    }
     const sqlText = readWorkspaceSql();
     if (!sqlText.trim()) {
       setError("Workspace SQL query is required before export.");
@@ -141,7 +145,7 @@ export function useWorkspace({
       });
       setWorkspaceExport(result);
     } catch (err) {
-      setError(String(err));
+      setError(friendlyError(String(err)));
     } finally {
       setLoading(false);
     }
