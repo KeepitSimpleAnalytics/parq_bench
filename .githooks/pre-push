@@ -2,7 +2,7 @@
 # pre-push hook — ensure version strings are in sync before pushing
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 echo "Running version sync check..."
 "$REPO_ROOT/scripts/check-version-sync.sh"
