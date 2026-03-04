@@ -1,6 +1,14 @@
 import React from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { PRODUCT_STAGE_LABEL } from "../constants";
+import { APP_VERSION, PRODUCT_STAGE_LABEL } from "../constants";
+
+async function safeOpenUrl(url: string) {
+  try {
+    await openUrl(url);
+  } catch (err) {
+    console.error("Failed to open URL:", url, err);
+  }
+}
 
 export interface AboutModalProps {
   open: boolean;
@@ -25,7 +33,7 @@ export const AboutModal = React.memo(function AboutModal({
         onClick={(event) => event.stopPropagation()}
       >
         <h3>Parq-Bench</h3>
-        <span className="beta-badge" style={{ marginBottom: 12, alignSelf: "flex-start" }}>{PRODUCT_STAGE_LABEL} v0.3.0</span>
+        <span className="beta-badge" style={{ marginBottom: 12, alignSelf: "flex-start" }}>{PRODUCT_STAGE_LABEL} v{APP_VERSION}</span>
         <p style={{ margin: "8px 0", lineHeight: 1.5 }}>
           A high-performance desktop application for exploring and querying Parquet and CSV files locally.
           No cloud, no accounts, no telemetry — all processing happens on your machine.
@@ -34,7 +42,7 @@ export const AboutModal = React.memo(function AboutModal({
           Built by{" "}
           <a
             href="#"
-            onClick={(e) => { e.preventDefault(); void openUrl("https://www.keepitsimpleanalytics.com/"); }}
+            onClick={(e) => { e.preventDefault(); void safeOpenUrl("https://www.keepitsimpleanalytics.com/"); }}
             style={{ color: "var(--accent)" }}
           >
             KISA — Keep it Simple Analytics
@@ -65,15 +73,15 @@ export const AboutModal = React.memo(function AboutModal({
         </div>
         <p style={{ margin: "8px 0", fontSize: "0.84rem", color: "var(--text-soft)" }}>
           Licensed under{" "}
-          <a href="#" onClick={(e) => { e.preventDefault(); void openUrl("https://github.com/KeepitSimpleAnalytics/parq_bench/blob/main/LICENSE"); }} style={{ color: "var(--accent)" }}>GPLv3</a>.
+          <a href="#" onClick={(e) => { e.preventDefault(); void safeOpenUrl("https://github.com/KeepitSimpleAnalytics/parq_bench/blob/main/LICENSE"); }} style={{ color: "var(--accent)" }}>GPLv3</a>.
           {" "}We believe great tools should be open and accessible to everyone.
         </p>
         <p style={{ margin: "4px 0", fontSize: "0.82rem" }}>
-          <a href="#" onClick={(e) => { e.preventDefault(); void openUrl("https://github.com/KeepitSimpleAnalytics/parq_bench"); }} style={{ color: "var(--accent)" }}>
+          <a href="#" onClick={(e) => { e.preventDefault(); void safeOpenUrl("https://github.com/KeepitSimpleAnalytics/parq_bench"); }} style={{ color: "var(--accent)" }}>
             GitHub Repository
           </a>
           {" — "}
-          <a href="#" onClick={(e) => { e.preventDefault(); void openUrl("https://github.com/KeepitSimpleAnalytics/parq_bench/issues"); }} style={{ color: "var(--accent)" }}>
+          <a href="#" onClick={(e) => { e.preventDefault(); void safeOpenUrl("https://github.com/KeepitSimpleAnalytics/parq_bench/issues"); }} style={{ color: "var(--accent)" }}>
             Report an Issue
           </a>
         </p>

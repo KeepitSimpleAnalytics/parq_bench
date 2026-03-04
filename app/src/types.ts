@@ -10,11 +10,6 @@ export type SmokeQueryResponse = {
   rows: SmokeRow[];
 };
 
-export type ArrowRow = {
-  id: number;
-  label: string;
-};
-
 export type BenchmarkResult = {
   mode: "ipc" | "socket";
   sizeMb: number;
@@ -179,6 +174,7 @@ export type AppSettings = {
   expandMode: "fullscreen" | "resize";
   showPerspectiveConfigure: boolean;
   showVisualization: boolean;
+  deepStats: boolean;
 };
 
 export type SummarizeRow = Record<string, string>;

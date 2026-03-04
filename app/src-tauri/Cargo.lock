@@ -3250,7 +3250,7 @@ dependencies = [
 
 [[package]]
 name = "parq-bench"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "arrow-array 57.3.0",
  "arrow-ipc",

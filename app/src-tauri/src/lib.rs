@@ -103,7 +103,7 @@ struct FlattenedColumn {
     select_expr: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum WorkspaceSourceKind {
     Parquet,
     Delimited,
@@ -310,6 +310,9 @@ fn open_configured_duckdb(state: &AppRuntimeState) -> Result<Connection, String>
 }
 
 
+/// Escape a value for use inside a SQL single-quoted string literal.
+/// Backslashes are converted to forward slashes for DuckDB file-path
+/// compatibility on Windows. Only use this for file paths, not arbitrary strings.
 fn escape_sql_string_literal(value: &str) -> String {
     value.replace('\\', "/").replace('\'', "''")
 }
@@ -1867,6 +1870,7 @@ fn explain_workspace_query(
 #[tauri::command]
 fn summarize_workspace_table(
     alias: String,
+    deep: Option<bool>,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<Vec<std::collections::HashMap<String, String>>, String> {
     ensure_memory_guard_clear(state.as_ref())?;
@@ -1875,59 +1879,79 @@ fn summarize_workspace_table(
         return Err("Workspace alias is required.".to_string());
     }
 
-    {
-        let lock = state
+    let st = state.inner().clone();
+    let (file_path, source_kind, tables) = {
+        let lock = st
             .workspace_tables
             .lock()
             .map_err(|_| "Workspace table lock poisoned.".to_string())?;
-        if !lock
-            .iter()
-            .any(|entry| entry.alias.eq_ignore_ascii_case(&alias_trimmed))
-        {
-            return Err(format!("Workspace alias not found: {alias_trimmed}"));
+        match lock.iter().find(|entry| entry.alias.eq_ignore_ascii_case(&alias_trimmed)) {
+            Some(entry) => (entry.file_path.clone(), entry.source_kind, lock.clone()),
+            None => return Err(format!("Workspace alias not found: {alias_trimmed}")),
         }
-    }
-
-    let st = state.inner().clone();
-    let tables = {
-        let lock = st.workspace_tables.lock()
-            .map_err(|_| "Workspace table lock poisoned.".to_string())?;
-        lock.clone()
     };
+
+    let use_fast_path = !deep.unwrap_or(false) && source_kind == WorkspaceSourceKind::Parquet;
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
         apply_workspace_tables(&conn, &tables)?;
         let conn = &conn;
         let started = Instant::now();
-        let ident = escape_sql_ident(&alias_trimmed);
 
-        // DuckDB SUMMARIZE has fixed output columns. Cast all to VARCHAR
-        // to avoid type-mismatch panics in row.get().
-        let summarize_sql = format!(
-            concat!(
-                "SELECT ",
-                "CAST(column_name AS VARCHAR) AS column_name, ",
-                "CAST(column_type AS VARCHAR) AS column_type, ",
-                "CAST(min AS VARCHAR) AS min, ",
-                "CAST(max AS VARCHAR) AS max, ",
-                "CAST(approx_unique AS VARCHAR) AS approx_unique, ",
-                "CAST(avg AS VARCHAR) AS avg, ",
-                "CAST(std AS VARCHAR) AS std, ",
-                "CAST(q25 AS VARCHAR) AS q25, ",
-                "CAST(q50 AS VARCHAR) AS q50, ",
-                "CAST(q75 AS VARCHAR) AS q75, ",
-                "CAST(count AS VARCHAR) AS count, ",
-                "CAST(null_percentage AS VARCHAR) AS null_percentage ",
-                "FROM (SUMMARIZE \"{}\")"
-            ),
-            ident
-        );
-        let col_names = vec![
-            "column_name", "column_type", "min", "max", "approx_unique",
-            "avg", "std", "q25", "q50", "q75", "count", "null_percentage",
-        ];
+        let (col_names, sql) = if use_fast_path {
+            let escaped_path = escape_sql_string_literal(&file_path);
+            let cols = vec![
+                "column_name", "column_type", "min", "max", "count", "null_percentage",
+            ];
+            let q = format!(
+                concat!(
+                    "SELECT ",
+                    "s.name AS column_name, ",
+                    "s.type AS column_type, ",
+                    "COALESCE(CAST(MIN(TRY_CAST(m.stats_min_value AS DOUBLE)) AS VARCHAR), MIN(m.stats_min_value)) AS min, ",
+                    "COALESCE(CAST(MAX(TRY_CAST(m.stats_max_value AS DOUBLE)) AS VARCHAR), MAX(m.stats_max_value)) AS max, ",
+                    "CAST(SUM(m.num_values) AS VARCHAR) AS count, ",
+                    "CAST(ROUND(SUM(m.stats_null_count) * 100.0 ",
+                    "/ NULLIF(SUM(m.num_values), 0), 2) AS VARCHAR) AS null_percentage ",
+                    "FROM parquet_schema('{}') s ",
+                    "JOIN parquet_metadata('{}') m ON s.name = m.path_in_schema ",
+                    "WHERE s.name != 'duckdb_schema' ",
+                    "GROUP BY s.name, m.column_id, s.type ",
+                    "ORDER BY m.column_id"
+                ),
+                escaped_path, escaped_path
+            );
+            (cols, q)
+        } else {
+            let ident = escape_sql_ident(&alias_trimmed);
+            let cols = vec![
+                "column_name", "column_type", "min", "max", "approx_unique",
+                "avg", "std", "q25", "q50", "q75", "count", "null_percentage",
+            ];
+            let q = format!(
+                concat!(
+                    "SELECT ",
+                    "CAST(column_name AS VARCHAR) AS column_name, ",
+                    "CAST(column_type AS VARCHAR) AS column_type, ",
+                    "CAST(min AS VARCHAR) AS min, ",
+                    "CAST(max AS VARCHAR) AS max, ",
+                    "CAST(approx_unique AS VARCHAR) AS approx_unique, ",
+                    "CAST(avg AS VARCHAR) AS avg, ",
+                    "CAST(std AS VARCHAR) AS std, ",
+                    "CAST(q25 AS VARCHAR) AS q25, ",
+                    "CAST(q50 AS VARCHAR) AS q50, ",
+                    "CAST(q75 AS VARCHAR) AS q75, ",
+                    "CAST(count AS VARCHAR) AS count, ",
+                    "CAST(null_percentage AS VARCHAR) AS null_percentage ",
+                    "FROM (SUMMARIZE \"{}\")"
+                ),
+                ident
+            );
+            (cols, q)
+        };
+
         let mut stmt = conn
-            .prepare(&summarize_sql)
+            .prepare(&sql)
             .map_err(|e| format!("prepare summarize: {e}"))?;
         let row_iter = stmt
             .query_map([], |row| {
@@ -1942,9 +1966,10 @@ fn summarize_workspace_table(
         let results: Vec<std::collections::HashMap<String, String>> = row_iter
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect summarize rows: {e}"))?;
+        let log_label = if use_fast_path { "summarize_workspace_table_fast" } else { "summarize_workspace_table" };
         log_perf(
             &st,
-            "summarize_workspace_table",
+            log_label,
             &format!(
                 "alias={} duration_ms={} rows={}",
                 alias_trimmed,

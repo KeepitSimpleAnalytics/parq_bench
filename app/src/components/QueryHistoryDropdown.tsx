@@ -27,8 +27,8 @@ export const QueryHistoryDropdown = React.memo(function QueryHistoryDropdown({
             <strong style={{ fontSize: "0.82rem" }}>Query History</strong>
             <button type="button" style={{ padding: "2px 6px", fontSize: "0.72rem" }} onClick={onClear}>Clear</button>
           </div>
-          {history.map((entry, idx) => (
-            <div key={`qh-${idx}`}
+          {history.map((entry) => (
+            <div key={`qh-${entry.timestamp}`}
               style={{ padding: "4px 6px", borderBottom: "1px solid var(--border)", cursor: "pointer", fontSize: "0.8rem" }}
               onClick={() => onSelect(entry.sql)}
             >

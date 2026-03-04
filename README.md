@@ -1,11 +1,8 @@
 # Parq-Bench
 
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 A high-performance desktop application for exploring large Parquet files locally. Built with Tauri, React, and DuckDB. No cloud, no accounts, no telemetry — all processing happens on your machine.
-
-<!-- TODO: Add screenshot or demo GIF here -->
-<!-- ![Parq-Bench screenshot](docs/screenshot.png) -->
 
 ## Installation
 
@@ -36,6 +33,9 @@ Register one or more files as named tables, then write SQL to query across them.
 - **Autocomplete** — Type `.` after a table alias to get column suggestions. SQL keywords, table names, and column names from all mounted tables are offered as completions.
 - **Run a query** — Click **Run SQL** or press `Ctrl+Enter`. Results appear in a scrollable table below the editor with row count, execution time, and column types.
 - **Export results** — Click **Export Query CSV** or **Export Query Parquet** to save query output to a file. Press `Ctrl+Shift+E` to export as CSV directly.
+- **Table statistics** — Click **Stats** on any mounted table to view column-level statistics. By default, stats are read from Parquet metadata (instant). Enable **Deep Stats** in Settings to run a full table scan for exact values.
+- **EXPLAIN ANALYZE** — Press `Ctrl+Shift+Enter` to see the query execution plan instead of result rows.
+- **Schema diff** — Compare column schemas between two mounted tables to spot added, removed, or type-changed columns.
 - **Charting** — After running a query, pick a chart plugin (Y Bar, X Bar, Y Line, Treemap), select X/Y columns and an aggregation (sum, avg, count, min, max), then click **Chart in Perspective** to visualize results interactively.
 
 ### Keyboard Shortcuts
@@ -46,12 +46,28 @@ Register one or more files as named tables, then write SQL to query across them.
 | `Ctrl+1` | Switch to Preview tab |
 | `Ctrl+2` | Switch to SQL tab |
 | `Ctrl+Enter` | Run SQL query |
+| `Ctrl+Shift+Enter` | Explain Analyze |
 | `Ctrl+Shift+E` | Export query as CSV |
+| `Ctrl+,` | Open Settings |
 | `Escape` | Close About dialog or clear error |
 
 ### Theme
 
 Choose **System**, **Light**, or **Dark** from the dropdown in the header. The choice persists across sessions.
+
+### Settings
+
+Press `Ctrl+,` to open the Settings panel. Configurable options:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| SQL Row Limit | 200 | Maximum rows returned by workspace queries |
+| Perspective Max Rows | 5,000 | Maximum rows loaded into the Perspective viewer |
+| Editor Font Size | 13 px | Monaco editor font size |
+| Expand Mode | Fullscreen | Fullscreen overlay or drag-to-resize panels |
+| Deep Stats | Off | Full table scan for exact stats (may be slow on large files) |
+| Show Visualization | On | Toggle chart controls in workspace |
+| Show Perspective Configure | On | Toggle Perspective's built-in settings button |
 
 ### Memory Guard
 
@@ -134,4 +150,4 @@ Bug reports and feature requests are welcome — please [open an issue](https://
 
 ## License
 
-[Apache License 2.0](LICENSE) — KISA-Keep it Simple Analytics LLC
+[GNU General Public License v3.0](LICENSE) — KISA-Keep it Simple Analytics LLC

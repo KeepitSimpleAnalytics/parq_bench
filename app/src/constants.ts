@@ -29,8 +29,10 @@ export const DEFAULT_SETTINGS: AppSettings = {
   expandMode: "fullscreen",
   showPerspectiveConfigure: true,
   showVisualization: true,
+  deepStats: false,
 };
 
 export const INTERNAL_TOOLS_ENABLED =
   import.meta.env.DEV || import.meta.env.VITE_PARQBENCH_INTERNAL_TOOLS === "1";
+export const APP_VERSION: string = __APP_VERSION__;
 export const PRODUCT_STAGE_LABEL = "Beta";

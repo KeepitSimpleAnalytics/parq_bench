@@ -9,6 +9,7 @@ export interface WorkspaceTableRegistryProps {
   tables: WorkspaceTableInfo[];
   schemas: WorkspaceSchemaByAlias;
   loading: boolean;
+  deepStats: boolean;
   workspaceSlowModeEnabled: boolean;
   onSlowModeChange: (enabled: boolean) => void;
   onRegister: (alias: string, filePath: string, isGlob: boolean, sourceKind: "parquet" | "delimited", delimiter?: string) => Promise<void>;
@@ -31,6 +32,7 @@ export function WorkspaceTableRegistry({
   tables,
   schemas,
   loading,
+  deepStats,
   workspaceSlowModeEnabled,
   onSlowModeChange,
   onRegister,
@@ -51,7 +53,7 @@ export function WorkspaceTableRegistry({
   const [columnSearchQuery, setColumnSearchQuery] = useState("");
   const [editingAlias, setEditingAlias] = useState<string | null>(null);
   const [editingAliasValue, setEditingAliasValue] = useState("");
-  const [tableStats, setTableStats] = useState<Record<string, SummarizeRow[] | null>>({});
+  const [tableStats, setTableStats] = useState<Record<string, { rows: SummarizeRow[]; deep: boolean } | null>>({});
   const [statsLoading, setStatsLoading] = useState<string | null>(null);
 
   const sourceKind = detectSourceKind(pathInput);
@@ -109,8 +111,8 @@ export function WorkspaceTableRegistry({
   async function loadStats(alias: string) {
     setStatsLoading(alias);
     try {
-      const result = await invoke<SummarizeRow[]>("summarize_workspace_table", { alias });
-      setTableStats((prev) => ({ ...prev, [alias]: result }));
+      const result = await invoke<SummarizeRow[]>("summarize_workspace_table", { alias, deep: deepStats });
+      setTableStats((prev) => ({ ...prev, [alias]: { rows: result, deep: deepStats } }));
     } catch (err) {
       onError(String(err));
     } finally {
@@ -295,7 +297,7 @@ export function WorkspaceTableRegistry({
         return (
           <details key={`stats-${table.alias}`} open style={{ marginBottom: 8 }}>
             <summary style={{ cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, marginBottom: 4 }}>
-              Stats: {table.alias}
+              Stats: {table.alias} <span style={{ fontWeight: 400, fontSize: "0.78rem", color: "var(--text-soft)" }}>({stats.deep ? "deep scan" : "metadata"})</span>
               <button type="button" style={{ marginLeft: 8, padding: "1px 6px", fontSize: "0.72rem" }}
                 onClick={(e) => { e.stopPropagation(); setTableStats((prev) => ({ ...prev, [table.alias]: null })); }}>
                 Hide
@@ -303,7 +305,8 @@ export function WorkspaceTableRegistry({
             </summary>
             <div className="table-wrap" style={{ maxHeight: 240, overflowY: "auto" }}>
               {(() => {
-                const STATS_COLS = ["column_name","column_type","min","max","approx_unique","avg","std","q25","q50","q75","count","null_percentage"];
+                const ALL_STATS_COLS = ["column_name","column_type","min","max","approx_unique","avg","std","q25","q50","q75","count","null_percentage"];
+                const STATS_COLS = stats.rows.length > 0 ? ALL_STATS_COLS.filter((c) => c in stats.rows[0]) : [];
                 return (
                   <table>
                     <thead>
@@ -314,7 +317,7 @@ export function WorkspaceTableRegistry({
                       </tr>
                     </thead>
                     <tbody>
-                      {stats.map((row, ri) => (
+                      {stats.rows.map((row, ri) => (
                         <tr key={`stats-row-${table.alias}-${ri}`}>
                           {STATS_COLS.map((key, ci) => (
                             <td key={`stats-cell-${table.alias}-${ri}-${ci}`} style={{ fontSize: "0.78rem" }}>{row[key] ?? ""}</td>

@@ -86,6 +86,13 @@ export const SettingsModal = React.memo(function SettingsModal({
             Show Visualization
             <span className="phase" style={{ marginLeft: "auto" }}>Show Visualize Data button and chart controls in workspace</span>
           </label>
+          <label style={{ display: "flex", flexDirection: "row", alignItems: "center", gap: 8, fontSize: "0.85rem", cursor: "pointer" }}>
+            <input type="checkbox" checked={settings.deepStats}
+              onChange={(e) => onSettingsChange((s) => ({ ...s, deepStats: e.target.checked }))}
+            />
+            Deep Stats (full table scan)
+            <span className="phase" style={{ marginLeft: "auto" }}>May take minutes on large Parquet files. When off, stats use Parquet metadata (instant).</span>
+          </label>
           <div style={{ fontSize: "0.84rem", color: "var(--text-soft)", padding: "6px 0", borderTop: "1px solid var(--border)" }}>
             Memory guard threshold: 85% (read-only, configured in backend)
           </div>
