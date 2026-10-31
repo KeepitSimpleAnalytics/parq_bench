@@ -2864,6 +2864,112 @@ mod tests {
         conn.execute_batch("DROP TABLE test_util").expect("drop table");
     }
 
+    #[test]
+    fn bundled_duckdb_is_v2_with_static_parquet_and_json() {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        // Forbid any runtime extension install/load so this only passes if the
+        // extensions are statically linked into the bundled build.
+        conn.execute_batch(
+            "SET autoinstall_known_extensions = false; SET autoload_known_extensions = false;",
+        )
+        .expect("disable extension autoinstall/autoload");
+
+        let version: String = conn
+            .query_row("SELECT version()", [], |row| row.get(0))
+            .expect("query version");
+        assert!(version.starts_with("v2.0."), "unexpected DuckDB version {version}");
+
+        for ext in ["parquet", "json"] {
+            let (loaded, mode): (bool, String) = conn
+                .query_row(
+                    "SELECT loaded, install_mode FROM duckdb_extensions() WHERE extension_name = ?",
+                    [ext],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or_else(|e| panic!("look up {ext} extension: {e}"));
+            assert!(loaded, "{ext} extension not loaded");
+            assert_eq!(mode, "STATICALLY_LINKED", "{ext} extension install mode");
+        }
+
+        let temp_file = unique_test_parquet_path();
+        let escaped_path = escape_sql_string_literal(&temp_file);
+        conn.execute_batch(&format!(
+            "COPY (SELECT 42::INTEGER AS answer) TO '{escaped_path}' (FORMAT PARQUET);"
+        ))
+        .expect("write parquet without INSTALL");
+        let answer: i32 = conn
+            .query_row(
+                &format!("SELECT answer FROM read_parquet('{escaped_path}')"),
+                [],
+                |row| row.get(0),
+            )
+            .expect("read parquet without INSTALL");
+        assert_eq!(answer, 42);
+
+        let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn timestamptz_round_trips_through_preview_and_query() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let temp_file = unique_test_parquet_path();
+        let escaped_path = escape_sql_string_literal(&temp_file);
+
+        conn.execute_batch(&format!(
+            "COPY (
+                SELECT 1::BIGINT AS id, TIMESTAMPTZ '2024-03-15 12:34:56+00' AS ts
+            ) TO '{escaped_path}' (FORMAT PARQUET);"
+        ))
+        .expect("write timestamptz parquet fixture");
+
+        let source = format!("read_parquet('{escaped_path}')");
+        let flattened = flattened_columns_for_source(&conn, &source).expect("load flattened columns");
+        let schema = schema_from_flattened(&flattened);
+        let ts_col = schema.iter().find(|c| c.name == "ts").expect("ts column present");
+        assert!(
+            ts_col.duckdb_type.contains("TIME ZONE") || ts_col.duckdb_type == "TIMESTAMPTZ",
+            "unexpected ts type {}",
+            ts_col.duckdb_type
+        );
+
+        let preview = parquet_rows_page(&conn, &source, &flattened, 0, 10).expect("preview rows");
+        assert_eq!(preview.len(), 1);
+        let preview_ts = preview[0][1].as_deref().expect("preview ts not null");
+        assert!(preview_ts.starts_with("2024-03-15"), "preview ts = {preview_ts}");
+
+        let sql = format!("SELECT ts FROM {source}");
+        let query_schema_cols = query_schema(&conn, &sql).expect("query schema");
+        let (rows, _) =
+            query_rows_with_limit(&conn, &sql, &query_schema_cols, 10).expect("query rows");
+        let query_ts = rows[0][0].as_deref().expect("query ts not null");
+        assert!(query_ts.starts_with("2024-03-15"), "query ts = {query_ts}");
+
+        let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn untyped_null_query_renders_and_exports() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let sql = "SELECT NULL AS x";
+
+        let schema = query_schema(&conn, sql).expect("schema for untyped NULL");
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].name, "x");
+        let (rows, _) = query_rows_with_limit(&conn, sql, &schema, 10).expect("rows for untyped NULL");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], None);
+
+        for format in ["csv", "parquet"] {
+            let out = unique_test_output_path(format);
+            export_workspace_query_to_file(&conn, sql, &out, format, Some(sql), None)
+                .unwrap_or_else(|e| panic!("export untyped NULL to {format}: {e}"));
+            assert!(fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false));
+            let _ = fs::remove_file(&out);
+        }
+    }
+
     fn unique_test_parquet_path() -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2920,16 +3026,8 @@ pub fn run() {
                     *guard = Some(log_path);
                 }
             }
-
-            // Warm up: install + load the parquet extension on a throwaway
-            // connection so the first real user query doesn't pay the cost.
-            let warmup_state = Arc::clone(&state);
-            thread::spawn(move || {
-                if let Ok(conn) = Connection::open_in_memory() {
-                    let _ = conn.execute_batch("INSTALL parquet; LOAD parquet;");
-                    log_perf(&warmup_state, "duckdb_warmup", "parquet extension preloaded");
-                }
-            });
+            // Parquet and JSON are statically linked via the `parquet` / `json`
+            // crate features, so no runtime INSTALL/LOAD (and no network) is needed.
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

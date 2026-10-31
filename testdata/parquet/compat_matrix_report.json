@@ -1,6 +1,6 @@
 {
-  "generated_at": "unix:1793463583s",
-  "duckdb_version": "v1.4.4",
+  "generated_at": "unix:1793469097s",
+  "duckdb_version": "v2.0.0",
   "fixtures_dir": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet",
   "total_files": 5,
   "pass_count": 5,
@@ -9,7 +9,7 @@
     {
       "file_name": "flat_small.parquet",
       "file_path": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\flat_small.parquet",
-      "file_size_bytes": 422388,
+      "file_size_bytes": 422490,
       "row_count": 50000,
       "column_count": 7,
       "nested_column_count": 0,
@@ -54,7 +54,7 @@
     {
       "file_name": "flat_wide.parquet",
       "file_path": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\flat_wide.parquet",
-      "file_size_bytes": 65881,
+      "file_size_bytes": 66295,
       "row_count": 30000,
       "column_count": 22,
       "nested_column_count": 0,
@@ -159,7 +159,7 @@
     {
       "file_name": "nested_collections.parquet",
       "file_path": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\nested_collections.parquet",
-      "file_size_bytes": 143669,
+      "file_size_bytes": 143744,
       "row_count": 15000,
       "column_count": 3,
       "nested_column_count": 2,
@@ -188,7 +188,7 @@
     {
       "file_name": "nested_struct.parquet",
       "file_path": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\nested_struct.parquet",
-      "file_size_bytes": 207560,
+      "file_size_bytes": 207671,
       "row_count": 40000,
       "column_count": 3,
       "nested_column_count": 2,
@@ -217,7 +217,7 @@
     {
       "file_name": "perf_medium.parquet",
       "file_path": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\perf_medium.parquet",
-      "file_size_bytes": 3227278,
+      "file_size_bytes": 3227741,
       "row_count": 500000,
       "column_count": 7,
       "nested_column_count": 1,

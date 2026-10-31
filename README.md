@@ -101,7 +101,7 @@ Installers are output to `app/src-tauri/target/release/bundle/`.
 | Editor | Monaco Editor | SQL workspace with autocomplete |
 | Visualization | Perspective.js (FINOS) | Interactive grid, charts, pivoting |
 | Backend | Rust, Tauri 2 | File I/O, DuckDB queries, Arrow IPC transport |
-| Query Engine | DuckDB 1.4.4 (bundled) | Parquet reading, SQL execution, exports |
+| Query Engine | DuckDB 2.0.0 (bundled, Parquet + JSON built in) | Parquet reading, SQL execution, exports |
 | Transport | Arrow IPC / WebSocket | < 1 MB via Tauri IPC, >= 1 MB via localhost socket |
 
 ## Project Structure
@@ -137,7 +137,7 @@ This runs:
 
 ### DuckDB Version Policy
 
-DuckDB is pinned to `1.4.4` for reproducibility. See [docs/duckdb-upgrade-policy.md](docs/duckdb-upgrade-policy.md) for the upgrade process.
+DuckDB is pinned to `2.0.0` (crate `duckdb = "=1.20000.1"`) for reproducibility. See [docs/duckdb-upgrade-policy.md](docs/duckdb-upgrade-policy.md) for the upgrade process.
 
 ## Contributing
 
