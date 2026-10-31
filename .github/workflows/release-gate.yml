@@ -9,6 +9,10 @@ on:
 jobs:
   gate:
     runs-on: windows-latest
+    env:
+      # No debug info on CI: much smaller target dir and faster linking.
+      # DuckDB is compiled from C++ source, so its debug objects are large.
+      CARGO_PROFILE_DEV_DEBUG: "0"
     defaults:
       run:
         shell: pwsh
@@ -27,6 +31,14 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # Caches compiled dependencies (DuckDB's C++ build takes ~17 min cold).
+      # Saved even when tests fail so a re-run doesn't rebuild DuckDB.
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri -> target
+          cache-on-failure: true
 
       - name: Install frontend deps
         run: npm ci

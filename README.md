@@ -140,7 +140,7 @@ npm run release:gate
 This runs:
 
 - TypeScript + Vite production build
-- `cargo check` and `cargo test` (41 tests; the extension tests download Excel, SQLite and Delta extensions on their first run, so the first gate run needs internet)
+- `cargo test` (41 tests; it compiles the app and both helper binaries too, so there is no separate `cargo check`; the extension tests download Excel, SQLite and Delta extensions on their first run, so the first gate run needs internet)
 - Parquet fixture regeneration (5 synthetic files)
 - DuckDB compatibility matrix (5/5 must pass)
 
