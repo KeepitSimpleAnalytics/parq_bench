@@ -39,6 +39,7 @@ import {
   INTERNAL_TOOLS_ENABLED,
   APP_VERSION,
   PRODUCT_STAGE_LABEL,
+  WORKSPACE_EXTENSIONS,
 } from "./constants";
 import {
   detectSourceKind,
@@ -875,13 +876,12 @@ function App() {
   }
 
   async function handleSqlDrop(paths: string[]) {
-    const supportedExts = [".parquet", ".csv", ".tsv", ".txt", ".data"];
     const validPaths = paths.filter((p) => {
       const lower = p.toLowerCase();
-      return supportedExts.some((ext) => lower.endsWith(ext));
+      return WORKSPACE_EXTENSIONS.some((ext) => lower.endsWith(`.${ext}`));
     });
     if (validPaths.length === 0) {
-      setError("No supported files found. Supported: .parquet, .csv, .tsv, .txt, .data");
+      setError(`No supported files found. Supported: ${WORKSPACE_EXTENSIONS.map((e) => `.${e}`).join(", ")}`);
       return;
     }
     if (loading) return;
@@ -913,15 +913,12 @@ function App() {
         existingAliases.add(alias);
         if (!firstAlias) firstAlias = alias;
 
-        const sourceKind = detectSourceKind(filePath);
-        const delimiter = filePath.toLowerCase().endsWith(".tsv") ? "\t" : undefined;
-
+        // Delimiter is left to the backend: .tsv/.psv map to tab/pipe, others are sniffed.
         await invoke<WorkspaceTableInfo>("register_workspace_table", {
           alias,
           filePath,
           isGlob: false,
-          sourceKind,
-          delimiter,
+          sourceKind: detectSourceKind(filePath),
         });
       }
 

@@ -125,6 +125,7 @@ struct WorkspaceTableRegistration {
     is_glob: bool,
     source_kind: WorkspaceSourceKind,
     delimiter: Option<String>,
+    row_count: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -135,6 +136,18 @@ struct WorkspaceTableInfo {
     source_kind: String,
     delimiter: Option<String>,
     file_size_bytes: Option<u64>,
+    row_count: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct SourcePeekResponse {
+    source_kind: String,
+    detected_delimiter: Option<String>,
+    has_header: Option<bool>,
+    matched_files: Option<u64>,
+    row_count: Option<u64>,
+    schema: Vec<ParquetSchemaColumn>,
+    rows: Vec<Vec<Option<String>>>,
 }
 
 #[derive(Serialize)]
@@ -688,12 +701,16 @@ fn parse_workspace_source_kind(source_kind: Option<String>) -> Result<WorkspaceS
     }
 }
 
-fn default_delimiter_for_path(path: &str) -> char {
+/// Delimiter implied by a file extension. `None` means "let DuckDB's CSV
+/// sniffer detect it" (used for .csv, .txt, .data and anything unknown).
+fn default_delimiter_for_path(path: &str) -> Option<char> {
     let lower = path.trim().to_ascii_lowercase();
     if lower.ends_with(".tsv") {
-        '\t'
+        Some('\t')
+    } else if lower.ends_with(".psv") {
+        Some('|')
     } else {
-        ','
+        None
     }
 }
 
@@ -730,16 +747,11 @@ fn resolve_workspace_delimiter(
     match source_kind {
         WorkspaceSourceKind::Parquet => Ok(None),
         WorkspaceSourceKind::Delimited => {
-            let resolved = if let Some(raw) = delimiter {
-                if raw.trim().is_empty() {
-                    default_delimiter_for_path(file_path)
-                } else {
-                    parse_delimiter_char(&raw)?
-                }
-            } else {
-                default_delimiter_for_path(file_path)
+            let resolved = match delimiter {
+                Some(raw) if !raw.trim().is_empty() => Some(parse_delimiter_char(&raw)?),
+                _ => default_delimiter_for_path(file_path),
             };
-            Ok(Some(resolved.to_string()))
+            Ok(resolved.map(|c| c.to_string()))
         }
     }
 }
@@ -753,9 +765,15 @@ fn workspace_source_sql(table: &WorkspaceTableRegistration) -> String {
                 .delimiter
                 .as_deref()
                 .and_then(|value| value.chars().next())
-                .unwrap_or_else(|| default_delimiter_for_path(&table.file_path));
-            let escaped_delim = escape_sql_literal(&delimiter.to_string());
-            format!("read_csv_auto('{path}', delim='{escaped_delim}')")
+                .or_else(|| default_delimiter_for_path(&table.file_path));
+            match delimiter {
+                Some(d) => {
+                    let escaped_delim = escape_sql_literal(&d.to_string());
+                    format!("read_csv_auto('{path}', delim='{escaped_delim}')")
+                }
+                // No explicit delimiter: let DuckDB's sniffer detect it.
+                None => format!("read_csv_auto('{path}')"),
+            }
         }
     }
 }
@@ -773,6 +791,7 @@ fn workspace_table_info(entry: &WorkspaceTableRegistration) -> WorkspaceTableInf
         source_kind: entry.source_kind.as_str().to_string(),
         delimiter: entry.delimiter.clone(),
         file_size_bytes,
+        row_count: entry.row_count,
     }
 }
 
@@ -1510,6 +1529,115 @@ fn write_text_report(path: String, contents: String) -> Result<(), String> {
     fs::write(&path, contents).map_err(|e| format!("write report file: {e}"))
 }
 
+fn parquet_metadata_row_count(conn: &Connection, normalized_path: &str) -> Result<u64, String> {
+    let sql = format!(
+        "SELECT COALESCE(SUM(num_rows), 0)::UBIGINT FROM parquet_file_metadata('{normalized_path}')"
+    );
+    conn.query_row(&sql, [], |row| row.get::<_, u64>(0))
+        .map_err(|e| format!("read parquet metadata: {e}"))
+}
+
+/// Inspect a source before it is mounted: detected delimiter/header, glob
+/// match count, schema, and the first few rows.
+#[tauri::command]
+fn peek_workspace_source(
+    file_path: String,
+    is_glob: Option<bool>,
+    source_kind: Option<String>,
+    delimiter: Option<String>,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<SourcePeekResponse, String> {
+    ensure_memory_guard_clear(state.as_ref())?;
+    let trimmed_path = file_path.trim().to_string();
+    if trimmed_path.is_empty() {
+        return Err("File path is required.".to_string());
+    }
+    let use_glob = is_glob.unwrap_or(false);
+    if !use_glob && fs::metadata(&trimmed_path).is_err() {
+        return Err("Workspace file path does not exist.".to_string());
+    }
+    let kind = parse_workspace_source_kind(source_kind)?;
+    let resolved_delimiter = resolve_workspace_delimiter(&kind, &trimmed_path, delimiter)?;
+    let registration = WorkspaceTableRegistration {
+        alias: "_peek".to_string(),
+        file_path: trimmed_path,
+        is_glob: use_glob,
+        source_kind: kind,
+        delimiter: resolved_delimiter,
+        row_count: None,
+    };
+    let st = state.inner().clone();
+    on_duckdb_thread(move || peek_source(&open_configured_duckdb(&st)?, &registration))
+}
+
+fn peek_source(
+    conn: &Connection,
+    registration: &WorkspaceTableRegistration,
+) -> Result<SourcePeekResponse, String> {
+    let normalized = escape_sql_string_literal(&registration.file_path);
+
+    let (matched_files, first_file) = if registration.is_glob {
+        let count: u64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*)::UBIGINT FROM glob('{normalized}')"),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("match glob pattern: {e}"))?;
+        if count == 0 {
+            return Err(format!("No files match {}", registration.file_path));
+        }
+        let first: String = conn
+            .query_row(
+                &format!("SELECT file FROM glob('{normalized}') ORDER BY file LIMIT 1"),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("match glob pattern: {e}"))?;
+        (Some(count), first)
+    } else {
+        (None, registration.file_path.clone())
+    };
+
+    let (detected_delimiter, has_header) =
+        if registration.source_kind == WorkspaceSourceKind::Delimited {
+            let sniff_path = escape_sql_string_literal(&first_file);
+            let sniff_sql = match registration.delimiter.as_deref() {
+                Some(d) => format!(
+                    "SELECT Delimiter, HasHeader FROM sniff_csv('{sniff_path}', delim='{}')",
+                    escape_sql_literal(d)
+                ),
+                None => format!("SELECT Delimiter, HasHeader FROM sniff_csv('{sniff_path}')"),
+            };
+            let (d, h): (String, bool) = conn
+                .query_row(&sniff_sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| format!("detect delimiter: {e}"))?;
+            (Some(d), Some(h))
+        } else {
+            (None, None)
+        };
+
+    let source = workspace_source_sql(registration);
+    let select_sql = format!("SELECT * FROM {source}");
+    let schema = query_schema(conn, &select_sql)?;
+    let (rows, _) = query_rows_with_limit(conn, &select_sql, &schema, 5)?;
+    let row_count = if registration.source_kind == WorkspaceSourceKind::Parquet {
+        Some(parquet_metadata_row_count(conn, &normalized)?)
+    } else {
+        None
+    };
+
+    Ok(SourcePeekResponse {
+        source_kind: registration.source_kind.as_str().to_string(),
+        detected_delimiter,
+        has_header,
+        matched_files,
+        row_count,
+        schema,
+        rows,
+    })
+}
+
 #[tauri::command]
 fn register_workspace_table(
     alias: String,
@@ -1541,6 +1669,29 @@ fn register_workspace_table(
     let resolved_delimiter =
         resolve_workspace_delimiter(&parsed_source_kind, trimmed_path, delimiter)?;
 
+    // Row count from Parquet footer metadata (cheap; no data scan). Delimited
+    // sources would need a full scan, so they report no count.
+    let row_count = if parsed_source_kind == WorkspaceSourceKind::Parquet {
+        let st = state.inner().clone();
+        let path_for_count = trimmed_path.to_string();
+        match on_duckdb_thread(move || {
+            let conn = open_configured_duckdb(&st)?;
+            parquet_metadata_row_count(&conn, &escape_sql_string_literal(&path_for_count))
+        }) {
+            Ok(count) => Some(count),
+            Err(err) => {
+                log_perf(
+                    state.as_ref(),
+                    "workspace_row_count_unavailable",
+                    &format!("path={trimmed_path} error={err}"),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let mut tables = state
         .workspace_tables
         .lock()
@@ -1551,6 +1702,7 @@ fn register_workspace_table(
         is_glob: use_glob,
         source_kind: parsed_source_kind,
         delimiter: resolved_delimiter,
+        row_count,
     };
     if let Some(existing) = tables
         .iter_mut()
@@ -2070,9 +2222,11 @@ mod tests {
         open_configured_duckdb, parquet_rows_page, parquet_total_rows, query_rows_with_limit,
         query_schema, schema_from_flattened, start_socket_server_for_payload,
         table_schema_for_alias, AppRuntimeState, ParquetSchemaColumn, WorkspaceSourceKind,
-        WorkspaceTableRegistration, DUCKDB_MEMORY_CAP_BYTES,
+        WorkspaceTableRegistration, DUCKDB_MEMORY_CAP_BYTES, default_delimiter_for_path,
+        peek_source, resolve_workspace_delimiter,
     };
     use futures_util::StreamExt;
+    use duckdb::Connection;
     use std::fs;
     use std::io::ErrorKind;
     use std::sync::Arc;
@@ -2279,6 +2433,7 @@ mod tests {
                 is_glob: false,
                 source_kind: WorkspaceSourceKind::Parquet,
                 delimiter: None,
+                row_count: None,
             },
             WorkspaceTableRegistration {
                 alias: "right_tbl".to_string(),
@@ -2286,6 +2441,7 @@ mod tests {
                 is_glob: false,
                 source_kind: WorkspaceSourceKind::Parquet,
                 delimiter: None,
+                row_count: None,
             },
         ];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
@@ -2325,6 +2481,7 @@ mod tests {
             is_glob: false,
             source_kind: WorkspaceSourceKind::Parquet,
             delimiter: None,
+            row_count: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
 
@@ -2357,6 +2514,7 @@ mod tests {
             is_glob: false,
             source_kind: WorkspaceSourceKind::Parquet,
             delimiter: None,
+            row_count: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
 
@@ -2442,6 +2600,7 @@ mod tests {
             is_glob: false,
             source_kind: WorkspaceSourceKind::Parquet,
             delimiter: None,
+            row_count: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
 
@@ -2477,6 +2636,7 @@ mod tests {
             is_glob: false,
             source_kind: WorkspaceSourceKind::Delimited,
             delimiter: None,
+            row_count: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply csv workspace table");
 
@@ -2508,6 +2668,7 @@ mod tests {
             is_glob: false,
             source_kind: WorkspaceSourceKind::Delimited,
             delimiter: Some("\t".to_string()),
+            row_count: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply tsv workspace table");
 
@@ -2523,6 +2684,124 @@ mod tests {
         assert_eq!(rows[1][1].as_deref(), Some("beta"));
 
         let _ = fs::remove_file(&tsv_path);
+    }
+
+    fn delimited_registration(alias: &str, path: &str, is_glob: bool) -> WorkspaceTableRegistration {
+        WorkspaceTableRegistration {
+            alias: alias.to_string(),
+            file_path: path.to_string(),
+            is_glob,
+            source_kind: WorkspaceSourceKind::Delimited,
+            delimiter: resolve_workspace_delimiter(&WorkspaceSourceKind::Delimited, path, None)
+                .expect("resolve delimiter"),
+            row_count: None,
+        }
+    }
+
+    fn query_two_rows(conn: &Connection, sql: &str) -> Vec<Vec<Option<String>>> {
+        let schema = query_schema(conn, sql).expect("schema");
+        let (rows, _) = query_rows_with_limit(conn, sql, &schema, 10).expect("rows");
+        rows
+    }
+
+    #[test]
+    fn default_delimiter_maps_extensions() {
+        assert_eq!(default_delimiter_for_path("a.tsv"), Some('\t'));
+        assert_eq!(default_delimiter_for_path("A.PSV"), Some('|'));
+        assert_eq!(default_delimiter_for_path("dir/*.psv"), Some('|'));
+        assert_eq!(default_delimiter_for_path("a.csv"), None);
+        assert_eq!(default_delimiter_for_path("a.txt"), None);
+    }
+
+    #[test]
+    fn workspace_query_reads_psv_with_pipe_delimiter() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let path = unique_test_output_path("psv");
+        fs::write(&path, "id|label\n1|alpha\n2|beta\n").expect("write psv fixture");
+
+        let reg = delimited_registration("psv_tbl", &path, false);
+        assert_eq!(reg.delimiter.as_deref(), Some("|"));
+        apply_workspace_tables(&conn, &[reg]).expect("apply psv table");
+
+        let rows = query_two_rows(&conn, "SELECT id, label FROM psv_tbl ORDER BY id");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][1].as_deref(), Some("alpha"));
+        assert_eq!(rows[1][1].as_deref(), Some("beta"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn workspace_query_sniffs_pipe_delimited_txt() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let path = unique_test_output_path("txt");
+        fs::write(&path, "id|label|score\n1|alpha|3.5\n2|beta|4.0\n").expect("write txt fixture");
+
+        let reg = delimited_registration("txt_tbl", &path, false);
+        assert_eq!(reg.delimiter, None, ".txt should defer to the sniffer");
+        apply_workspace_tables(&conn, &[reg]).expect("apply txt table");
+
+        let schema = query_schema(&conn, "SELECT * FROM txt_tbl").expect("txt schema");
+        assert_eq!(schema.len(), 3, "pipe-delimited .txt must split into 3 columns");
+        let rows = query_two_rows(&conn, "SELECT id, label FROM txt_tbl ORDER BY id");
+        assert_eq!(rows[0][1].as_deref(), Some("alpha"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn workspace_query_reads_csv_glob_folder() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let dir = std::path::PathBuf::from(unique_test_output_path("dir"));
+        fs::create_dir_all(&dir).expect("create glob dir");
+        fs::write(dir.join("a.csv"), "id,label\n1,alpha\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "id,label\n2,beta\n").expect("write b.csv");
+        let pattern = dir.join("*.csv").to_string_lossy().to_string();
+
+        let reg = delimited_registration("glob_tbl", &pattern, true);
+        apply_workspace_tables(&conn, &[reg.clone()]).expect("apply glob table");
+        let rows = query_two_rows(&conn, "SELECT id, label FROM glob_tbl ORDER BY id");
+        assert_eq!(rows.len(), 2);
+
+        let peek = peek_source(&conn, &reg).expect("peek glob");
+        assert_eq!(peek.matched_files, Some(2));
+        assert_eq!(peek.detected_delimiter.as_deref(), Some(","));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peek_source_detects_psv_and_returns_sample_rows() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let path = unique_test_output_path("psv");
+        let mut contents = String::from("id|label\n");
+        for i in 0..8 {
+            contents.push_str(&format!("{i}|row{i}\n"));
+        }
+        fs::write(&path, contents).expect("write psv fixture");
+
+        let peek = peek_source(&conn, &delimited_registration("p", &path, false)).expect("peek psv");
+        assert_eq!(peek.detected_delimiter.as_deref(), Some("|"));
+        assert_eq!(peek.has_header, Some(true));
+        assert_eq!(peek.schema.len(), 2);
+        assert_eq!(peek.rows.len(), 5);
+        assert_eq!(peek.matched_files, None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn peek_source_errors_when_glob_matches_nothing() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let dir = std::path::PathBuf::from(unique_test_output_path("emptydir"));
+        fs::create_dir_all(&dir).expect("create dir");
+        let pattern = dir.join("*.psv").to_string_lossy().to_string();
+        let err = peek_source(&conn, &delimited_registration("p", &pattern, true))
+            .err()
+            .expect("empty glob should error");
+        assert!(err.contains("No files match"), "unexpected error: {err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2664,6 +2943,7 @@ pub fn run() {
             start_arrow_socket_server,
             write_text_report,
             register_workspace_table,
+            peek_workspace_source,
             list_workspace_tables,
             rename_workspace_table,
             remove_workspace_table,

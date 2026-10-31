@@ -2,7 +2,7 @@ import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { WorkspaceTableInfo, WorkspaceSchemaByAlias, SummarizeRow } from "../types";
-import { INTERNAL_TOOLS_ENABLED } from "../constants";
+import { INTERNAL_TOOLS_ENABLED, PARQUET_EXTENSIONS, DELIMITED_EXTENSIONS, WORKSPACE_FOLDER_FILE_TYPES } from "../constants";
 import { detectSourceKind, formatWorkspaceDelimiter, appendGlobPattern } from "../utils";
 
 export interface WorkspaceTableRegistryProps {
@@ -47,6 +47,7 @@ export function WorkspaceTableRegistry({
   const [aliasInput, setAliasInput] = useState("");
   const [pathInput, setPathInput] = useState("");
   const [isGlob, setIsGlob] = useState(false);
+  const [globExt, setGlobExt] = useState("parquet");
   const [delimiterInput, setDelimiterInput] = useState("");
   const [bulkSelectMode, setBulkSelectMode] = useState(false);
   const [bulkSelectedAliases, setBulkSelectedAliases] = useState<Set<string>>(new Set());
@@ -62,8 +63,8 @@ export function WorkspaceTableRegistry({
     const filters = isGlob
       ? []
       : [
-          { name: "Parquet", extensions: ["parquet"] },
-          { name: "Delimited", extensions: ["csv", "tsv", "txt", "data"] },
+          { name: "Parquet", extensions: PARQUET_EXTENSIONS },
+          { name: "Delimited text", extensions: DELIMITED_EXTENSIONS },
         ];
     const selected = await open({
       title: isGlob ? "Select Workspace Source Folder" : "Select Workspace Table Source",
@@ -73,7 +74,7 @@ export function WorkspaceTableRegistry({
     });
     if (selected && !Array.isArray(selected)) {
       if (isGlob) {
-        setPathInput(appendGlobPattern(selected, "*.parquet"));
+        setPathInput(appendGlobPattern(selected, `*.${globExt}`));
       } else {
         setPathInput(selected);
       }
@@ -175,6 +176,13 @@ export function WorkspaceTableRegistry({
           />
           glob
         </label>
+        {isGlob ? (
+          <select value={globExt} aria-label="Folder file type" onChange={(e) => setGlobExt(e.currentTarget.value)}>
+            {WORKSPACE_FOLDER_FILE_TYPES.map((t) => (
+              <option key={t.ext} value={t.ext}>{t.label}</option>
+            ))}
+          </select>
+        ) : null}
         <button type="button" onClick={() => void pickPath()} disabled={loading}>
           Browse
         </button>

@@ -11,7 +11,20 @@ export const ACCEPTANCE_GATE_TIMEOUT_MS = 15000;
 export const PERSPECTIVE_RESTORE_TIMEOUT_DEFAULT_MS = 8000;
 export const PERSPECTIVE_RESTORE_TIMEOUT_CHART_MS = 20000;
 
-export const DELIMITED_EXTENSIONS = ["csv", "tsv", "txt", "data"];
+export const PARQUET_EXTENSIONS = ["parquet"];
+export const DELIMITED_EXTENSIONS = ["csv", "tsv", "psv", "txt", "data"];
+/** Every extension that can be mounted as a workspace table. Single source of truth for
+ *  file pickers, drag-and-drop filtering and source-kind detection. */
+export const WORKSPACE_EXTENSIONS = [...PARQUET_EXTENSIONS, ...DELIMITED_EXTENSIONS];
+/** File types offered when mounting a folder of files (glob). */
+export const WORKSPACE_FOLDER_FILE_TYPES: Array<{ ext: string; label: string }> = [
+  { ext: "parquet", label: "Parquet (*.parquet)" },
+  { ext: "csv", label: "CSV (*.csv)" },
+  { ext: "tsv", label: "TSV (*.tsv)" },
+  { ext: "psv", label: "Pipe-delimited (*.psv)" },
+  { ext: "txt", label: "Text (*.txt)" },
+  { ext: "data", label: "Data (*.data)" },
+];
 
 export const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";
 export const UI_WORKSPACE_SLOW_MODE_STORAGE_KEY = "parqbench.ui.workspace_slow_mode_enabled";

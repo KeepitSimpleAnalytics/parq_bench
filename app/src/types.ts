@@ -90,6 +90,18 @@ export type WorkspaceTableInfo = {
   source_kind: "parquet" | "delimited";
   delimiter: string | null;
   file_size_bytes: number | null;
+  /** From Parquet footer metadata; null for delimited sources. */
+  row_count: number | null;
+};
+
+export type SourcePeekResponse = {
+  source_kind: "parquet" | "delimited";
+  detected_delimiter: string | null;
+  has_header: boolean | null;
+  matched_files: number | null;
+  row_count: number | null;
+  schema: PreviewColumn[];
+  rows: Array<Array<string | null>>;
 };
 
 export type WorkspaceSchemaByAlias = Record<string, PreviewColumn[]>;
