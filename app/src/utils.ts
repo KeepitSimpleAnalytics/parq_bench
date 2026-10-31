@@ -5,12 +5,12 @@ import type {
   QueryHistoryEntry,
   AppSettings,
   WorkspaceSourceKind,
+  RecentFile,
 } from "./types";
 import {
   DEFAULT_SETTINGS,
   DELIMITED_EXTENSIONS,
   UI_THEME_STORAGE_KEY,
-  UI_WORKSPACE_SLOW_MODE_STORAGE_KEY,
   UI_ACTIVE_TAB_STORAGE_KEY,
   UI_RECENT_FILES_STORAGE_KEY,
   UI_QUERY_HISTORY_STORAGE_KEY,
@@ -59,21 +59,109 @@ export function readThemeMode(): ThemeMode {
   return "system";
 }
 
-export function readWorkspaceSlowModeEnabled(): boolean {
-  if (typeof window === "undefined") {
-    return false;
-  }
-  return window.localStorage.getItem(UI_WORKSPACE_SLOW_MODE_STORAGE_KEY) === "1";
-}
-
-export function readRecentFiles(): string[] {
+/** Reads recent files; accepts the pre-0.6 format (plain path strings). */
+export function readRecentFiles(): RecentFile[] {
   if (typeof window === "undefined") return [];
   try {
     const raw = window.localStorage.getItem(UI_RECENT_FILES_STORAGE_KEY);
     if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x: unknown) => typeof x === "string").slice(0, RECENT_FILES_MAX) : [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const files: RecentFile[] = [];
+    for (const item of parsed) {
+      if (typeof item === "string") {
+        files.push({ path: item, sizeBytes: null, openedAt: null });
+      } else if (item && typeof item === "object" && typeof (item as RecentFile).path === "string") {
+        const entry = item as RecentFile;
+        files.push({
+          path: entry.path,
+          sizeBytes: typeof entry.sizeBytes === "number" ? entry.sizeBytes : null,
+          openedAt: typeof entry.openedAt === "number" ? entry.openedAt : null,
+        });
+      }
+    }
+    return files.slice(0, RECENT_FILES_MAX);
   } catch { return []; }
+}
+
+export function fileNameFromPath(path: string): string {
+  return path.replace(/[/\\]+$/, "").split(/[/\\]/).pop() ?? path;
+}
+
+/** 1536 -> "1.5 KB", 4478948229 -> "4.17 GB". */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 ? 0 : value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unit]}`;
+}
+
+/** Compact row counts for tight spaces: 25 -> "25", 150000 -> "150K", 180000000 -> "180M". */
+export function formatCompactCount(count: number): string {
+  if (count < 1000) return String(count);
+  const units: Array<[number, string]> = [[1e9, "B"], [1e6, "M"], [1e3, "K"]];
+  for (const [size, suffix] of units) {
+    if (count >= size) {
+      const value = count / size;
+      return `${value >= 100 ? value.toFixed(0) : value.toFixed(1).replace(/\.0$/, "")}${suffix}`;
+    }
+  }
+  return String(count);
+}
+
+/** 412 -> "412 ms", 17403 -> "17.4 s". */
+export function formatDuration(ms: number): string {
+  return ms < 1000 ? `${ms.toFixed(0)} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`;
+}
+
+export function formatRelativeTime(epochMs: number, now = Date.now()): string {
+  const diffMin = Math.round((now - epochMs) / 60000);
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin} min ago`;
+  const diffHours = Math.round(diffMin / 60);
+  if (diffHours < 24) return `${diffHours} h ago`;
+  const diffDays = Math.round(diffHours / 24);
+  if (diffDays === 1) return "yesterday";
+  if (diffDays < 7) return `${diffDays} days ago`;
+  return new Date(epochMs).toLocaleDateString();
+}
+
+/** Builds a valid, unused table alias from a file path (e.g. "Sales 2024.csv" -> "sales_2024"). */
+export function suggestAlias(filePath: string, taken: Iterable<string>): string {
+  const takenLower = new Set(Array.from(taken, (a) => a.toLowerCase()));
+  const base = fileNameFromPath(filePath).replace(/\*/g, "").replace(/\.[^.]+$/, "");
+  let sanitized = base.replace(/[^A-Za-z0-9_]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "").toLowerCase();
+  if (!sanitized) sanitized = "table";
+  if (!/^[a-z_]/.test(sanitized)) sanitized = `_${sanitized}`;
+  let alias = sanitized;
+  let counter = 2;
+  while (takenLower.has(alias)) {
+    alias = `${sanitized}_${counter}`;
+    counter += 1;
+  }
+  return alias;
+}
+
+export function isValidAlias(alias: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(alias);
+}
+
+/** Human label for a delimiter character. */
+export function describeDelimiter(value: string | null): string {
+  switch (value) {
+    case null: return "auto-detected";
+    case ",": return "comma";
+    case "\t": return "tab";
+    case "|": return "pipe";
+    case ";": return "semicolon";
+    default: return `"${value}"`;
+  }
 }
 
 export function readQueryHistory(): QueryHistoryEntry[] {

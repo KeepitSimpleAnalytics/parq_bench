@@ -20,7 +20,9 @@ interface UsePerspectiveParams {
   firstViewportMs: number | null;
   openStartRef: React.MutableRefObject<number | null>;
   settings: AppSettings;
-  onError: (error: string) => void;
+  /** Receives errors with the context (tab) whose action failed. */
+  onError: (error: string, context: PerspectiveContext) => void;
+  /** Preview tab view mode; only driven by preview-context loads. */
   onViewModeChange: (mode: ViewMode) => void;
 }
 
@@ -62,7 +64,40 @@ export function usePerspective({
     return "preview";
   }
 
+  const contextRef = useRef<PerspectiveContext>("preview");
+  const loadSeqRef = useRef(0);
+
+  /**
+   * Frees the viewer's view and its table. Only call this when the viewer element is about
+   * to unmount (context switch): a deleted <perspective-viewer> cannot be reused.
+   */
+  async function releaseViewer() {
+    const viewer = perspectiveViewerRef.current as (HTMLElement & { delete?: () => Promise<void> }) | null;
+    const table = perspectiveTableRef.current;
+    perspectiveTableRef.current = null;
+    try {
+      await viewer?.delete?.();
+    } catch (err) {
+      console.warn("Perspective viewer cleanup failed:", err);
+    }
+    try {
+      await table?.delete?.();
+    } catch (err) {
+      console.warn("Perspective table cleanup failed:", err);
+    }
+  }
+
+  function switchContext(next: PerspectiveContext): Promise<void> {
+    if (contextRef.current === next) return Promise.resolve();
+    contextRef.current = next;
+    const released = releaseViewer();
+    setPerspectiveContext(next);
+    return released;
+  }
+
   function resetPerspective() {
+    loadSeqRef.current += 1; // cancel any in-flight load
+    void switchContext("preview");
     perspectiveStatusRef.current = "idle";
     perspectiveReadyMsRef.current = null;
     perspectiveErrorRef.current = null;
@@ -71,7 +106,6 @@ export function usePerspective({
     setPerspectiveError(null);
     setPerspectiveLoadedForFile(null);
     setPerspectiveReadyMs(null);
-    setPerspectiveContext("preview");
   }
 
   async function waitForPerspectiveViewerReady(timeoutMs = 3000): Promise<
@@ -147,9 +181,13 @@ export function usePerspective({
   async function loadPerspectiveDataset(
     dataset: Array<Record<string, unknown>>,
     restoreConfig: Record<string, unknown>,
-    options?: { loadedForFile?: string; trackOpenTiming?: boolean; context?: PerspectiveContext },
+    options?: { loadedForFile?: string; trackOpenTiming?: boolean; context?: PerspectiveContext; /** Switch the preview to pivot view when loaded. */ activate?: boolean },
   ) {
     let stage = "runtime";
+    const loadContext: PerspectiveContext = options?.context ?? "preview";
+    // A newer load (or a reset) supersedes this one; stale loads stop without touching state.
+    const seq = ++loadSeqRef.current;
+    const isStale = () => seq !== loadSeqRef.current;
     setPerspectiveStatus("loading");
     setPerspectiveStage(stage);
     setPerspectiveError(null);
@@ -162,10 +200,11 @@ export function usePerspective({
       if (!targetContext) {
         throw new Error("Perspective viewer unavailable in current layout. Add Preview or Workspace tab.");
       }
-      if (perspectiveContext !== targetContext) {
-        setPerspectiveContext(targetContext);
+      if (contextRef.current !== targetContext) {
+        await switchContext(targetContext);
         await waitForNextPaint();
       }
+      if (isStale()) return;
 
       await ensurePerspectiveRuntime((next) => {
         stage = next;
@@ -180,6 +219,7 @@ export function usePerspective({
       stage = "viewer.ready";
       setPerspectiveStage(stage);
       const viewer = await withTimeout("viewer.ready()", waitForPerspectiveViewerReady(), 5000);
+      if (isStale()) return;
 
       const previousTable = perspectiveTableRef.current;
 
@@ -191,6 +231,10 @@ export function usePerspective({
       stage = "table";
       setPerspectiveStage(stage);
       const table = await withTimeout("worker.table()", worker.table(dataset));
+      if (isStale()) {
+        try { await (table as { delete?: () => Promise<void> }).delete?.(); } catch { /* never loaded into a view */ }
+        return;
+      }
       perspectiveTableRef.current = table as { delete?: () => Promise<void> | void };
       stage = "viewer.load";
       setPerspectiveStage(stage);
@@ -210,6 +254,7 @@ export function usePerspective({
         await waitForNextPaint();
         await withTimeout("viewer.restore(retry)", viewer.restore(restoreConfig), restoreTimeoutMs);
       }
+      if (isStale()) return;
       if (previousTable?.delete) {
         try {
           await previousTable.delete();
@@ -229,8 +274,9 @@ export function usePerspective({
       if (options?.trackOpenTiming && openStartRef.current !== null) {
         setPerspectiveReadyMs(performance.now() - openStartRef.current);
       }
-      onViewModeChange("perspective");
+      if (loadContext === "preview" && options?.activate) onViewModeChange("perspective");
     } catch (err) {
+      if (isStale()) return;
       const plugin = String(restoreConfig.plugin ?? "");
       const timeoutHint =
         stage === "viewer.restore" && String(err).includes("timed out")
@@ -239,8 +285,8 @@ export function usePerspective({
       setPerspectiveStatus("error");
       setPerspectiveStage("error");
       setPerspectiveError(`stage=${stage} ${String(err)}${timeoutHint}`);
-      onError(`Perspective error: stage=${stage} ${String(err)}${timeoutHint}`);
-      onViewModeChange("virtual");
+      onError(`Chart failed (${stage}): ${String(err)}${timeoutHint}`, loadContext);
+      if (loadContext === "preview") onViewModeChange("virtual");
     }
   }
 
@@ -270,24 +316,13 @@ export function usePerspective({
     return { status: "timeout", readyMs: perspectiveReadyMsRef.current, error: "Perspective timeout" };
   }
 
-  // Auto-load Perspective from preview data
-  useEffect(() => {
-    if (
-      !preview ||
-      firstViewportMs === null ||
-      perspectiveLoadedForFile === preview.file_path ||
-      perspectiveStatus !== "idle"
-    ) {
-      return;
-    }
-
+  /** Loads the currently paged-in preview rows (up to the configured cap) into the viewer. */
+  function loadPreviewIntoPerspective(activate = false) {
+    if (!preview) return Promise.resolve();
     const rowIndexes = Array.from(loadedRows.keys())
       .sort((a, b) => a - b)
       .slice(0, settings.perspectiveMaxRows);
-
-    if (rowIndexes.length === 0) {
-      return;
-    }
+    if (rowIndexes.length === 0) return Promise.resolve();
 
     const dataset = rowIndexes.map((rowIndex) => {
       const row = loadedRows.get(rowIndex) ?? [];
@@ -298,11 +333,26 @@ export function usePerspective({
       return item;
     });
 
-    void loadPerspectiveDataset(dataset, { plugin: "Datagrid" }, {
+    return loadPerspectiveDataset(dataset, { plugin: "Datagrid" }, {
       loadedForFile: preview.file_path,
-      trackOpenTiming: true,
+      trackOpenTiming: perspectiveLoadedForFile !== preview.file_path,
       context: "preview",
+      activate,
     });
+  }
+
+  // Auto-load Perspective from preview data once the first viewport is painted.
+  useEffect(() => {
+    if (
+      !preview ||
+      firstViewportMs === null ||
+      perspectiveLoadedForFile === preview.file_path ||
+      perspectiveStatus !== "idle" ||
+      loadedRows.size === 0
+    ) {
+      return;
+    }
+    void loadPreviewIntoPerspective();
   }, [firstViewportMs, loadedRows, perspectiveLoadedForFile, perspectiveStatus, preview]);
 
   // Hide/show Perspective's built-in configure (settings) button via shadow DOM style injection
@@ -336,6 +386,7 @@ export function usePerspective({
     perspectiveLoadedForFile,
     perspectiveViewerRef,
     loadPerspectiveDataset,
+    loadPreviewIntoPerspective,
     waitForPerspectiveResult,
     resetPerspective,
   };

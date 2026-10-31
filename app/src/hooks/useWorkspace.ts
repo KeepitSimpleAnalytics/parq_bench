@@ -32,7 +32,7 @@ export function useWorkspace({
   setLoading,
   setError,
 }: UseWorkspaceParams) {
-  const [workspaceChartPlugin, setWorkspaceChartPlugin] = useState<WorkspaceChartPlugin>("Datagrid");
+  const [workspaceChartPlugin, setWorkspaceChartPlugin] = useState<WorkspaceChartPlugin>("X Bar");
   const [workspaceChartX, setWorkspaceChartX] = useState("");
   const [workspaceChartY, setWorkspaceChartY] = useState("");
   const [workspaceChartAgg, setWorkspaceChartAgg] = useState("sum");

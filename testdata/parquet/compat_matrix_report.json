@@ -1,14 +1,14 @@
 {
-  "generated_at": "unix:1771726989s",
+  "generated_at": "unix:1793463583s",
   "duckdb_version": "v1.4.4",
-  "fixtures_dir": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet",
+  "fixtures_dir": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet",
   "total_files": 5,
   "pass_count": 5,
   "fail_count": 0,
   "results": [
     {
       "file_name": "flat_small.parquet",
-      "file_path": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\flat_small.parquet",
+      "file_path": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\flat_small.parquet",
       "file_size_bytes": 422388,
       "row_count": 50000,
       "column_count": 7,
@@ -53,7 +53,7 @@
     },
     {
       "file_name": "flat_wide.parquet",
-      "file_path": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\flat_wide.parquet",
+      "file_path": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\flat_wide.parquet",
       "file_size_bytes": 65881,
       "row_count": 30000,
       "column_count": 22,
@@ -158,7 +158,7 @@
     },
     {
       "file_name": "nested_collections.parquet",
-      "file_path": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\nested_collections.parquet",
+      "file_path": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\nested_collections.parquet",
       "file_size_bytes": 143669,
       "row_count": 15000,
       "column_count": 3,
@@ -187,7 +187,7 @@
     },
     {
       "file_name": "nested_struct.parquet",
-      "file_path": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\nested_struct.parquet",
+      "file_path": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\nested_struct.parquet",
       "file_size_bytes": 207560,
       "row_count": 40000,
       "column_count": 3,
@@ -216,7 +216,7 @@
     },
     {
       "file_name": "perf_medium.parquet",
-      "file_path": "E:\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\perf_medium.parquet",
+      "file_path": "E:\\win_apps\\parq_bench\\app\\src-tauri\\..\\..\\testdata\\parquet\\perf_medium.parquet",
       "file_size_bytes": 3227278,
       "row_count": 500000,
       "column_count": 7,

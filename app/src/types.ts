@@ -171,6 +171,15 @@ export type ExportPayload = {
 export type ThemeMode = "system" | "light" | "dark";
 export type ResolvedTheme = "light" | "dark";
 export type ActiveTab = "preview" | "sql";
+export type ResultTab = "results" | "chart" | "plan";
+
+export type RecentFile = {
+  path: string;
+  /** Size in bytes when last opened; null for entries saved by older versions. */
+  sizeBytes: number | null;
+  /** Epoch ms when last opened; null for entries saved by older versions. */
+  openedAt: number | null;
+};
 
 export type QueryHistoryEntry = {
   sql: string;

@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-A high-performance desktop application for exploring large Parquet files locally. Built with Tauri, React, and DuckDB. No cloud, no accounts, no telemetry — all processing happens on your machine.
+A high-performance desktop application for exploring large Parquet and delimited text files locally. Built with Tauri, React, and DuckDB. No cloud, no accounts, no telemetry — all processing happens on your machine.
 
 ## Installation
 
@@ -14,29 +14,26 @@ Download the latest installer for your platform from the [Releases](https://gith
 
 Open any Parquet file and see data instantly. Parq-Bench uses virtual scrolling to handle files with millions of rows — only the visible rows are rendered, so scrolling stays smooth regardless of file size.
 
-- **Open a file** — Click **Open Parquet** or press `Ctrl+O` to pick a `.parquet` file. You can also drag and drop a file onto the preview pane.
-- **File metadata** — Path, size, row count, and column count are shown at the top.
-- **Schema at a glance** — Column names and DuckDB types appear in the header row.
-- **Interactive pivot view** — Once Perspective.js finishes loading in the background, click **Switch to interactive view** to pivot, sort, filter, and chart the first 5,000 rows.
-- **Close file** — Click **Close File** to clear the preview and free memory.
+- **Open a file** — Click **Open file…** or press `Ctrl+O` to pick a `.parquet` file, drop a file onto the Preview tab, or pick one from **Recent**.
+- **File header** — File name, row count, column count and size, with the full path underneath. **Copy column names**, **Open…** and **Close** (×) sit next to it.
+- **Column types** — Each column header shows its DuckDB type. Numbers are right-aligned; `NULL` values are shown in grey italics.
+- **Pivot & chart** — Switch from **Rows** to **Pivot & chart** to pivot, sort, filter and chart the first 5,000 rows (configurable) with Perspective.js. It loads in the background, so the switch is instant.
 
 ### SQL Tab
 
-Register one or more files as named tables, then write SQL to query across them.
+Add files as named tables in the sidebar, then write SQL to query across them.
 
-- **Mount a table** — Enter an alias (e.g. `sales`), browse for a file, and click **Mount**. The table is immediately queryable. You can also drag and drop files onto the SQL pane to auto-register them.
-- **Glob patterns** — Check the **Glob** box to mount an entire folder of Parquet files as a single table (e.g. `logs/*.parquet`).
-- **CSV / TSV support** — Enable **Slo-mo** mode to register delimited text files (CSV, TSV, TXT) with optional custom delimiter.
-- **Rename or remove tables** — Click an alias to rename it in-place. Click **x** to remove.
-- **Schema summary** — Column names and types for each mounted table are shown as compact pills below the table list.
-- **SQL editor** — A Monaco-powered editor with SQL syntax highlighting, word wrap, and line numbers. Resize it vertically by adjusting the font size with the **A-** / **A+** buttons.
-- **Autocomplete** — Type `.` after a table alias to get column suggestions. SQL keywords, table names, and column names from all mounted tables are offered as completions.
-- **Run a query** — Click **Run SQL** or press `Ctrl+Enter`. Results appear in a scrollable table below the editor with row count, execution time, and column types.
-- **Export results** — Click **Export Query CSV** or **Export Query Parquet** to save query output to a file. Press `Ctrl+Shift+E` to export as CSV directly.
-- **Table statistics** — Click **Stats** on any mounted table to view column-level statistics. By default, stats are read from Parquet metadata (instant). Enable **Deep Stats** in Settings to run a full table scan for exact values.
-- **EXPLAIN ANALYZE** — Press `Ctrl+Shift+Enter` to see the query execution plan instead of result rows.
-- **Schema diff** — Compare column schemas between two mounted tables to spot added, removed, or type-changed columns.
-- **Charting** — After running a query, pick a chart plugin (Y Bar, X Bar, Y Line, Treemap), select X/Y columns and an aggregation (sum, avg, count, min, max), then click **Chart in Perspective** to visualize results interactively.
+- **Add a table** — Click **Add table**, choose **Single file** or **Folder of files**, and browse. The table name is filled in from the file name, the format and delimiter are detected, and the first 5 rows are shown before you add it. You can also drop files onto the SQL tab to add them directly.
+- **Supported files** — Parquet (`.parquet`) and delimited text (`.csv`, `.tsv`, `.psv`, `.txt`, `.data`). `.tsv` uses tabs and `.psv` uses pipes; other text files have their delimiter auto-detected. You can override it with comma, tab, pipe, semicolon or any single character.
+- **Folders** — **Folder of files** mounts every file of one type in a folder as a single table (e.g. `exports\*.csv`) and shows how many files match.
+- **Tables sidebar** — Expand a table to see its columns and types. Each table has **Stats**, **Rename**, **Insert SELECT** and **Remove**. Parquet tables show their row count. **Search columns** filters tables by column name.
+- **Compare schemas** — Compare two tables to see columns only in one side or with a changed type.
+- **SQL editor** — Monaco-powered editor with SQL highlighting and autocomplete (type `.` after a table name for its columns). Drag the bottom edge to resize it.
+- **Run a query** — Click **Run** or press `Ctrl+Enter`. A running query shows its elapsed time.
+- **Results / Chart / Plan** — Results show row count, time and column types. **Chart** draws a Bar, Column, Line, Treemap or Table chart and updates as you change the group-by column, value and summary. **Plan** shows `EXPLAIN ANALYZE` output (**Explain** or `Ctrl+Shift+Enter`).
+- **Export** — **Export ▾** saves all result rows (not just the displayed ones) as CSV or Parquet. `Ctrl+Shift+E` exports CSV directly.
+- **Table statistics** — **Stats** reads column statistics from Parquet metadata (instant). Turn on **Exact table stats** in Settings for a full scan.
+- **History** — The last 50 queries, with row counts and timings.
 
 ### Keyboard Shortcuts
 
@@ -46,32 +43,29 @@ Register one or more files as named tables, then write SQL to query across them.
 | `Ctrl+1` | Switch to Preview tab |
 | `Ctrl+2` | Switch to SQL tab |
 | `Ctrl+Enter` | Run SQL query |
-| `Ctrl+Shift+Enter` | Explain Analyze |
-| `Ctrl+Shift+E` | Export query as CSV |
+| `Ctrl+Shift+Enter` | Explain query plan |
+| `Ctrl+Shift+E` | Export results as CSV |
 | `Ctrl+,` | Open Settings |
-| `Escape` | Close About dialog or clear error |
-
-### Theme
-
-Choose **System**, **Light**, or **Dark** from the dropdown in the header. The choice persists across sessions.
+| `Escape` | Close dialog, exit full window, or dismiss error |
 
 ### Settings
 
-Press `Ctrl+,` to open the Settings panel. Configurable options:
+Press `Ctrl+,` or click the gear icon. Configurable options:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| SQL Row Limit | 200 | Maximum rows returned by workspace queries |
-| Perspective Max Rows | 5,000 | Maximum rows loaded into the Perspective viewer |
-| Editor Font Size | 13 px | Monaco editor font size |
-| Expand Mode | Fullscreen | Fullscreen overlay or drag-to-resize panels |
-| Deep Stats | Off | Full table scan for exact stats (may be slow on large files) |
-| Show Visualization | On | Toggle chart controls in workspace |
-| Show Perspective Configure | On | Toggle Perspective's built-in settings button |
+| Theme | System | System, Light or Dark |
+| Editor font size | 13 px | Monaco editor font size |
+| Expand panels | Full window | Full window overlay or drag-to-resize panels |
+| Result row limit | 200 | Rows shown per SQL query (exports include every row) |
+| Chart row limit | 5,000 | Rows loaded into pivot and chart views |
+| Exact table stats | Off | Full table scan for exact stats (may be slow on large files) |
+| Show charting *(Advanced)* | On | The Chart tab in SQL results |
+| Show chart configure panel *(Advanced)* | On | Perspective's built-in settings button |
 
 ### Memory Guard
 
-Parq-Bench monitors system memory. If usage gets too high, the memory guard trips and blocks file opens and queries until pressure drops. A banner explains what happened and how to recover.
+Parq-Bench monitors its own memory use, shown in the status bar. If it passes 85% of system RAM, a banner explains that opening files and running queries is paused until usage drops, and offers to close the open file.
 
 ## Building from Source
 
@@ -136,7 +130,7 @@ npm run release:gate
 This runs:
 
 - TypeScript + Vite production build
-- `cargo check` and `cargo test` (13 integration tests)
+- `cargo check` and `cargo test` (22 tests)
 - Parquet fixture regeneration (5 synthetic files)
 - DuckDB compatibility matrix (5/5 must pass)
 

@@ -27,12 +27,30 @@ export const WORKSPACE_FOLDER_FILE_TYPES: Array<{ ext: string; label: string }> 
 ];
 
 export const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";
-export const UI_WORKSPACE_SLOW_MODE_STORAGE_KEY = "parqbench.ui.workspace_slow_mode_enabled";
 export const UI_ACTIVE_TAB_STORAGE_KEY = "parqbench.ui.active_tab";
 export const UI_RECENT_FILES_STORAGE_KEY = "parqbench.ui.recent_files";
 export const UI_QUERY_HISTORY_STORAGE_KEY = "parqbench.ui.query_history";
 export const UI_SETTINGS_STORAGE_KEY = "parqbench.ui.settings";
 export const RECENT_FILES_MAX = 15;
+/** Mirrors PANIC_RSS_RATIO in the backend: app RSS / total RAM that trips the memory guard. */
+export const MEMORY_GUARD_RATIO = 0.85;
+
+/** Chart types shown to users, mapped to Perspective plugin names. */
+export const CHART_TYPES: Array<{ plugin: import("./types").WorkspaceChartPlugin; label: string }> = [
+  { plugin: "X Bar", label: "Bar" },
+  { plugin: "Y Bar", label: "Column" },
+  { plugin: "Y Line", label: "Line" },
+  { plugin: "Treemap", label: "Treemap" },
+  { plugin: "Datagrid", label: "Table" },
+];
+
+export const CHART_AGGREGATES: Array<{ value: string; label: string }> = [
+  { value: "sum", label: "Sum" },
+  { value: "avg", label: "Average" },
+  { value: "count", label: "Count" },
+  { value: "min", label: "Min" },
+  { value: "max", label: "Max" },
+];
 export const QUERY_HISTORY_MAX = 50;
 
 export const DEFAULT_SETTINGS: AppSettings = {
