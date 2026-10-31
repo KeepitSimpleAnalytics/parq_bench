@@ -17,6 +17,7 @@ Open any Parquet file and see data instantly. Parq-Bench uses virtual scrolling 
 - **Open a file** — Click **Open file…** or press `Ctrl+O` to pick a `.parquet` file, drop a file onto the Preview tab, or pick one from **Recent**.
 - **File header** — File name, row count, column count and size, with the full path underneath. **Copy column names**, **Open…** and **Close** (×) sit next to it.
 - **Column types** — Each column header shows its DuckDB type. Numbers are right-aligned; `NULL` values are shown in grey italics.
+- **Query with SQL** — Adds the open file as a table (or reuses it if it is already added), switches to the SQL tab and starts a `SELECT` for it. Ctrl+Z in the editor brings back what you had.
 - **Pivot & chart** — Switch from **Rows** to **Pivot & chart** to pivot, sort, filter and chart the first 5,000 rows (configurable) with Perspective.js. It loads in the background, so the switch is instant.
 
 ### SQL Tab
@@ -26,7 +27,7 @@ Add files as named tables in the sidebar, then write SQL to query across them.
 - **Add a table** — Click **Add table**, choose **Single file** or **Folder of files**, and browse. The table name is filled in from the file name, the format and delimiter are detected, and the first 5 rows are shown before you add it. You can also drop files onto the SQL tab to add them directly.
 - **Supported files** — Parquet (`.parquet`) and delimited text (`.csv`, `.tsv`, `.psv`, `.txt`, `.data`). `.tsv` uses tabs and `.psv` uses pipes; other text files have their delimiter auto-detected. You can override it with comma, tab, pipe, semicolon or any single character.
 - **Folders** — **Folder of files** mounts every file of one type in a folder as a single table (e.g. `exports\*.csv`) and shows how many files match.
-- **Tables sidebar** — Expand a table to see its columns and types. Each table has **Stats**, **Rename**, **Insert SELECT** and **Remove**. Parquet tables show their row count. **Search columns** filters tables by column name.
+- **Tables sidebar** — Expand a table to see its columns and types. Each table has **Stats**, **Rename**, **Insert SELECT** and **Remove**; single-file Parquet tables also have **Preview**, which opens them in the Preview tab for full scrolling. Parquet tables show their row count. **Search columns** filters tables by column name.
 - **Compare schemas** — Compare two tables to see columns only in one side or with a changed type.
 - **SQL editor** — Monaco-powered editor with SQL highlighting and autocomplete (type `.` after a table name for its columns). Drag the bottom edge to resize it.
 - **Run a query** — Click **Run** or press `Ctrl+Enter`. A running query shows its elapsed time.

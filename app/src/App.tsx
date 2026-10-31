@@ -196,6 +196,20 @@ function App() {
     workspaceEditorRef.current?.setValue(nextSql);
   }
 
+  /** Replaces the whole editor content as one undoable edit (Ctrl+Z restores the previous SQL). */
+  function replaceWorkspaceSqlUndoable(nextSql: string): void {
+    const editor = workspaceEditorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model) {
+      replaceWorkspaceSql(nextSql);
+      return;
+    }
+    editor.pushUndoStop();
+    editor.executeEdits("replace-sql", [{ range: model.getFullModelRange(), text: nextSql, forceMoveMarkers: true }]);
+    editor.pushUndoStop();
+    setWorkspaceSql(nextSql);
+  }
+
   /** Inserts SQL at the cursor, or replaces the untouched starter query. */
   function insertWorkspaceSql(text: string): void {
     const editor = workspaceEditorRef.current;
@@ -466,6 +480,42 @@ function App() {
     setAcceptanceGate(null);
     setPreviewError(null);
     if (expandedPanel === "preview") setExpandedPanel(null);
+  }
+
+  /** Same file path regardless of slash direction or letter case (Windows paths). */
+  function samePath(a: string, b: string): boolean {
+    const norm = (p: string) => p.replace(/\\/g, "/").toLowerCase();
+    return norm(a) === norm(b);
+  }
+
+  async function queryPreviewInSql() {
+    if (!preview) return;
+    const filePath = preview.file_path;
+    const existing = workspaceTables.find((t) => !t.is_glob && samePath(t.file_path, filePath));
+    let alias = existing?.alias ?? null;
+    if (!alias) {
+      alias = suggestAlias(filePath, workspaceTables.map((t) => t.alias));
+      setLoading(true);
+      setPreviewError(null);
+      try {
+        await invoke("register_workspace_table", { alias, filePath, isGlob: false, sourceKind: "parquet" });
+        await refreshWorkspaceTables();
+      } catch (err) {
+        setPreviewError(friendlyError(String(err)));
+        return;
+      } finally {
+        setLoading(false);
+      }
+    }
+    setActiveTab("sql");
+    replaceWorkspaceSqlUndoable(`SELECT * FROM ${alias} LIMIT 100`);
+    workspaceEditorRef.current?.focus();
+  }
+
+  async function previewTable(table: WorkspaceTableInfo) {
+    setActiveTab("preview");
+    if (preview && samePath(preview.file_path, table.file_path)) return;
+    await openPreviewPath(table.file_path);
   }
 
   function showPivot() {
@@ -809,6 +859,7 @@ function App() {
             onClearRecent={() => setRecentFiles([])}
             onCloseFile={closePreview}
             onCopyAllColumns={() => preview && void copyToClipboard(preview.schema.map((c) => c.name).join(", "))}
+            onQueryWithSql={() => void queryPreviewInSql()}
             viewMode={viewMode}
             onShowRows={() => setViewMode("virtual")}
             onShowPivot={showPivot}
@@ -856,6 +907,7 @@ function App() {
               onRemoveSelected={(aliases) => void removeTables([...aliases])}
               onInsertSelect={(alias) => insertWorkspaceSql(`SELECT * FROM ${alias} LIMIT 100`)}
               onShowStats={setStatsAlias}
+              onPreview={(table) => void previewTable(table)}
               onCompareSchemas={() => setDiffOpen(true)}
               onError={setSqlError}
             />

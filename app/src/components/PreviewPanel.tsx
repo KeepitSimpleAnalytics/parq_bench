@@ -16,6 +16,8 @@ export interface PreviewPanelProps {
   onClearRecent: () => void;
   onCloseFile: () => void;
   onCopyAllColumns: () => void;
+  /** Adds the open file as a workspace table and switches to the SQL tab. */
+  onQueryWithSql: () => void;
   viewMode: ViewMode;
   onShowRows: () => void;
   onShowPivot: () => void;
@@ -101,6 +103,10 @@ export function PreviewPanel(p: PreviewPanelProps) {
               {p.pivotStatus === "loading" || p.pivotStatus === "idle" ? "Pivot & chart…" : "Pivot & chart"}
             </button>
           </div>
+          <button type="button" className="btn btn-outline" onClick={p.onQueryWithSql} disabled={p.loading || p.blocked}
+            title="Add this file as a table and open it in the SQL tab">
+            Query with SQL
+          </button>
           <button type="button" className="btn" onClick={p.onCopyAllColumns}>Copy column names</button>
           <button type="button" className="btn" title="Open another file (Ctrl+O)" onClick={p.onOpen} disabled={p.loading || p.blocked}>Open…</button>
           <button type="button" className="icon-btn" aria-label="Close file" title="Close file" onClick={p.onCloseFile}>

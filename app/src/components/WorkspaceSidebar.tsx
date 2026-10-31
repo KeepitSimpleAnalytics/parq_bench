@@ -16,6 +16,8 @@ export interface WorkspaceSidebarProps {
   onRemoveSelected: (aliases: Set<string>) => void;
   onInsertSelect: (alias: string) => void;
   onShowStats: (alias: string) => void;
+  /** Opens a single-file Parquet table in the Preview tab for full scrolling. */
+  onPreview: (table: WorkspaceTableInfo) => void;
   onCompareSchemas: () => void;
   onError: (message: string) => void;
 }
@@ -48,6 +50,7 @@ export function WorkspaceSidebar({
   onRemoveSelected,
   onInsertSelect,
   onShowStats,
+  onPreview,
   onCompareSchemas,
   onError,
 }: WorkspaceSidebarProps) {
@@ -198,6 +201,12 @@ export function WorkspaceSidebar({
                     </button>
                   ) : null}
                   <div className="tree-actions">
+                    {table.source_kind === "parquet" && !table.is_glob ? (
+                      <button type="button" className="btn btn-xs" title="Scroll the whole file in the Preview tab"
+                        onClick={() => onPreview(table)} disabled={loading}>
+                        Preview
+                      </button>
+                    ) : null}
                     <button type="button" className="btn btn-xs" onClick={() => onShowStats(table.alias)} disabled={loading}>Stats</button>
                     <button type="button" className="btn btn-xs" onClick={() => { renameCancelledRef.current = false; setRenaming({ alias: table.alias, value: table.alias }); }} disabled={loading}>Rename</button>
                     <button type="button" className="btn btn-xs" onClick={() => onInsertSelect(table.alias)}>Insert SELECT</button>
