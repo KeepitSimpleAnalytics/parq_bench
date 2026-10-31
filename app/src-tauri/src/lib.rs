@@ -595,10 +595,8 @@ fn schema_from_flattened(flattened: &[FlattenedColumn]) -> Vec<ParquetSchemaColu
 }
 
 fn parquet_total_rows(conn: &Connection, normalized_path: &str, source: &str) -> Result<u64, String> {
-    let metadata_sql = format!(
-        "SELECT COALESCE(SUM(num_rows), 0)::UBIGINT FROM parquet_metadata('{normalized_path}')"
-    );
-    if let Ok(rows) = conn.query_row(&metadata_sql, [], |row| row.get::<_, u64>(0)) {
+    // Footer metadata gives the count without scanning; fall back to COUNT(*) only if it fails.
+    if let Ok(rows) = parquet_metadata_row_count(conn, normalized_path) {
         return Ok(rows);
     }
 
@@ -2219,7 +2217,7 @@ mod tests {
         apply_workspace_tables, build_workspace_schema_diff, compute_duckdb_memory_limit_bytes,
         compute_duckdb_threads, escape_sql_string_literal, export_workspace_query_to_file,
         flattened_columns_for_source, is_select_like, normalize_single_sql_statement,
-        open_configured_duckdb, parquet_rows_page, parquet_total_rows, query_rows_with_limit,
+        open_configured_duckdb, parquet_metadata_row_count, parquet_rows_page, parquet_total_rows, query_rows_with_limit,
         query_schema, schema_from_flattened, start_socket_server_for_payload,
         table_schema_for_alias, AppRuntimeState, ParquetSchemaColumn, WorkspaceSourceKind,
         WorkspaceTableRegistration, DUCKDB_MEMORY_CAP_BYTES, default_delimiter_for_path,
@@ -2298,6 +2296,27 @@ mod tests {
         assert_eq!(rows[0][1].as_deref(), Some("alpha"));
         assert_eq!(rows[2][0].as_deref(), Some("3"));
         assert_eq!(rows[2][1].as_deref(), Some("gamma"));
+
+        let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn parquet_row_count_comes_from_footer_metadata() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let temp_file = unique_test_parquet_path();
+        let escaped_path = escape_sql_string_literal(&temp_file);
+        conn.execute_batch(&format!(
+            "COPY (SELECT range AS id FROM range(1234)) TO '{escaped_path}' (FORMAT PARQUET, ROW_GROUP_SIZE 500);"
+        ))
+        .expect("write multi-row-group parquet fixture");
+
+        // Must succeed on its own; parquet_total_rows only scans if this errors.
+        let from_metadata =
+            parquet_metadata_row_count(&conn, &escaped_path).expect("row count from metadata");
+        assert_eq!(from_metadata, 1234);
+        let source = format!("read_parquet('{escaped_path}')");
+        assert_eq!(parquet_total_rows(&conn, &escaped_path, &source).expect("total rows"), 1234);
 
         let _ = fs::remove_file(&temp_file);
     }
