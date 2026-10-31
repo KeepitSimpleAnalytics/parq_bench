@@ -1,6 +1,6 @@
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import type { PreviewResponse, RecentFile, ViewMode } from "../types";
-import { fileNameFromPath, formatBytes, formatRelativeTime } from "../utils";
+import { detectSourceKind, fileNameFromPath, formatBytes, formatRelativeTime, isRemotePath } from "../utils";
 import { Icon } from "./Icon";
 import { InlineError } from "./AppChrome";
 
@@ -13,6 +13,8 @@ export interface PreviewPanelProps {
   onDismissError: () => void;
   onOpen: () => void;
   onOpenRecent: (path: string) => void;
+  /** Opens a Parquet file from an http(s):// link. */
+  onOpenUrl: (url: string) => void;
   onClearRecent: () => void;
   onCloseFile: () => void;
   onCopyAllColumns: () => void;
@@ -33,6 +35,10 @@ export interface PreviewPanelProps {
 
 export function PreviewPanel(p: PreviewPanelProps) {
   const { preview } = p;
+  const [url, setUrl] = useState("");
+  // Preview reads Parquet only; other links (CSV, …) can be added as tables in the SQL tab.
+  const urlIsLink = isRemotePath(url);
+  const urlValid = urlIsLink && detectSourceKind(url) === "parquet";
 
   if (!preview) {
     return (
@@ -42,10 +48,18 @@ export function PreviewPanel(p: PreviewPanelProps) {
           <div className="drop-card">
             <Icon name="upload" size={32} className="accent" />
             <h1 className="drop-title">Open a Parquet file</h1>
-            <p className="muted">Drop a .parquet file here, or browse for one. Nothing leaves your machine.</p>
+            <p className="muted">Drop a .parquet file here, or browse for one. Local files never leave your machine.</p>
             <button type="button" className="btn btn-primary" onClick={p.onOpen} disabled={p.loading || p.blocked}>
               {p.loading ? "Opening…" : "Open file…"} <kbd className="kbd kbd-on-primary">Ctrl+O</kbd>
             </button>
+            <form className="url-open" onSubmit={(e) => { e.preventDefault(); if (urlValid) p.onOpenUrl(url.trim()); }}>
+              <input type="url" className="input input-mono grow" aria-label="Parquet file URL" value={url}
+                placeholder="or paste a link: https://…/data.parquet" onChange={(e) => setUrl(e.currentTarget.value)} />
+              <button type="submit" className="btn btn-outline" disabled={!urlValid || p.loading || p.blocked}>Open URL</button>
+            </form>
+            {urlIsLink && !urlValid ? (
+              <p className="muted small">Preview opens Parquet links. Add other files from the web as a table in the SQL tab.</p>
+            ) : null}
           </div>
           {p.devTools}
           {p.recentFiles.length > 0 ? (
@@ -85,7 +99,7 @@ export function PreviewPanel(p: PreviewPanelProps) {
           <div className="file-title-row">
             <h1 className="file-title">{fileNameFromPath(preview.file_path)}</h1>
             <span className="muted small">
-              {preview.total_rows.toLocaleString()} rows · {preview.schema.length} columns · {formatBytes(preview.file_size_bytes)}
+              {preview.total_rows.toLocaleString()} rows · {preview.schema.length} columns · {preview.file_size_bytes === null ? "from URL" : formatBytes(preview.file_size_bytes)}
             </span>
           </div>
           <span className="file-path" title={preview.file_path}>{preview.file_path}</span>

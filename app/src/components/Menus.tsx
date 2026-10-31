@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { QueryHistoryEntry } from "../types";
+import type { ExportFormat, QueryHistoryEntry } from "../types";
 import { Icon } from "./Icon";
 
 /** Closes a popover on outside click or Escape. */
@@ -23,7 +23,7 @@ function useDismiss(open: boolean, setOpen: (v: boolean) => void) {
   return ref;
 }
 
-export function ExportMenu({ disabled, onExport }: { disabled: boolean; onExport: (format: "csv" | "parquet") => void }) {
+export function ExportMenu({ disabled, onExport }: { disabled: boolean; onExport: (format: ExportFormat) => void }) {
   const [open, setOpen] = useState(false);
   const ref = useDismiss(open, setOpen);
   return (
@@ -39,6 +39,9 @@ export function ExportMenu({ disabled, onExport }: { disabled: boolean; onExport
           </button>
           <button type="button" role="menuitem" className="menu-item" onClick={() => { setOpen(false); onExport("parquet"); }}>
             Parquet
+          </button>
+          <button type="button" role="menuitem" className="menu-item" onClick={() => { setOpen(false); onExport("xlsx"); }}>
+            Excel (.xlsx)
           </button>
         </div>
       ) : null}

@@ -1,6 +1,8 @@
-import React from "react";
-import type { AppSettings, ThemeMode } from "../types";
-import { DEFAULT_SETTINGS } from "../constants";
+import React, { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import type { AppSettings, ExtensionStatus, ThemeMode } from "../types";
+import { DEFAULT_SETTINGS, MANAGED_EXTENSIONS } from "../constants";
+import { formatBytes, friendlyError } from "../utils";
 import { Modal } from "./Modal";
 
 export interface SettingsModalProps {
@@ -29,6 +31,62 @@ function SettingRow({ label, hint, htmlFor, children }: { label: string; hint?: 
       </div>
       {children}
     </div>
+  );
+}
+
+/** On-demand DuckDB extensions: status is read only while Settings is open, never at startup. */
+function ExtensionsSection({ open }: { open: boolean }) {
+  const [statuses, setStatuses] = useState<ExtensionStatus[] | null>(null);
+  const [installing, setInstalling] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setError(null);
+    invoke<ExtensionStatus[]>("list_extensions")
+      .then(setStatuses)
+      .catch((err) => setError(friendlyError(String(err))));
+  }, [open]);
+
+  async function download(name: string) {
+    setInstalling(name);
+    setError(null);
+    try {
+      setStatuses(await invoke<ExtensionStatus[]>("install_extension", { name }));
+    } catch (err) {
+      setError(friendlyError(String(err)));
+    } finally {
+      setInstalling(null);
+    }
+  }
+
+  return (
+    <>
+      <h3 className="section-label">Extensions</h3>
+      <p className="setting-hint">
+        Downloaded automatically the first time a query needs one. Download ahead of time to use them offline.
+      </p>
+      {MANAGED_EXTENSIONS.map((ext) => {
+        const status = statuses?.find((s) => s.name === ext.name);
+        return (
+          <SettingRow key={ext.name} label={ext.label} hint={ext.purpose}>
+            {status === undefined ? (
+              <span className="muted small">{error ? "—" : "Checking…"}</span>
+            ) : status.installed ? (
+              <span className="ext-status muted small">
+                Downloaded{status.size_bytes !== null ? ` · ${formatBytes(status.size_bytes)}` : ""}
+              </span>
+            ) : (
+              <button type="button" className="btn btn-xs" disabled={installing !== null}
+                aria-label={`Download ${ext.label} extension`} onClick={() => void download(ext.name)}>
+                {installing === ext.name ? "Downloading…" : "Download"}
+              </button>
+            )}
+          </SettingRow>
+        );
+      })}
+      {error ? <p className="text-danger small">{error}</p> : null}
+    </>
   );
 }
 
@@ -104,6 +162,8 @@ export const SettingsModal = React.memo(function SettingsModal({
         <input id="set-deep" type="checkbox" className="checkbox" checked={settings.deepStats}
           onChange={(e) => onSettingsChange((s) => ({ ...s, deepStats: e.target.checked }))} />
       </SettingRow>
+
+      <ExtensionsSection open={open} />
 
       <details className="settings-advanced">
         <summary className="section-label">Advanced</summary>

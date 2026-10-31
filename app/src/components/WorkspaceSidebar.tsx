@@ -23,8 +23,17 @@ export interface WorkspaceSidebarProps {
 }
 
 function kindLabel(table: WorkspaceTableInfo): string {
+  const base = baseKindLabel(table);
+  return table.is_remote ? `URL · ${base}` : base;
+}
+
+function baseKindLabel(table: WorkspaceTableInfo): string {
   if (table.source_kind === "parquet") return "PARQUET";
-  const match = table.file_path.toLowerCase().match(/\.([a-z0-9]+)$/);
+  if (table.source_kind === "excel") return "XLSX";
+  if (table.source_kind === "sqlite") return "SQLITE";
+  if (table.source_kind === "delta") return "DELTA";
+  // URLs: ignore ?query and #fragment when reading the extension.
+  const match = table.file_path.toLowerCase().replace(/[?#].*$/, "").match(/\.([a-z0-9]+)$/);
   const ext = match ? match[1].toUpperCase() : "TEXT";
   const delim = table.delimiter === "\t" ? "\\t" : table.delimiter;
   return delim && ext !== "CSV" && ext !== "TSV" ? `${ext} ${delim}` : ext;
@@ -133,7 +142,7 @@ export function WorkspaceSidebar({
         {tables.length === 0 ? (
           <div className="sidebar-empty">
             <p>No tables yet.</p>
-            <p className="muted small">Add a Parquet, CSV, TSV, PSV or TXT file — or drop files anywhere on this tab.</p>
+            <p className="muted small">Add a Parquet, CSV/TSV/PSV/TXT, Excel or SQLite file, a Delta table or a web link — or drop files anywhere on this tab.</p>
           </div>
         ) : null}
         {query && visibleTables.length === 0 ? <p className="sidebar-empty muted small">No columns match “{searchInput.trim()}”.</p> : null}
@@ -149,7 +158,7 @@ export function WorkspaceSidebar({
 
           return (
             <div key={table.alias} className="tree-item">
-              <div className="tree-row" title={table.file_path}>
+              <div className="tree-row" title={table.object_name ? `${table.file_path} · ${table.source_kind === "excel" ? "sheet" : "table"} ${table.object_name}` : table.file_path}>
                 {selectMode ? (
                   <input type="checkbox" className="checkbox" aria-label={`Select ${table.alias}`}
                     checked={selected.has(table.alias)} onChange={() => setSelected((s) => toggle(s, table.alias))} />
@@ -173,7 +182,7 @@ export function WorkspaceSidebar({
                 )}
                 <span className={table.source_kind === "parquet" ? "kind-badge" : "kind-badge is-text"}>{kindLabel(table)}</span>
                 {table.is_glob ? <span className="kind-badge is-folder" title="Folder of files">folder</span> : null}
-                <span className="tree-count" title={table.row_count !== null ? `${table.row_count.toLocaleString()} rows` : "Row count needs a full scan for text files"}>
+                <span className="tree-count" title={table.row_count !== null ? `${table.row_count.toLocaleString()} rows` : "Row count is only shown for Parquet files (other sources need a full scan)"}>
                   {table.row_count !== null ? formatCompactCount(table.row_count) : ""}
                 </span>
               </div>

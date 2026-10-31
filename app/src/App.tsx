@@ -17,7 +17,7 @@ import type {
   WorkspaceTableInfo,
   WorkspaceSchemaByAlias,
   WorkspaceQueryResponse,
-  WorkspaceSourceKind,
+  RegisterTableRequest,
   ExportPayload,
   ActiveTab,
   ResultTab,
@@ -43,6 +43,7 @@ import {
 } from "./constants";
 import {
   detectSourceKind,
+  isRemotePath,
   readActiveTab,
   readRecentFiles,
   readQueryHistory,
@@ -106,6 +107,8 @@ function App() {
   const [aboutOpen, setAboutOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [addTableOpen, setAddTableOpen] = useState(false);
+  /** Path pre-filled in the Add table dialog (a dropped SQLite file still needs a table choice). */
+  const [addTableInitialPath, setAddTableInitialPath] = useState<string | undefined>(undefined);
   const [diffOpen, setDiffOpen] = useState(false);
   const [statsAlias, setStatsAlias] = useState<string | null>(null);
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>(() => readRecentFiles());
@@ -250,23 +253,29 @@ function App() {
         nextSchemas[r.value.alias] = r.value.schema;
         return;
       }
-      schemaErrors.push(`Schema unavailable for ${tables[index]?.alias ?? "unknown"}: ${friendlyError(String(r.reason))}`);
+      const alias = tables[index]?.alias ?? "unknown";
+      const message = friendlyError(String(r.reason));
+      // Messages for unreadable tables already name the table.
+      schemaErrors.push(message.includes(`"${alias}"`) ? message : `Schema unavailable for ${alias}: ${message}`);
     });
 
     setWorkspaceTableSchemas(nextSchemas);
     if (schemaErrors.length > 0) {
-      const schemaMessage = schemaErrors.join(" | ");
-      setSqlError((previous) => (previous ? `${previous} | ${schemaMessage}` : schemaMessage));
+      // Refreshes can repeat (e.g. at startup); don't stack the same message twice.
+      setSqlError((previous) => {
+        const parts = previous ? previous.split(" | ") : [];
+        for (const e of schemaErrors) if (!parts.includes(e)) parts.push(e);
+        return parts.join(" | ");
+      });
     }
   }
 
-  async function registerTable(
-    alias: string, filePath: string, isGlob: boolean, sourceKind: WorkspaceSourceKind, delimiter?: string,
-  ): Promise<boolean> {
+  async function registerTable(request: RegisterTableRequest): Promise<boolean> {
+    const { alias } = request;
     setLoading(true);
     setSqlError(null);
     try {
-      await invoke("register_workspace_table", { alias, filePath, isGlob, sourceKind, delimiter });
+      await invoke("register_workspace_table", { ...request });
       await refreshWorkspaceTables();
       // Only replace the untouched starter query; never edit the user's SQL.
       const current = readWorkspaceSql();
@@ -482,8 +491,9 @@ function App() {
     if (expandedPanel === "preview") setExpandedPanel(null);
   }
 
-  /** Same file path regardless of slash direction or letter case (Windows paths). */
+  /** Same file path regardless of slash direction or letter case (Windows paths). URLs compare exactly. */
   function samePath(a: string, b: string): boolean {
+    if (isRemotePath(a) || isRemotePath(b)) return a.trim() === b.trim();
     const norm = (p: string) => p.replace(/\\/g, "/").toLowerCase();
     return norm(a) === norm(b);
   }
@@ -564,16 +574,38 @@ function App() {
       return;
     }
 
+    // A SQLite database needs a table choice, so it opens the Add table dialog instead.
+    const sqlitePaths = validPaths.filter((p) => detectSourceKind(p) === "sqlite");
+    const sqlitePath = sqlitePaths[0];
+    const directPaths = validPaths.filter((p) => detectSourceKind(p) !== "sqlite");
+    const openSqliteDialog = () => {
+      if (!sqlitePath) return;
+      if (sqlitePaths.length > 1) {
+        setSqlError(
+          `SQLite databases are added one at a time. Choose a table from ${fileNameFromPath(sqlitePath)} now, then add `
+          + `${sqlitePaths.slice(1).map(fileNameFromPath).join(", ")} with Add table.`,
+        );
+      }
+      setActiveTab("sql");
+      setAddTableInitialPath(sqlitePath);
+      setAddTableOpen(true);
+    };
+    if (directPaths.length === 0) {
+      openSqliteDialog();
+      return;
+    }
+
     setLoading(true);
     setSqlError(null);
     try {
       const taken = workspaceTables.map((t) => t.alias);
       let firstAlias: string | null = null;
-      for (const filePath of validPaths) {
+      for (const filePath of directPaths) {
         const alias = suggestAlias(filePath, taken);
         taken.push(alias);
         if (!firstAlias) firstAlias = alias;
         // Delimiter is left to the backend: .tsv/.psv map to tab/pipe, others are sniffed.
+        // Excel files mount their first sheet.
         await invoke<WorkspaceTableInfo>("register_workspace_table", {
           alias,
           filePath,
@@ -586,6 +618,7 @@ function App() {
         replaceWorkspaceSql(`SELECT * FROM ${firstAlias} LIMIT 100`);
       }
       setActiveTab("sql");
+      openSqliteDialog();
     } catch (err) {
       setSqlError(friendlyError(String(err)));
       try { await refreshWorkspaceTables(); } catch { /* keep the original error visible */ }
@@ -856,6 +889,7 @@ function App() {
             onDismissError={() => setPreviewError(null)}
             onOpen={() => void openParquetPreview()}
             onOpenRecent={(path) => void openPreviewPath(path)}
+            onOpenUrl={(url) => void openPreviewPath(url)}
             onClearRecent={() => setRecentFiles([])}
             onCloseFile={closePreview}
             onCopyAllColumns={() => preview && void copyToClipboard(preview.schema.map((c) => c.name).join(", "))}
@@ -896,7 +930,7 @@ function App() {
               tables={workspaceTables}
               schemas={workspaceTableSchemas}
               loading={loading}
-              onAddTable={() => setAddTableOpen(true)}
+              onAddTable={() => { setAddTableInitialPath(undefined); setAddTableOpen(true); }}
               onRemove={(alias) => void removeTables([alias])}
               onRename={(oldAlias, newAlias) => void renameTable(oldAlias, newAlias)}
               onClearAll={() => {
@@ -1006,6 +1040,7 @@ function App() {
         onClose={() => setAddTableOpen(false)}
         existingAliases={workspaceTables.map((t) => t.alias)}
         busy={loading}
+        initialPath={addTableInitialPath}
         onAdd={registerTable}
       />
       <TableStatsDialog alias={statsAlias} deep={settings.deepStats} onClose={() => setStatsAlias(null)} />

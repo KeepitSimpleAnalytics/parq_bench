@@ -33,7 +33,8 @@ export type PreviewColumn = {
 
 export type PreviewResponse = {
   file_path: string;
-  file_size_bytes: number;
+  /** null for URLs (no local file to measure). */
+  file_size_bytes: number | null;
   total_rows: number;
   row_offset: number;
   row_limit: number;
@@ -87,15 +88,22 @@ export type WorkspaceTableInfo = {
   alias: string;
   file_path: string;
   is_glob: boolean;
-  source_kind: "parquet" | "delimited";
+  /** http(s):// source, read through the on-demand httpfs extension. */
+  is_remote: boolean;
+  source_kind: WorkspaceSourceKind;
   delimiter: string | null;
+  /** Excel sheet or SQLite table/view name. */
+  object_name: string | null;
+  /** Excel only: first row holds column names. */
+  header: boolean | null;
+  /** null for folders, URLs and Delta tables. */
   file_size_bytes: number | null;
-  /** From Parquet footer metadata; null for delimited sources. */
+  /** From Parquet footer metadata; null for other sources. */
   row_count: number | null;
 };
 
 export type SourcePeekResponse = {
-  source_kind: "parquet" | "delimited";
+  source_kind: WorkspaceSourceKind;
   detected_delimiter: string | null;
   has_header: boolean | null;
   matched_files: number | null;
@@ -105,7 +113,31 @@ export type SourcePeekResponse = {
 };
 
 export type WorkspaceSchemaByAlias = Record<string, PreviewColumn[]>;
-export type WorkspaceSourceKind = "parquet" | "delimited";
+export type WorkspaceSourceKind = "parquet" | "delimited" | "excel" | "sqlite" | "delta";
+
+/** What the Add table dialog sends to register_workspace_table. */
+export type RegisterTableRequest = {
+  alias: string;
+  filePath: string;
+  isGlob: boolean;
+  sourceKind: WorkspaceSourceKind;
+  delimiter?: string;
+  /** Excel sheet or SQLite table/view. */
+  objectName?: string;
+  /** Excel only. */
+  header?: boolean;
+};
+
+export type SqliteObject = { name: string; kind: "table" | "view" };
+
+export type ExtensionStatus = {
+  name: string;
+  installed: boolean;
+  loaded: boolean;
+  size_bytes: number | null;
+};
+
+export type ExportFormat = "csv" | "parquet" | "xlsx";
 
 export type WorkspaceQueryResponse = {
   sql: string;
@@ -138,7 +170,7 @@ export type WorkspaceSchemaDiffResponse = {
 
 export type WorkspaceExportResponse = {
   sql: string;
-  format: "csv" | "parquet";
+  format: ExportFormat;
   output_path: string;
   file_size_bytes: number;
   elapsed_ms: number;

@@ -33,6 +33,7 @@ futures-util = "0.3.31"
 tauri-plugin-dialog = "2.6.0"
 sysinfo = "0.38.1"
 tauri-plugin-clipboard-manager = "2"
+zip = { version = "9.2", default-features = false, features = ["deflate-flate2"] }
 
 # DuckDB (incl. Parquet/JSON, now statically linked) is compiled from C++ source.
 # Unoptimized, `tauri dev` previews run ~2x slower than on 1.4.4, where Parquet came

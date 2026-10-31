@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
-A high-performance desktop application for exploring large Parquet and delimited text files locally. Built with Tauri, React, and DuckDB. No cloud, no accounts, no telemetry — all processing happens on your machine.
+A high-performance desktop application for exploring large Parquet and delimited text files locally, plus Excel, SQLite and Delta Lake tables. Built with Tauri, React, and DuckDB. No cloud, no accounts, no telemetry — all processing happens on your machine. The only network use is a one-time download of an optional DuckDB extension when you first use a feature that needs it (see [Extensions](#extensions)), and reading files you open from a URL.
 
 ## Installation
 
@@ -14,7 +14,7 @@ Download the latest installer for your platform from the [Releases](https://gith
 
 Open any Parquet file and see data instantly. Parq-Bench uses virtual scrolling to handle files with millions of rows — only the visible rows are rendered, so scrolling stays smooth regardless of file size.
 
-- **Open a file** — Click **Open file…** or press `Ctrl+O` to pick a `.parquet` file, drop a file onto the Preview tab, or pick one from **Recent**.
+- **Open a file** — Click **Open file…** or press `Ctrl+O` to pick a `.parquet` file, drop a file onto the Preview tab, or pick one from **Recent**. To open a Parquet file from the web, paste an `https://` link and click **Open URL**.
 - **File header** — File name, row count, column count and size, with the full path underneath. **Copy column names**, **Open…** and **Close** (×) sit next to it.
 - **Column types** — Each column header shows its DuckDB type. Numbers are right-aligned; `NULL` values are shown in grey italics.
 - **Query with SQL** — Adds the open file as a table (or reuses it if it is already added), switches to the SQL tab and starts a `SELECT` for it. Ctrl+Z in the editor brings back what you had.
@@ -26,13 +26,16 @@ Add files as named tables in the sidebar, then write SQL to query across them.
 
 - **Add a table** — Click **Add table**, choose **Single file** or **Folder of files**, and browse. The table name is filled in from the file name, the format and delimiter are detected, and the first 5 rows are shown before you add it. You can also drop files onto the SQL tab to add them directly.
 - **Supported files** — Parquet (`.parquet`) and delimited text (`.csv`, `.tsv`, `.psv`, `.txt`, `.data`). `.tsv` uses tabs and `.psv` uses pipes; other text files have their delimiter auto-detected. You can override it with comma, tab, pipe, semicolon or any single character.
-- **Folders** — **Folder of files** mounts every file of one type in a folder as a single table (e.g. `exports\*.csv`) and shows how many files match.
+- **Excel** (`.xlsx`) — Pick a sheet and whether the first row holds column names. Excel stores numbers as decimals, so numeric columns arrive as `DOUBLE`. Dropped `.xlsx` files add their first sheet.
+- **SQLite** (`.db`, `.sqlite`, `.sqlite3`) — Pick a table or view from the database. Dropping a SQLite file opens **Add table** so you can choose one.
+- **Web URLs** — Type an `https://` link to a Parquet or CSV file in the path field. It is read from the web each time a query runs.
+- **Folders** — **Folder of files** mounts every file of one type in a folder as a single table (e.g. `exports\*.csv`) and shows how many files match. Choose **Delta Lake table (folder)** to add a Delta table folder.
 - **Tables sidebar** — Expand a table to see its columns and types. Each table has **Stats**, **Rename**, **Insert SELECT** and **Remove**; single-file Parquet tables also have **Preview**, which opens them in the Preview tab for full scrolling. Parquet tables show their row count. **Search columns** filters tables by column name.
 - **Compare schemas** — Compare two tables to see columns only in one side or with a changed type.
 - **SQL editor** — Monaco-powered editor with SQL highlighting and autocomplete (type `.` after a table name for its columns). Drag the bottom edge to resize it.
 - **Run a query** — Click **Run** or press `Ctrl+Enter`. A running query shows its elapsed time.
 - **Results / Chart / Plan** — Results show row count, time and column types. **Chart** draws a Bar, Column, Line, Treemap or Table chart and updates as you change the group-by column, value and summary. **Plan** shows `EXPLAIN ANALYZE` output (**Explain** or `Ctrl+Shift+Enter`).
-- **Export** — **Export ▾** saves all result rows (not just the displayed ones) as CSV or Parquet. `Ctrl+Shift+E` exports CSV directly.
+- **Export** — **Export ▾** saves all result rows (not just the displayed ones) as CSV, Parquet or Excel (`.xlsx`, up to 1,048,576 rows). `Ctrl+Shift+E` exports CSV directly.
 - **Table statistics** — **Stats** reads column statistics from Parquet metadata (instant). Turn on **Exact table stats** in Settings for a full scan.
 - **History** — The last 50 queries, with row counts and timings.
 
@@ -63,6 +66,12 @@ Press `Ctrl+,` or click the gear icon. Configurable options:
 | Exact table stats | Off | Full table scan for exact stats (may be slow on large files) |
 | Show charting *(Advanced)* | On | The Chart tab in SQL results |
 | Show chart configure panel *(Advanced)* | On | Perspective's built-in settings button |
+
+### Extensions
+
+Parquet and JSON support is built in. Excel, SQLite, web URLs, Delta Lake and time zones (`AT TIME ZONE`) use DuckDB extensions that are **downloaded automatically the first time you use them** (about 45–80 MB each) and cached in `~/.duckdb/extensions`, after which they work offline. Nothing is downloaded or loaded at startup, and none of them ship with the installer.
+
+**Settings → Extensions** shows which are downloaded and lets you download them ahead of time, for example before working offline. Other official DuckDB extensions also download automatically when a query uses one of their functions.
 
 ### Memory Guard
 
@@ -131,7 +140,7 @@ npm run release:gate
 This runs:
 
 - TypeScript + Vite production build
-- `cargo check` and `cargo test` (22 tests)
+- `cargo check` and `cargo test` (41 tests; the extension tests download Excel, SQLite and Delta extensions on their first run, so the first gate run needs internet)
 - Parquet fixture regeneration (5 synthetic files)
 - DuckDB compatibility matrix (5/5 must pass)
 

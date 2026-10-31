@@ -1071,3 +1071,12 @@ th.num .th-button { align-items: flex-end; }
   .sql-main { min-height: 600px; }
   .preview-layout, .sql-main { padding: 12px; }
 }
+
+/* Checkbox with an inline text label (e.g. "First row is column names"). */
+.checkbox-label { display: inline-flex; align-items: center; gap: 8px; min-height: 36px; white-space: nowrap; cursor: pointer; }
+
+/* Settings → Extensions */
+.ext-status { display: inline-flex; align-items: center; gap: 10px; }
+
+/* Preview empty state: open a Parquet file from a link */
+.url-open { display: flex; gap: 8px; width: 100%; max-width: 440px; margin-top: 12px; }

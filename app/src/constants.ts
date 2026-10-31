@@ -13,9 +13,15 @@ export const PERSPECTIVE_RESTORE_TIMEOUT_CHART_MS = 20000;
 
 export const PARQUET_EXTENSIONS = ["parquet"];
 export const DELIMITED_EXTENSIONS = ["csv", "tsv", "psv", "txt", "data"];
+export const EXCEL_EXTENSIONS = ["xlsx"];
+export const SQLITE_EXTENSIONS = ["db", "sqlite", "sqlite3"];
 /** Every extension that can be mounted as a workspace table. Single source of truth for
  *  file pickers, drag-and-drop filtering and source-kind detection. */
-export const WORKSPACE_EXTENSIONS = [...PARQUET_EXTENSIONS, ...DELIMITED_EXTENSIONS];
+export const WORKSPACE_EXTENSIONS = [
+  ...PARQUET_EXTENSIONS, ...DELIMITED_EXTENSIONS, ...EXCEL_EXTENSIONS, ...SQLITE_EXTENSIONS,
+];
+/** Folder-mode choice that mounts a Delta Lake table folder instead of a file pattern. */
+export const DELTA_FOLDER_TYPE = "delta";
 /** File types offered when mounting a folder of files (glob). */
 export const WORKSPACE_FOLDER_FILE_TYPES: Array<{ ext: string; label: string }> = [
   { ext: "parquet", label: "Parquet (*.parquet)" },
@@ -24,6 +30,16 @@ export const WORKSPACE_FOLDER_FILE_TYPES: Array<{ ext: string; label: string }> 
   { ext: "psv", label: "Pipe-delimited (*.psv)" },
   { ext: "txt", label: "Text (*.txt)" },
   { ext: "data", label: "Data (*.data)" },
+  { ext: DELTA_FOLDER_TYPE, label: "Delta Lake table (folder)" },
+];
+
+/** On-demand DuckDB extensions shown in Settings, in display order. `name` matches the backend. */
+export const MANAGED_EXTENSIONS: Array<{ name: string; label: string; purpose: string }> = [
+  { name: "excel", label: "Excel", purpose: "Add .xlsx tables and export results to Excel" },
+  { name: "sqlite_scanner", label: "SQLite", purpose: "Add tables from .db / .sqlite files" },
+  { name: "httpfs", label: "Web URLs", purpose: "Open Parquet and CSV files from https:// links" },
+  { name: "delta", label: "Delta Lake", purpose: "Add Delta table folders" },
+  { name: "icu", label: "Time zones", purpose: "AT TIME ZONE and local-time conversions in SQL" },
 ];
 
 export const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";

@@ -10,6 +10,9 @@ import type {
 import {
   DEFAULT_SETTINGS,
   DELIMITED_EXTENSIONS,
+  EXCEL_EXTENSIONS,
+  SQLITE_EXTENSIONS,
+  MANAGED_EXTENSIONS,
   UI_THEME_STORAGE_KEY,
   UI_ACTIVE_TAB_STORAGE_KEY,
   UI_RECENT_FILES_STORAGE_KEY,
@@ -21,8 +24,15 @@ import {
   PERSPECTIVE_RESTORE_TIMEOUT_CHART_MS,
 } from "./constants";
 
+/** http(s):// source (read through DuckDB's on-demand httpfs extension). */
+export function isRemotePath(path: string): boolean {
+  return /^\s*https?:\/\//i.test(path);
+}
+
 export function detectSourceKind(filePath: string): WorkspaceSourceKind {
-  const lower = filePath.toLowerCase().replace(/[/\\]+$/, "");
+  let lower = filePath.toLowerCase().replace(/[/\\]+$/, "");
+  // URLs: ignore ?query and #fragment when reading the extension.
+  if (isRemotePath(lower)) lower = lower.replace(/[?#].*$/, "");
   if (lower.includes("*")) {
     for (const ext of DELIMITED_EXTENSIONS) {
       if (lower.endsWith(`*.${ext}`)) return "delimited";
@@ -33,8 +43,16 @@ export function detectSourceKind(filePath: string): WorkspaceSourceKind {
   if (dot !== -1) {
     const ext = lower.slice(dot + 1);
     if (DELIMITED_EXTENSIONS.includes(ext)) return "delimited";
+    if (EXCEL_EXTENSIONS.includes(ext)) return "excel";
+    if (SQLITE_EXTENSIONS.includes(ext)) return "sqlite";
   }
   return "parquet";
+}
+
+/** Friendly name for a DuckDB extension ("sqlite_scanner" → "SQLite"). */
+export function extensionLabel(name: string): string {
+  const key = name.toLowerCase() === "sqlite" ? "sqlite_scanner" : name.toLowerCase();
+  return MANAGED_EXTENSIONS.find((e) => e.name === key)?.label ?? name;
 }
 
 export function readActiveTab(): ActiveTab {
@@ -89,8 +107,8 @@ export function fileNameFromPath(path: string): string {
 }
 
 /** 1536 -> "1.5 KB", 4478948229 -> "4.17 GB". */
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "";
+export function formatBytes(bytes: number | null): string {
+  if (bytes === null || !Number.isFinite(bytes) || bytes < 0) return "";
   const units = ["B", "KB", "MB", "GB", "TB"];
   let value = bytes;
   let unit = 0;
@@ -303,6 +321,53 @@ export function friendlyError(raw: string): string {
 
   // Strip LINE N: ... ^ caret trace (internal SQL pointer noise)
   msg = msg.replace(/\s*LINE \d+:[\s\S]*\^$/, "").trim();
+
+  // A registered table that can no longer be read (file moved/deleted, link down, …).
+  const tableFailure = msg.match(/^register workspace table '([^']+)':\s*(?:prepare source schema query:\s*)?([\s\S]*)$/i);
+  if (tableFailure) {
+    const [, alias, reason] = tableFailure;
+    const missing = reason.match(/No files found that match the pattern "([^"]+)"/i);
+    const detail = missing
+      ? `${missing[1]} no longer exists. Restore the file or remove the table.`
+      : friendlyError(reason);
+    return `Table "${alias}" can't be read: ${detail}`;
+  }
+
+  // On-demand extension couldn't be downloaded (offline, firewall, proxy).
+  const extMatch = msg.match(/Failed to download extension "([^"]+)"/i);
+  if (extMatch) {
+    return `This needs the ${extensionLabel(extMatch[1])} extension, which couldn't be downloaded. `
+      + "Connect to the internet once to get it; after that it works offline.";
+  }
+
+  // A .db file that isn't SQLite (often a DuckDB database).
+  if (/sqlite_scan|sqlite_master/i.test(msg) && /file is not a database/i.test(msg)) {
+    return "This file isn't a SQLite database. (DuckDB .db files aren't supported as tables.)";
+  }
+
+  // URL sources
+  const unreachable = msg.match(/Could not (?:connect to server|resolve hostname) error for HTTP \w+ to '([^']+)'/i);
+  if (unreachable) {
+    return `Couldn't reach ${unreachable[1]}. Check the URL and your internet connection.`;
+  }
+  const httpStatus = msg.match(/HTTP \w+ error on '([^']+)' \((HTTP \d+[^)]*)\)/i);
+  if (httpStatus) {
+    return `The server returned ${httpStatus[2]} for ${httpStatus[1]}. Check that the link is correct and publicly accessible.`;
+  }
+
+  // Excel
+  if (/Sheet row limit of '1048576' rows exceeded/i.test(msg)) {
+    return "Excel sheets hold at most 1,048,576 rows. Add a LIMIT to the query, or export to CSV or Parquet instead.";
+  }
+  const sheetMissing = msg.match(/Sheet "([^"]+)" not found in xlsx file/i);
+  if (sheetMissing) {
+    return `Sheet "${sheetMissing[1]}" isn't in this workbook.`;
+  }
+
+  // Delta
+  if (/DeltaKernel InvalidTableLocationError/i.test(msg)) {
+    return "This folder isn't a Delta table (it has no _delta_log folder).";
+  }
 
   // File not found
   if (/read file metadata:.*No such file/i.test(msg)) {

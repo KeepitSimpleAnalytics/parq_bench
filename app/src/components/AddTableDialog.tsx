@@ -1,14 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import type { SourcePeekResponse, WorkspaceSourceKind } from "../types";
-import { PARQUET_EXTENSIONS, DELIMITED_EXTENSIONS, WORKSPACE_FOLDER_FILE_TYPES } from "../constants";
+import type { ExtensionStatus, RegisterTableRequest, SourcePeekResponse, SqliteObject, WorkspaceSourceKind } from "../types";
+import {
+  PARQUET_EXTENSIONS,
+  DELIMITED_EXTENSIONS,
+  EXCEL_EXTENSIONS,
+  SQLITE_EXTENSIONS,
+  WORKSPACE_EXTENSIONS,
+  WORKSPACE_FOLDER_FILE_TYPES,
+  DELTA_FOLDER_TYPE,
+} from "../constants";
 import {
   appendGlobPattern,
   describeDelimiter,
   detectSourceKind,
+  extensionLabel,
   friendlyError,
   isNumericDuckType,
+  isRemotePath,
   isValidAlias,
   suggestAlias,
 } from "../utils";
@@ -31,18 +41,28 @@ export interface AddTableDialogProps {
   onClose: () => void;
   existingAliases: string[];
   busy: boolean;
-  onAdd: (alias: string, filePath: string, isGlob: boolean, sourceKind: WorkspaceSourceKind, delimiter?: string) => Promise<boolean>;
+  /** Pre-fills the path when the dialog opens (e.g. a dropped SQLite file that needs a table choice). */
+  initialPath?: string;
+  onAdd: (request: RegisterTableRequest) => Promise<boolean>;
 }
 
-/** Replaces the trailing "*.ext" of a folder pattern (or appends one). */
+/** Replaces the trailing "*.ext" of a folder pattern (or appends one). Delta tables take the bare folder. */
 function withFolderExt(path: string, ext: string): string {
   const trimmed = path.trim();
   if (!trimmed) return trimmed;
   const withoutPattern = trimmed.replace(/[/\\]?\*\.[A-Za-z0-9]+$/, "");
-  return appendGlobPattern(withoutPattern, `*.${ext}`);
+  return ext === DELTA_FOLDER_TYPE ? withoutPattern : appendGlobPattern(withoutPattern, `*.${ext}`);
 }
 
-export function AddTableDialog({ open: isOpen, onClose, existingAliases, busy, onAdd }: AddTableDialogProps) {
+/** DuckDB extension a source needs (downloaded on first use), or null. */
+function requiredExtension(kind: WorkspaceSourceKind, remote: boolean): string | null {
+  if (kind === "excel") return "excel";
+  if (kind === "sqlite") return "sqlite_scanner";
+  if (kind === "delta") return "delta";
+  return remote ? "httpfs" : null;
+}
+
+export function AddTableDialog({ open: isOpen, onClose, existingAliases, busy, initialPath, onAdd }: AddTableDialogProps) {
   const [mode, setMode] = useState<SourceMode>("file");
   const [path, setPath] = useState("");
   const [folderExt, setFolderExt] = useState("parquet");
@@ -54,12 +74,19 @@ export function AddTableDialog({ open: isOpen, onClose, existingAliases, busy, o
   const [peekError, setPeekError] = useState<string | null>(null);
   const [peekLoading, setPeekLoading] = useState(false);
   const peekSeq = useRef(0);
+  // Excel sheets / SQLite tables of the chosen file.
+  const [objects, setObjects] = useState<SqliteObject[] | null>(null);
+  const [objectsError, setObjectsError] = useState<string | null>(null);
+  const [objectName, setObjectName] = useState("");
+  const [header, setHeader] = useState(true);
+  const objectsSeq = useRef(0);
+  const [extensions, setExtensions] = useState<ExtensionStatus[] | null>(null);
 
   // Reset the form each time the dialog opens.
   useEffect(() => {
     if (!isOpen) return;
     setMode("file");
-    setPath("");
+    setPath(initialPath ?? "");
     setFolderExt("parquet");
     setDelimiterChoice("auto");
     setCustomDelimiter("");
@@ -67,27 +94,74 @@ export function AddTableDialog({ open: isOpen, onClose, existingAliases, busy, o
     setAliasEdited(false);
     setPeek(null);
     setPeekError(null);
-  }, [isOpen]);
+    setHeader(true);
+    setExtensions(null);
+  }, [isOpen, initialPath]);
 
   const trimmedPath = path.trim();
-  const sourceKind = detectSourceKind(trimmedPath);
-  const isGlob = mode === "folder";
+  const isDelta = mode === "folder" && folderExt === DELTA_FOLDER_TYPE;
+  const isGlob = mode === "folder" && !isDelta;
+  const remote = mode === "file" && isRemotePath(trimmedPath);
+  const sourceKind: WorkspaceSourceKind = isDelta ? "delta" : detectSourceKind(trimmedPath);
+  const needsObject = mode === "file" && !remote && (sourceKind === "excel" || sourceKind === "sqlite");
   const delimiter =
     sourceKind !== "delimited" || delimiterChoice === "auto"
       ? undefined
       : delimiterChoice === "custom"
         ? customDelimiter || undefined
         : delimiterChoice;
+  const extensionName = requiredExtension(sourceKind, remote);
 
-  // Keep the alias in sync with the path until the user edits it.
+  // Keep the alias in sync with the path (and chosen SQLite table) until the user edits it.
+  // Frozen while busy: registering refreshes existingAliases before the dialog closes,
+  // which would otherwise flash a "name_2" suggestion.
   useEffect(() => {
-    if (aliasEdited) return;
-    setAlias(trimmedPath ? suggestAlias(trimmedPath, existingAliases) : "");
-  }, [trimmedPath, aliasEdited, existingAliases]);
+    if (aliasEdited || busy) return;
+    const base = sourceKind === "sqlite" && objectName ? `${objectName}.db` : trimmedPath;
+    setAlias(trimmedPath ? suggestAlias(base, existingAliases) : "");
+  }, [trimmedPath, aliasEdited, existingAliases, sourceKind, objectName, busy]);
+
+  // Whether the needed extension is already downloaded (only checked when one is needed).
+  useEffect(() => {
+    if (!isOpen || !extensionName || extensions !== null) return;
+    invoke<ExtensionStatus[]>("list_extensions").then(setExtensions).catch(() => setExtensions([]));
+  }, [isOpen, extensionName, extensions]);
+  const extensionMissing = extensionName !== null && extensions !== null
+    && extensions.length > 0 && !extensions.find((e) => e.name === extensionName)?.installed;
+
+  // List the sheets (Excel) or tables (SQLite) of the chosen file.
+  useEffect(() => {
+    const seq = ++objectsSeq.current;
+    setObjects(null);
+    setObjectsError(null);
+    setObjectName("");
+    if (!isOpen || !needsObject || !trimmedPath) return;
+    const timer = window.setTimeout(() => {
+      const request = sourceKind === "excel"
+        ? invoke<string[]>("list_xlsx_sheets", { filePath: trimmedPath })
+          .then((names) => names.map((name): SqliteObject => ({ name, kind: "table" })))
+        : invoke<SqliteObject[]>("list_sqlite_tables", { filePath: trimmedPath });
+      request
+        .then((list) => {
+          if (seq !== objectsSeq.current) return;
+          if (list.length === 0) {
+            setObjectsError(sourceKind === "excel" ? "This workbook has no sheets." : "This database has no tables or views.");
+            return;
+          }
+          setObjects(list);
+          setObjectName(list[0].name);
+        })
+        .catch((err) => {
+          if (seq === objectsSeq.current) setObjectsError(friendlyError(String(err)));
+        });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [isOpen, needsObject, trimmedPath, sourceKind]);
 
   // Peek at the source (debounced) whenever what would be mounted changes.
   useEffect(() => {
-    if (!isOpen || !trimmedPath || (delimiterChoice === "custom" && !customDelimiter)) {
+    const waitingForObject = needsObject && !objectName;
+    if (!isOpen || !trimmedPath || waitingForObject || (delimiterChoice === "custom" && !customDelimiter)) {
       peekSeq.current += 1; // invalidate any in-flight peek
       setPeek(null);
       setPeekError(null);
@@ -102,11 +176,15 @@ export function AddTableDialog({ open: isOpen, onClose, existingAliases, busy, o
         isGlob,
         sourceKind,
         delimiter,
+        objectName: needsObject ? objectName : undefined,
+        header: sourceKind === "excel" ? header : undefined,
       })
         .then((result) => {
           if (seq !== peekSeq.current) return;
           setPeek(result);
           setPeekError(null);
+          // A first-use download may have just happened.
+          if (extensionMissing) setExtensions(null);
         })
         .catch((err) => {
           if (seq !== peekSeq.current) return;
@@ -118,21 +196,25 @@ export function AddTableDialog({ open: isOpen, onClose, existingAliases, busy, o
         });
     }, 350);
     return () => window.clearTimeout(timer);
-  }, [isOpen, trimmedPath, isGlob, sourceKind, delimiter, delimiterChoice, customDelimiter]);
+    // extensionMissing is read only to refresh the notice; it must not re-trigger a peek.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, trimmedPath, isGlob, sourceKind, delimiter, delimiterChoice, customDelimiter, needsObject, objectName, header]);
 
   async function browse() {
     if (mode === "folder") {
-      const selected = await open({ title: "Select folder", directory: true, multiple: false });
-      if (selected && !Array.isArray(selected)) setPath(appendGlobPattern(selected, `*.${folderExt}`));
+      const selected = await open({ title: isDelta ? "Select Delta table folder" : "Select folder", directory: true, multiple: false });
+      if (selected && !Array.isArray(selected)) setPath(isDelta ? selected : appendGlobPattern(selected, `*.${folderExt}`));
       return;
     }
     const selected = await open({
       title: "Select file",
       multiple: false,
       filters: [
-        { name: "Supported files", extensions: [...PARQUET_EXTENSIONS, ...DELIMITED_EXTENSIONS] },
+        { name: "Supported files", extensions: WORKSPACE_EXTENSIONS },
         { name: "Parquet", extensions: PARQUET_EXTENSIONS },
         { name: "Delimited text", extensions: DELIMITED_EXTENSIONS },
+        { name: "Excel", extensions: EXCEL_EXTENSIONS },
+        { name: "SQLite", extensions: SQLITE_EXTENSIONS },
       ],
     });
     if (selected && !Array.isArray(selected)) setPath(selected);
@@ -151,25 +233,48 @@ export function AddTableDialog({ open: isOpen, onClose, existingAliases, busy, o
 
   async function submit() {
     if (!canAdd) return;
-    const ok = await onAdd(aliasTrimmed, trimmedPath, isGlob, sourceKind, delimiter);
+    const ok = await onAdd({
+      alias: aliasTrimmed,
+      filePath: trimmedPath,
+      isGlob,
+      sourceKind,
+      delimiter,
+      objectName: needsObject ? objectName : undefined,
+      header: sourceKind === "excel" ? header : undefined,
+    });
     if (ok) onClose();
   }
 
   const detectedDelimiter = peek?.detected_delimiter ?? null;
-  const formatLine =
-    peek === null
-      ? null
-      : peek.source_kind === "parquet"
-        ? "Parquet"
-        : detectedDelimiter
-          ? `Delimited text · ${describeDelimiter(detectedDelimiter)} ( ${detectedDelimiter === "\t" ? "\\t" : detectedDelimiter} )`
-          : "Delimited text";
+  const formatLine = (() => {
+    if (peek === null) return null;
+    const prefix = remote ? "From URL · " : "";
+    switch (peek.source_kind) {
+      case "parquet": return `${prefix}Parquet`;
+      case "excel": return `Excel workbook · sheet ${objectName}`;
+      case "sqlite": return `SQLite database · ${objects?.find((o) => o.name === objectName)?.kind ?? "table"} ${objectName}`;
+      case "delta": return "Delta Lake table";
+      default:
+        return detectedDelimiter
+          ? `${prefix}Delimited text · ${describeDelimiter(detectedDelimiter)} ( ${detectedDelimiter === "\t" ? "\\t" : detectedDelimiter} )`
+          : `${prefix}Delimited text`;
+    }
+  })();
   const detailParts: string[] = [];
   if (peek) {
     if (peek.has_header !== null) detailParts.push(peek.has_header ? "Header row found" : "No header row");
     if (peek.row_count !== null) detailParts.push(`${peek.row_count.toLocaleString()} rows`);
     detailParts.push(`${peek.schema.length} columns`);
   }
+  const sourceHint = remote
+    ? "Read from the web each time a query runs, so it needs an internet connection."
+    : sourceKind === "excel"
+      ? "Excel stores numbers as decimals, so they arrive as DOUBLE. Cast in SQL if you need integers."
+      : null;
+  const pathLabel = mode === "file" ? "File or URL" : isDelta ? "Delta table folder" : "Folder";
+  const pathPlaceholder = mode === "file"
+    ? "C:\\data\\sales.parquet  or  https://…/sales.parquet"
+    : isDelta ? "C:\\data\\events_delta" : "C:\\data\\exports\\*.csv";
 
   return (
     <Modal
@@ -197,10 +302,10 @@ export function AddTableDialog({ open: isOpen, onClose, existingAliases, busy, o
         </div>
 
         <div className="field">
-          <label htmlFor="add-path" className="field-label">{mode === "folder" ? "Folder" : "File"}</label>
+          <label htmlFor="add-path" className="field-label">{pathLabel}</label>
           <div className="field-row">
             <input id="add-path" type="text" className="input input-mono grow" value={path}
-              placeholder={mode === "folder" ? "C:\\data\\exports\\*.csv" : "C:\\data\\sales.parquet"}
+              placeholder={pathPlaceholder}
               onChange={(e) => setPath(e.currentTarget.value)}
               onKeyDown={(e) => { if (e.key === "Enter") void submit(); }} />
             <button type="button" className="btn btn-outline" onClick={() => void browse()}>Browse…</button>
@@ -222,14 +327,46 @@ export function AddTableDialog({ open: isOpen, onClose, existingAliases, busy, o
           </div>
         ) : null}
 
+        {needsObject && trimmedPath ? (
+          <div className="field-row align-end">
+            <div className="field grow">
+              <label htmlFor="add-object" className="field-label">{sourceKind === "excel" ? "Sheet" : "Table"}</label>
+              <select id="add-object" className="input" value={objectName} disabled={objects === null}
+                onChange={(e) => setObjectName(e.currentTarget.value)}>
+                {objects === null ? <option value="">{objectsError ? "—" : "Reading…"}</option> : null}
+                {objects?.map((o) => (
+                  <option key={`${o.kind}:${o.name}`} value={o.name}>{o.kind === "view" ? `${o.name} (view)` : o.name}</option>
+                ))}
+              </select>
+            </div>
+            {sourceKind === "excel" ? (
+              <label className="checkbox-label">
+                <input type="checkbox" className="checkbox" checked={header} onChange={(e) => setHeader(e.currentTarget.checked)} />
+                First row is column names
+              </label>
+            ) : null}
+          </div>
+        ) : null}
+
         {trimmedPath ? (
           <div className="detect-box" aria-live="polite">
             <div className="detect-text">
               <span className="field-label">Detected format</span>
-              {peekLoading ? <span className="muted">Reading file…</span> : null}
+              {peekLoading ? (
+                <span className="muted">
+                  {extensionMissing ? `Downloading the ${extensionLabel(extensionName ?? "")} extension (first use only)…` : "Reading file…"}
+                </span>
+              ) : null}
               {!peekLoading && formatLine ? <strong>{formatLine}</strong> : null}
               {!peekLoading && detailParts.length > 0 ? <span className="muted small">{detailParts.join(" · ")}</span> : null}
               {!peekLoading && peekError ? <span className="text-danger">{peekError}</span> : null}
+              {objectsError ? <span className="text-danger">{objectsError}</span> : null}
+              {sourceHint ? <span className="muted small">{sourceHint}</span> : null}
+              {!peekLoading && extensionMissing && !peek && !peekError && !objectsError ? (
+                <span className="muted small">
+                  Needs the {extensionLabel(extensionName ?? "")} extension, downloaded automatically on first use.
+                </span>
+              ) : null}
             </div>
             {sourceKind === "delimited" ? (
               <div className="field">
@@ -259,7 +396,7 @@ export function AddTableDialog({ open: isOpen, onClose, existingAliases, busy, o
           ) : aliasReplaces ? (
             <span className="text-warning small">A table named {aliasTrimmed} already exists and will be replaced.</span>
           ) : aliasTrimmed ? (
-            <span className="muted small">Filled in from the file name. Use it in SQL: SELECT * FROM {aliasTrimmed}</span>
+            <span className="muted small">Filled in from the {sourceKind === "sqlite" ? "table" : "file"} name. Use it in SQL: SELECT * FROM {aliasTrimmed}</span>
           ) : null}
         </div>
 

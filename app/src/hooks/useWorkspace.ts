@@ -5,6 +5,7 @@ import type {
   WorkspaceChartPlugin,
   WorkspaceSchemaDiffResponse,
   WorkspaceExportResponse,
+  ExportFormat,
   WorkspaceQueryResponse,
   WorkspaceTableInfo,
   PerspectiveContext,
@@ -107,7 +108,7 @@ export function useWorkspace({
     }
   }
 
-  async function exportWorkspaceQuery(format: "csv" | "parquet") {
+  async function exportWorkspaceQuery(format: ExportFormat) {
     if (!workspaceQueryResult || workspaceQueryResult.rows.length === 0) {
       setError("Run a query with results before exporting.");
       return;
@@ -124,7 +125,7 @@ export function useWorkspace({
       defaultPath: `workspace_query_${nowIso}.${format}`,
       filters: [
         {
-          name: format.toUpperCase(),
+          name: format === "xlsx" ? "Excel" : format.toUpperCase(),
           extensions: [format],
         },
       ],
