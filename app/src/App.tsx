@@ -25,7 +25,9 @@ import type {
   AppSettings,
   RecentFile,
   PerspectiveContext,
+  RunningOperation,
 } from "./types";
+import { planRun, splitSqlStatements, statementAtOffset, type RunPlan } from "./sql/statements";
 import {
   PAGE_SIZE,
   FIRST_VIEWPORT_TARGET_MS,
@@ -40,6 +42,7 @@ import {
   INTERNAL_TOOLS_ENABLED,
   WORKSPACE_EXTENSIONS,
   PARQUET_EXTENSIONS,
+  QUERY_CANCELLED,
 } from "./constants";
 import {
   detectSourceKind,
@@ -73,7 +76,7 @@ import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { AddTableDialog } from "./components/AddTableDialog";
 import { TableStatsDialog, SchemaDiffDialog } from "./components/TableDialogs";
 import { ResultsPanel } from "./components/ResultsPanel";
-import { ExportMenu, HistoryMenu } from "./components/Menus";
+import { ExportMenu, HistoryMenu, RunMenu } from "./components/Menus";
 import { Icon } from "./components/Icon";
 
 const DEFAULT_SQL = "SELECT * FROM my_table LIMIT 100";
@@ -103,6 +106,18 @@ function App() {
   const [workspaceQueryResult, setWorkspaceQueryResult] = useState<WorkspaceQueryResponse | null>(null);
   const [resultSeq, setResultSeq] = useState(0);
   const [queryStartedAt, setQueryStartedAt] = useState<number | null>(null);
+  /** The query, export or explain the Cancel button can stop. */
+  const [runningOp, setRunningOp] = useState<RunningOperation | null>(null);
+  /** DuckDB's progress estimate (0–100) for `runningOp`, when it has one. */
+  const [runningProgress, setRunningProgress] = useState<number | null>(null);
+  /** Non-error status for the results panel, e.g. "Query cancelled after 4.2 s". */
+  const [sqlNotice, setSqlNotice] = useState<string | null>(null);
+  const [editorHasSelection, setEditorHasSelection] = useState(false);
+  /** The statement(s) behind the current results, so Export writes exactly what was run. */
+  const lastRunRef = useRef<{ sql: string; setup: string[] } | null>(null);
+  /** Latest `runningOp`, for the editor's Esc handler (registered once at mount). */
+  const runningOpRef = useRef<RunningOperation | null>(null);
+  runningOpRef.current = runningOp;
   const [resultTab, setResultTab] = useState<ResultTab>("results");
   const [aboutOpen, setAboutOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -162,11 +177,16 @@ function App() {
     exportWorkspaceQuery,
     visualizeWorkspaceChart,
   } = useWorkspace({
-    workspaceTables, workspaceQueryResult, readWorkspaceSql,
+    workspaceTables, workspaceQueryResult,
+    getLastRun: () => lastRunRef.current,
+    operations: { start: startOperation, finish: finishOperation },
     loadPerspectiveDataset, setLoading, setError: setSqlError,
   });
 
-  useSqlCompletions(workspaceMonacoRef, workspaceEditorReady, workspaceTables, workspaceTableSchemas, workspaceQueryResult);
+  const smartCompletion = useSqlCompletions(
+    workspaceMonacoRef, workspaceEditorRef, workspaceEditorReady,
+    workspaceTables, workspaceTableSchemas, workspaceQueryResult,
+  );
 
   const { dragOverZone } = useDragDrop({
     activeTab, previewPaneRef, sqlPaneRef,
@@ -326,10 +346,94 @@ function App() {
 
   // ── Queries ────────────────────────────────────────────────────────────
 
-  async function runWorkspaceQuery() {
-    if (loading) return;
-    const sqlText = readWorkspaceSql();
-    if (!sqlText.trim()) {
+  // ── Cancellable operations ─────────────────────────────────────────────
+
+  function startOperation(kind: RunningOperation["kind"]): RunningOperation {
+    const op: RunningOperation = { id: crypto.randomUUID(), kind, startedAt: Date.now() };
+    setRunningOp(op);
+    setRunningProgress(null);
+    setSqlNotice(null);
+    return op;
+  }
+
+  /** Ends `op`. Returns true when it failed because the user cancelled it (and says so). */
+  function finishOperation(op: RunningOperation, err?: unknown): boolean {
+    setRunningOp((current) => (current?.id === op.id ? null : current));
+    setRunningProgress(null);
+    if (err === undefined || String(err) !== QUERY_CANCELLED) return false;
+    const what = op.kind === "export" ? "Export" : op.kind === "explain" ? "Explain" : "Query";
+    const seconds = ((Date.now() - op.startedAt) / 1000).toFixed(1);
+    setSqlNotice(`${what} cancelled after ${seconds} s.`);
+    return true;
+  }
+
+  async function cancelRunningOperation() {
+    const op = runningOp;
+    if (!op) return;
+    try {
+      await invoke<boolean>("cancel_workspace_query", { queryId: op.id });
+    } catch (err) {
+      setSqlError(friendlyError(String(err)));
+    }
+  }
+
+  // Poll DuckDB's progress estimate while something runs.
+  useEffect(() => {
+    if (!runningOp) return;
+    const id = runningOp.id;
+    let stopped = false;
+    const timer = window.setInterval(() => {
+      invoke<number | null>("workspace_query_progress", { queryId: id })
+        .then((pct) => { if (!stopped) setRunningProgress(pct); })
+        .catch(() => { /* the query just finished */ });
+    }, 300);
+    return () => { stopped = true; window.clearInterval(timer); };
+  }, [runningOp]);
+
+  // ── Queries ────────────────────────────────────────────────────────────
+
+  /**
+   * What to run: "auto" = the selection if there is one, otherwise the statement
+   * under the cursor; "all" = every statement in the editor. Earlier statements run
+   * first as setup, so a script can create a temp table and then query it.
+   */
+  function planEditorRun(mode: "auto" | "all"): RunPlan | null {
+    const full = readWorkspaceSql();
+    const editor = workspaceEditorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model || mode === "all") return planRun(splitSqlStatements(full));
+    const selection = editor.getSelection();
+    if (selection && !selection.isEmpty()) {
+      const start = model.getOffsetAt(selection.getStartPosition());
+      const end = model.getOffsetAt(selection.getEndPosition());
+      return planRun(splitSqlStatements(full.slice(start, end)), start);
+    }
+    const position = editor.getPosition();
+    const statements = splitSqlStatements(full);
+    const current = position ? statementAtOffset(full, statements, model.getOffsetAt(position)) : statements[0] ?? null;
+    return current ? planRun([current]) : null;
+  }
+
+  /** Briefly highlights the SQL that just started running. */
+  function flashRange(start: number, end: number) {
+    const editor = workspaceEditorRef.current;
+    const model = editor?.getModel();
+    const monaco = workspaceMonacoRef.current;
+    if (!editor || !model || !monaco) return;
+    const from = model.getPositionAt(start);
+    const to = model.getPositionAt(end);
+    const decorations = editor.createDecorationsCollection([{
+      range: new monaco.Range(from.lineNumber, from.column, to.lineNumber, to.column),
+      options: { className: "ran-sql-flash" },
+    }]);
+    window.setTimeout(() => decorations.clear(), 900);
+  }
+
+  async function runWorkspaceQuery(mode: "auto" | "all" = "auto") {
+    // One cancellable operation at a time, so Cancel always stops the one that's running.
+    if (loading || runningOp) return;
+    const plan = planEditorRun(mode);
+    if (!plan) {
       setSqlError("Write a SQL query first.");
       return;
     }
@@ -340,28 +444,36 @@ function App() {
       return;
     }
 
+    const op = startOperation("query");
     setLoading(true);
     setSqlError(null);
-    setQueryStartedAt(Date.now());
+    setQueryStartedAt(op.startedAt);
     if (resultTab === "plan") setResultTab("results");
+    flashRange(plan.start, plan.end);
     try {
       const response = await invoke<WorkspaceQueryResponse>("run_workspace_query", {
-        sql: sqlText,
+        sql: plan.sql,
+        setupSql: plan.setup,
         rowLimit: settings.sqlRowLimit,
+        queryId: op.id,
       });
+      finishOperation(op);
+      lastRunRef.current = { sql: plan.sql, setup: plan.setup };
       setWorkspaceQueryResult(response);
       setResultSeq((n) => n + 1);
       setExplainPlan(null);
+      const historySql = plan.setup.length > 0 ? `${[...plan.setup, plan.sql].join(";\n")};` : response.sql;
       setQueryHistory((prev) => {
         const entry: QueryHistoryEntry = {
-          sql: response.sql,
+          sql: historySql,
           timestamp: Date.now(),
           rowCount: response.row_count,
           elapsedMs: response.elapsed_ms,
         };
-        return [entry, ...prev.filter((h) => h.sql !== response.sql)].slice(0, QUERY_HISTORY_MAX);
+        return [entry, ...prev.filter((h) => h.sql !== historySql)].slice(0, QUERY_HISTORY_MAX);
       });
     } catch (err) {
+      if (finishOperation(op, err)) return;
       const message = friendlyError(String(err));
       if (message.includes("Referenced column")) {
         const availableColumns = Array.from(new Set(Object.values(workspaceTableSchemas).flat().map((c) => c.name)));
@@ -380,19 +492,26 @@ function App() {
   }
 
   async function runExplainAnalyze() {
-    if (loading || explainLoading) return;
-    const sqlText = readWorkspaceSql();
-    if (!sqlText.trim()) {
+    if (loading || explainLoading || runningOp) return;
+    const plan = planEditorRun("auto");
+    if (!plan) {
       setSqlError("Write a SQL query first.");
       return;
     }
+    if (plan.setup.length > 0) {
+      setSqlError("Explain works on one statement. Select a single statement, or put the cursor in it.");
+      return;
+    }
+    const op = startOperation("explain");
     setExplainLoading(true);
     setSqlError(null);
     setResultTab("plan");
+    flashRange(plan.start, plan.end);
     try {
-      setExplainPlan(await invoke<string>("explain_workspace_query", { sql: sqlText }));
+      setExplainPlan(await invoke<string>("explain_workspace_query", { sql: plan.sql, queryId: op.id }));
+      finishOperation(op);
     } catch (err) {
-      setSqlError(friendlyError(String(err)));
+      if (!finishOperation(op, err)) setSqlError(friendlyError(String(err)));
     } finally {
       setExplainLoading(false);
     }
@@ -413,8 +532,19 @@ function App() {
       } catch (_) { /* clipboard unavailable */ }
     };
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyV, pasteFromClipboard);
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => { void shortcutRef.current.runQuery(); });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => { void shortcutRef.current.runQuery("auto"); });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.Enter, () => { void shortcutRef.current.runQuery("all"); });
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => { void shortcutRef.current.explain(); });
+    // Esc cancels a running query, unless it's closing a suggestion list or another editor widget.
+    editor.onKeyDown((e) => {
+      if (e.keyCode !== monaco.KeyCode.Escape || !runningOpRef.current) return;
+      const node = editor.getDomNode();
+      if (node?.querySelector(".suggest-widget.visible, .find-widget.visible, .parameter-hints-widget.visible")) return;
+      e.preventDefault();
+      e.stopPropagation();
+      void shortcutRef.current.cancel();
+    });
+    editor.onDidChangeCursorSelection((e) => setEditorHasSelection(!e.selection.isEmpty()));
     editor.addAction({
       id: "tauri-paste",
       label: "Paste",
@@ -773,10 +903,12 @@ function App() {
   const shortcutRef = useRef({
     runQuery: runWorkspaceQuery,
     explain: runExplainAnalyze,
+    cancel: cancelRunningOperation,
     onKeyDown: (_e: KeyboardEvent) => {},
   });
   shortcutRef.current.runQuery = runWorkspaceQuery;
   shortcutRef.current.explain = runExplainAnalyze;
+  shortcutRef.current.cancel = cancelRunningOperation;
   shortcutRef.current.onKeyDown = (e: KeyboardEvent) => {
     const mod = e.ctrlKey || e.metaKey;
     const target = e.target as HTMLElement | null;
@@ -788,7 +920,13 @@ function App() {
 
     if (e.key === "Escape") {
       // Dialogs and menus handle their own Escape in the capture phase.
-      if (expandedPanel && settings.expandMode === "fullscreen") {
+      if (runningOp && activeTab === "sql" && !dialogOpen) {
+        // Inside the editor, Monaco's own Esc binding cancels (and leaves Esc to an open suggestion list).
+        if (!inMonaco) {
+          e.preventDefault();
+          void cancelRunningOperation();
+        }
+      } else if (expandedPanel && settings.expandMode === "fullscreen") {
         e.preventDefault();
         setExpandedPanel(null);
       } else if (activeTab === "sql" && sqlError) {
@@ -815,11 +953,11 @@ function App() {
       return;
     }
     if (e.key === "Enter" && activeTab === "sql") {
-      if (!loading) { e.preventDefault(); void runWorkspaceQuery(); }
+      if (!loading) { e.preventDefault(); void runWorkspaceQuery(e.altKey ? "all" : "auto"); }
       return;
     }
     if ((e.key === "e" || e.key === "E") && e.shiftKey && activeTab === "sql") {
-      if (!loading) { e.preventDefault(); void exportWorkspaceQuery("csv"); }
+      if (!loading && !runningOp) { e.preventDefault(); void exportWorkspaceQuery("csv"); }
       return;
     }
     if (e.key === ",") { e.preventDefault(); setSettingsOpen((p) => !p); }
@@ -949,13 +1087,36 @@ function App() {
             <div className="sql-main">
               <section className="card editor-card" aria-label="SQL editor">
                 <div className="editor-toolbar">
-                  <button type="button" className="btn btn-primary" onClick={() => void runWorkspaceQuery()} disabled={loading}>
-                    <Icon name="play" size={13} /> Run <kbd className="kbd kbd-on-primary">Ctrl+Enter</kbd>
-                  </button>
+                  {runningOp ? (
+                    <button type="button" className="btn btn-danger-outline run-cancel" onClick={() => void cancelRunningOperation()}
+                      title="Stop the running query (Esc)">
+                      <Icon name="stop" size={12} /> Cancel
+                      {runningProgress !== null ? <span className="run-progress">{Math.round(runningProgress)}%</span> : null}
+                      <kbd className="kbd">Esc</kbd>
+                    </button>
+                  ) : (
+                    <div className="split-btn">
+                      <button type="button" className="btn btn-primary" onClick={() => void runWorkspaceQuery("auto")} disabled={loading}
+                        title={editorHasSelection ? "Run the selected SQL" : "Run the statement under the cursor"}>
+                        <Icon name="play" size={13} /> {editorHasSelection ? "Run selection" : "Run"}
+                        <kbd className="kbd kbd-on-primary">Ctrl+Enter</kbd>
+                      </button>
+                      <RunMenu disabled={loading} onRunAll={() => void runWorkspaceQuery("all")} />
+                    </div>
+                  )}
                   <button type="button" className="btn" title="Explain query plan (Ctrl+Shift+Enter)"
-                    onClick={() => void runExplainAnalyze()} disabled={loading || explainLoading}>
+                    onClick={() => void runExplainAnalyze()} disabled={loading || explainLoading || runningOp !== null}>
                     Explain
                   </button>
+                  {smartCompletion.state === "downloading" ? (
+                    <span className="muted small completion-status" role="status">
+                      <Icon name="spinner" size={12} className="spin" /> Downloading SQL autocomplete (first use only)…
+                    </span>
+                  ) : smartCompletion.state === "unavailable" ? (
+                    <span className="muted small completion-status" title={smartCompletion.reason}>
+                      Basic suggestions only: SQL autocomplete couldn't load.
+                    </span>
+                  ) : null}
                   <div className="spacer" />
                   <HistoryMenu
                     history={queryHistory}
@@ -963,7 +1124,8 @@ function App() {
                     onClear={() => setQueryHistory([])}
                   />
                   <ExportMenu
-                    disabled={loading || !workspaceQueryResult || workspaceQueryResult.rows.length === 0}
+                    disabled={loading || runningOp !== null || !workspaceQueryResult?.returns_rows
+                      || workspaceQueryResult.rows.length === 0 || !lastRunRef.current}
                     onExport={(format) => void exportWorkspaceQuery(format)}
                   />
                 </div>
@@ -997,6 +1159,9 @@ function App() {
                 showChartTab={settings.showVisualization}
                 result={workspaceQueryResult}
                 runningSince={queryStartedAt}
+                runningProgress={runningOp?.kind === "query" ? runningProgress : null}
+                notice={sqlNotice}
+                onDismissNotice={() => setSqlNotice(null)}
                 explainRunning={explainLoading}
                 explainPlan={explainPlan}
                 error={sqlError}
@@ -1043,7 +1208,9 @@ function App() {
         initialPath={addTableInitialPath}
         onAdd={registerTable}
       />
-      <TableStatsDialog alias={statsAlias} deep={settings.deepStats} onClose={() => setStatsAlias(null)} />
+      <TableStatsDialog alias={statsAlias} deep={settings.deepStats}
+        parquet={workspaceTables.find((t) => t.alias === statsAlias)?.source_kind === "parquet"}
+        onClose={() => setStatsAlias(null)} />
       <SchemaDiffDialog
         open={diffOpen}
         onClose={() => setDiffOpen(false)}

@@ -137,9 +137,41 @@ export type ExtensionStatus = {
   size_bytes: number | null;
 };
 
+/** One suggestion from DuckDB's sql_auto_complete (backend `sql_completions`). */
+export type SqlCompletion = {
+  text: string;
+  /** UTF-16 offset in the text sent, where the replaced word starts. */
+  start: number;
+  /** keyword | table | column | scalar_function | table_function | type | … */
+  kind: string;
+  /** Lower is better. */
+  score: number;
+  /** Text DuckDB suggests appending, e.g. a space after a keyword. */
+  extra: string | null;
+};
+
+/**
+ * State of DuckDB-powered completion. "basic" is the built-in list, used before
+ * the autocomplete extension is ready or when it can't be downloaded.
+ */
+export type SmartCompletionStatus =
+  | { state: "idle" }
+  | { state: "downloading" }
+  | { state: "ready" }
+  | { state: "unavailable"; reason: string };
+
+/** What the editor is running that the Cancel button can stop. */
+export type RunningOperation = {
+  id: string;
+  kind: "query" | "export" | "explain";
+  startedAt: number;
+};
+
 export type ExportFormat = "csv" | "parquet" | "xlsx";
 
 export type WorkspaceQueryResponse = {
+  /** False for DDL/DML/utility statements, whose single row is just a status message. */
+  returns_rows: boolean;
   sql: string;
   row_limit: number;
   row_count: number;

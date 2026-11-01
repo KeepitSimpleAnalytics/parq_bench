@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { SummarizeRow, WorkspaceSchemaDiffResponse, WorkspaceTableInfo } from "../types";
 import { friendlyError } from "../utils";
+import { QUERY_CANCELLED } from "../constants";
 import { Modal } from "./Modal";
 import { Icon } from "./Icon";
 import { InlineError } from "./AppChrome";
@@ -22,36 +23,74 @@ const STATS_COLUMNS: Array<[string, string]> = [
 ];
 const LEFT_ALIGNED = new Set(["column_name", "column_type", "min", "max"]);
 
-export function TableStatsDialog({ alias, deep, onClose }: { alias: string | null; deep: boolean; onClose: () => void }) {
+/**
+ * `deep` asks for exact stats. Only Parquet has a metadata fast path, so every
+ * other table kind always gets a full scan (and a Cancel button).
+ */
+export function TableStatsDialog({ alias, deep, parquet, onClose }: {
+  alias: string | null;
+  deep: boolean;
+  parquet: boolean;
+  onClose: () => void;
+}) {
+  const fullScan = deep || !parquet;
   const [rows, setRows] = useState<SummarizeRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  /** Id of the running exact-stats scan, so it can be cancelled. */
+  const queryIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!alias) return;
-    let cancelled = false;
+    let stale = false;
+    const queryId = crypto.randomUUID();
+    queryIdRef.current = queryId;
     setRows(null);
     setError(null);
+    setNotice(null);
     setLoading(true);
-    invoke<SummarizeRow[]>("summarize_workspace_table", { alias, deep })
-      .then((result) => { if (!cancelled) setRows(result); })
-      .catch((err) => { if (!cancelled) setError(friendlyError(String(err))); })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+    invoke<SummarizeRow[]>("summarize_workspace_table", { alias, deep, queryId })
+      .then((result) => { if (!stale) setRows(result); })
+      .catch((err) => {
+        if (stale) return;
+        if (String(err) === QUERY_CANCELLED) setNotice("Scan cancelled.");
+        else setError(friendlyError(String(err)));
+      })
+      .finally(() => {
+        if (queryIdRef.current === queryId) queryIdRef.current = null;
+        if (!stale) setLoading(false);
+      });
+    return () => {
+      stale = true;
+      // Closing the dialog (or switching table) stops a scan nobody will see.
+      void invoke("cancel_workspace_query", { queryId }).catch(() => {});
+    };
   }, [alias, deep]);
+
+  const cancelScan = () => {
+    const queryId = queryIdRef.current;
+    if (queryId) void invoke("cancel_workspace_query", { queryId }).catch(() => {});
+  };
 
   const columns = rows && rows.length > 0 ? STATS_COLUMNS.filter(([key]) => key in rows[0]) : [];
 
   return (
     <Modal open={alias !== null} title={`Stats: ${alias ?? ""}`} onClose={onClose} width={1100}
-      footer={<button type="button" className="btn btn-primary" onClick={onClose}>Close</button>}>
+      footer={
+        <>
+          {loading && fullScan ? <button type="button" className="btn btn-danger-outline" onClick={cancelScan}>Cancel scan</button> : null}
+          <button type="button" className="btn btn-primary" onClick={onClose}>Close</button>
+        </>
+      }>
       <p className="muted small">
-        {deep ? "Exact values from a full table scan." : "Instant values from Parquet metadata. Turn on Exact table stats in Settings for a full scan."}
+        {fullScan ? "Exact values from a full table scan." : "Instant values from Parquet metadata. Turn on Exact table stats in Settings for a full scan."}
       </p>
       {loading ? (
-        <div className="loading-state"><Icon name="spinner" size={22} className="spin" /> {deep ? "Scanning table…" : "Reading metadata…"}</div>
+        <div className="loading-state"><Icon name="spinner" size={22} className="spin" /> {fullScan ? "Scanning table…" : "Reading metadata…"}</div>
       ) : null}
       {error ? <p className="text-danger">{error}</p> : null}
+      {notice ? <p className="muted">{notice}</p> : null}
       {rows && rows.length > 0 ? (
         <div className="table-box tall">
           <table className="data-table compact">

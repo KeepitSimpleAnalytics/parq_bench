@@ -23,6 +23,27 @@ function useDismiss(open: boolean, setOpen: (v: boolean) => void) {
   return ref;
 }
 
+/** The caret beside Run: runs every statement in the editor. */
+export function RunMenu({ disabled, onRunAll }: { disabled: boolean; onRunAll: () => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useDismiss(open, setOpen);
+  return (
+    <div className="menu-wrap" ref={ref}>
+      <button type="button" className="btn btn-primary split-btn-caret" aria-haspopup="menu" aria-expanded={open}
+        aria-label="More run options" title="More run options" disabled={disabled} onClick={() => setOpen((o) => !o)}>
+        <Icon name="chevronDown" size={12} />
+      </button>
+      {open ? (
+        <div role="menu" className="menu">
+          <button type="button" role="menuitem" className="menu-item menu-item-nowrap" onClick={() => { setOpen(false); onRunAll(); }}>
+            Run all statements <kbd className="kbd">Ctrl+Alt+Enter</kbd>
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 export function ExportMenu({ disabled, onExport }: { disabled: boolean; onExport: (format: ExportFormat) => void }) {
   const [open, setOpen] = useState(false);
   const ref = useDismiss(open, setOpen);
