@@ -50,6 +50,8 @@ export const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";
 export const UI_ACTIVE_TAB_STORAGE_KEY = "parqbench.ui.active_tab";
 export const UI_RECENT_FILES_STORAGE_KEY = "parqbench.ui.recent_files";
 export const UI_QUERY_HISTORY_STORAGE_KEY = "parqbench.ui.query_history";
+/** Editor text and the open saved query, restored at the next start. */
+export const UI_EDITOR_SESSION_STORAGE_KEY = "parqbench.ui.editor_session";
 export const UI_SETTINGS_STORAGE_KEY = "parqbench.ui.settings";
 export const RECENT_FILES_MAX = 15;
 /** Mirrors PANIC_RSS_RATIO in the backend: app RSS / total RAM that trips the memory guard. */

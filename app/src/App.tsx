@@ -3,7 +3,9 @@ import Editor, { loader, type OnMount } from "@monaco-editor/react";
 import * as monacoEditor from "monaco-editor";
 loader.config({ monaco: monacoEditor });
 import { invoke } from "@tauri-apps/api/core";
-import { open, save } from "@tauri-apps/plugin-dialog";
+// The dialog plugin replaces window.confirm with an async version (it returns a
+// Promise, which is always truthy), so confirmations must await `confirm` instead.
+import { confirm, open, save } from "@tauri-apps/plugin-dialog";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type * as Monaco from "monaco-editor";
 import "./App.css";
@@ -22,12 +24,14 @@ import type {
   ActiveTab,
   ResultTab,
   QueryHistoryEntry,
+  SavedQuery,
   AppSettings,
   RecentFile,
   PerspectiveContext,
   RunningOperation,
 } from "./types";
 import { planRun, splitSqlStatements, statementAtOffset, type RunPlan } from "./sql/statements";
+import { findSavedQuery, isUnsaved, parseEditorSession, sameSql } from "./sql/savedQueries";
 import {
   PAGE_SIZE,
   FIRST_VIEWPORT_TARGET_MS,
@@ -37,6 +41,7 @@ import {
   UI_RECENT_FILES_STORAGE_KEY,
   UI_QUERY_HISTORY_STORAGE_KEY,
   UI_SETTINGS_STORAGE_KEY,
+  UI_EDITOR_SESSION_STORAGE_KEY,
   RECENT_FILES_MAX,
   QUERY_HISTORY_MAX,
   INTERNAL_TOOLS_ENABLED,
@@ -78,7 +83,8 @@ import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { AddTableDialog } from "./components/AddTableDialog";
 import { TableStatsDialog, SchemaDiffDialog } from "./components/TableDialogs";
 import { ResultsPanel } from "./components/ResultsPanel";
-import { ExportMenu, HistoryMenu, RunMenu } from "./components/Menus";
+import { ExportMenu, HistoryMenu, RunMenu, SavedMenu } from "./components/Menus";
+import { SaveQueryDialog } from "./components/SaveQueryDialog";
 import { Icon } from "./components/Icon";
 
 const DEFAULT_SQL = "SELECT * FROM my_table LIMIT 100";
@@ -101,7 +107,21 @@ function App() {
   const [workspaceTables, setWorkspaceTables] = useState<WorkspaceTableInfo[]>([]);
   const [workspaceTableSchemas, setWorkspaceTableSchemas] = useState<WorkspaceSchemaByAlias>({});
   const [workspaceEditorReady, setWorkspaceEditorReady] = useState(false);
-  const [workspaceSql, setWorkspaceSql] = useState(DEFAULT_SQL);
+  // Editor text and open saved query from the last session (browser storage, like History).
+  const [initialSession] = useState(() => {
+    try {
+      return parseEditorSession(window.localStorage.getItem(UI_EDITOR_SESSION_STORAGE_KEY));
+    } catch {
+      return null;
+    }
+  });
+  const [workspaceSql, setWorkspaceSql] = useState(() => initialSession?.sql ?? DEFAULT_SQL);
+  const [savedQueries, setSavedQueries] = useState<SavedQuery[]>([]);
+  /** Set when the saved-queries file couldn't be read; saving is then refused. */
+  const [savedLoadError, setSavedLoadError] = useState<string | null>(null);
+  /** Name of the saved query open in the editor (Ctrl+S updates it). */
+  const [openSavedName, setOpenSavedName] = useState<string | null>(() => initialSession?.openName ?? null);
+  const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const [editorHeight, setEditorHeight] = useState(180);
   const [settings, setSettings] = useState<AppSettings>(() => readSettings());
   const [editorFontSize, setEditorFontSize] = useState(() => settings.editorFontSize);
@@ -165,6 +185,21 @@ function App() {
   useLocalStorageSync(UI_RECENT_FILES_STORAGE_KEY, JSON.stringify(recentFiles));
   useLocalStorageSync(UI_QUERY_HISTORY_STORAGE_KEY, JSON.stringify(queryHistory));
   useLocalStorageSync(UI_SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  useLocalStorageSync(UI_EDITOR_SESSION_STORAGE_KEY, JSON.stringify({ sql: workspaceSql, openName: openSavedName }));
+
+  // Saved queries live in a file in the app data folder: read at startup, and again
+  // when the menu opens after a failed read (the file may have been locked or fixed).
+  const loadSavedQueries = useCallback(() => {
+    invoke<SavedQuery[]>("list_saved_queries")
+      .then((list) => {
+        setSavedQueries(list);
+        setSavedLoadError(null);
+        // The query open last session may have been deleted since.
+        setOpenSavedName((name) => findSavedQuery(list, name)?.name ?? null);
+      })
+      .catch((err) => setSavedLoadError(friendlyError(String(err))));
+  }, []);
+  useEffect(loadSavedQueries, [loadSavedQueries]);
 
   const {
     workspaceChartPlugin, setWorkspaceChartPlugin,
@@ -235,6 +270,68 @@ function App() {
     editor.executeEdits("replace-sql", [{ range: model.getFullModelRange(), text: nextSql, forceMoveMarkers: true }]);
     editor.pushUndoStop();
     setWorkspaceSql(nextSql);
+  }
+
+  // ── Saved queries ──────────────────────────────────────────────────────
+
+  /** Saves the editor text under `name`; throws a readable message on failure. */
+  async function saveQueryAs(name: string): Promise<void> {
+    const sql = readWorkspaceSql();
+    let list: SavedQuery[];
+    try {
+      list = await invoke<SavedQuery[]>("save_query", { name, sql });
+    } catch (err) {
+      throw friendlyError(String(err));
+    }
+    setSavedQueries(list);
+    const savedName = findSavedQuery(list, name)?.name ?? name.trim();
+    // Only mark it open if the editor still holds what was saved: if another query was
+    // opened meanwhile, pointing Ctrl+S at this one would overwrite it with that text.
+    if (readWorkspaceSql() === sql) setOpenSavedName(savedName);
+    setSaveDialogOpen(false);
+    setSqlNotice(`Saved “${savedName}”.`);
+  }
+
+  /** Ctrl+S: updates the open saved query, or asks for a name. */
+  function saveCurrentQuery(): void {
+    if (savedLoadError) {
+      setSqlError(savedLoadError);
+      return;
+    }
+    const open = findSavedQuery(savedQueries, openSavedName);
+    if (open) {
+      saveQueryAs(open.name).catch((message) => setSqlError(String(message)));
+    } else {
+      setSaveDialogOpen(true);
+    }
+  }
+
+  /** Opens a saved query, asking first if the editor text isn't kept anywhere. */
+  async function openSavedQuery(query: SavedQuery): Promise<void> {
+    const current = readWorkspaceSql();
+    if (!sameSql(current, query.sql) && isUnsaved(current, savedQueries, DEFAULT_SQL)) {
+      const ok = await confirm(
+        `The SQL in the editor isn't saved and will be replaced. Ctrl+Z brings it back.`,
+        { title: `Open “${query.name}”?`, kind: "warning", okLabel: "Open", cancelLabel: "Cancel" },
+      );
+      // The editor may have changed while the question was open; never replace newer text.
+      if (!ok || readWorkspaceSql() !== current) return;
+    }
+    replaceWorkspaceSqlUndoable(query.sql);
+    setOpenSavedName(query.name);
+  }
+
+  async function deleteSavedQuery(query: SavedQuery): Promise<void> {
+    const ok = await confirm(`Delete the saved query “${query.name}”?`,
+      { title: "Delete saved query", kind: "warning", okLabel: "Delete", cancelLabel: "Cancel" });
+    if (!ok) return;
+    try {
+      const list = await invoke<SavedQuery[]>("delete_saved_query", { name: query.name });
+      setSavedQueries(list);
+      setOpenSavedName((name) => findSavedQuery(list, name)?.name ?? null);
+    } catch (err) {
+      setSqlError(friendlyError(String(err)));
+    }
   }
 
   /** Inserts SQL at the cursor, or replaces the untouched starter query. */
@@ -549,6 +646,7 @@ function App() {
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => { void shortcutRef.current.runQuery("auto"); });
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.Enter, () => { void shortcutRef.current.runQuery("all"); });
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter, () => { void shortcutRef.current.explain(); });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => shortcutRef.current.save());
     // Esc cancels a running query, unless it's closing a suggestion list or another editor widget.
     editor.onKeyDown((e) => {
       if (e.keyCode !== monaco.KeyCode.Escape || !runningOpRef.current) return;
@@ -918,8 +1016,10 @@ function App() {
     runQuery: runWorkspaceQuery,
     explain: runExplainAnalyze,
     cancel: cancelRunningOperation,
+    save: saveCurrentQuery,
     onKeyDown: (_e: KeyboardEvent) => {},
   });
+  shortcutRef.current.save = saveCurrentQuery;
   shortcutRef.current.runQuery = runWorkspaceQuery;
   shortcutRef.current.explain = runExplainAnalyze;
   shortcutRef.current.cancel = cancelRunningOperation;
@@ -962,6 +1062,12 @@ function App() {
       if (!loading && !memoryGuardRef.current) { e.preventDefault(); void openParquetPreview(); }
       return;
     }
+    if ((e.key === "s" || e.key === "S") && !e.shiftKey && activeTab === "sql") {
+      // Inside the editor Monaco's Ctrl+S command saves; don't save twice.
+      e.preventDefault();
+      if (!inMonaco) saveCurrentQuery();
+      return;
+    }
     if (e.key === "Enter" && e.shiftKey && activeTab === "sql") {
       if (!loading && !explainLoading) { e.preventDefault(); void runExplainAnalyze(); }
       return;
@@ -981,6 +1087,11 @@ function App() {
     window.addEventListener("keydown", listener);
     return () => window.removeEventListener("keydown", listener);
   }, []);
+
+  const openSavedQueryEntry = findSavedQuery(savedQueries, openSavedName);
+  const openSavedQueryInfo = openSavedQueryEntry
+    ? { name: openSavedQueryEntry.name, edited: !sameSql(workspaceSql, openSavedQueryEntry.sql) }
+    : null;
 
   // ── Render ─────────────────────────────────────────────────────────────
 
@@ -1086,9 +1197,10 @@ function App() {
               onRemove={(alias) => void removeTables([alias])}
               onRename={(oldAlias, newAlias) => void renameTable(oldAlias, newAlias)}
               onClearAll={() => {
-                if (window.confirm(`Remove all ${workspaceTables.length} tables from the workspace? Your files are not changed.`)) {
-                  void removeTables(workspaceTables.map((t) => t.alias));
-                }
+                const aliases = workspaceTables.map((t) => t.alias);
+                void confirm(`Remove all ${aliases.length} tables from the workspace? Your files are not changed.`,
+                  { title: "Remove all tables", kind: "warning", okLabel: "Remove", cancelLabel: "Cancel" })
+                  .then((ok) => { if (ok) void removeTables(aliases); });
               }}
               onRemoveSelected={(aliases) => void removeTables([...aliases])}
               onInsertSelect={(alias) => insertWorkspaceSql(`SELECT * FROM ${alias} LIMIT 100`)}
@@ -1131,10 +1243,25 @@ function App() {
                       Basic suggestions only: SQL autocomplete couldn't load.
                     </span>
                   ) : null}
+                  {openSavedQueryInfo ? (
+                    <span className="open-query-name" role="status"
+                      title={openSavedQueryInfo.edited ? "Edited since it was saved. Ctrl+S updates it." : "Saved query open in the editor"}>
+                      <strong>{openSavedQueryInfo.name}</strong>{openSavedQueryInfo.edited ? " · edited" : ""}
+                    </span>
+                  ) : null}
                   <div className="spacer" />
+                  <SavedMenu
+                    saved={savedQueries}
+                    openName={openSavedQueryInfo?.name ?? null}
+                    loadError={savedLoadError}
+                    onOpen={(query) => void openSavedQuery(query)}
+                    onSaveAs={() => setSaveDialogOpen(true)}
+                    onDelete={(query) => void deleteSavedQuery(query)}
+                    onMenuOpen={() => { if (savedLoadError) loadSavedQueries(); }}
+                  />
                   <HistoryMenu
                     history={queryHistory}
-                    onSelect={replaceWorkspaceSql}
+                    onSelect={(sql) => { replaceWorkspaceSqlUndoable(sql); setOpenSavedName(null); }}
                     onClear={() => setQueryHistory([])}
                   />
                   <ExportMenu
@@ -1251,6 +1378,13 @@ function App() {
         editorRef={workspaceEditorRef}
         themeMode={themeMode}
         onThemeModeChange={setThemeMode}
+      />
+      <SaveQueryDialog
+        open={saveDialogOpen}
+        saved={savedQueries}
+        openName={openSavedQueryInfo?.name ?? null}
+        onClose={() => setSaveDialogOpen(false)}
+        onSave={saveQueryAs}
       />
       <AboutModal open={aboutOpen} onClose={() => setAboutOpen(false)} duckdbVersion={result?.duckdb_version ?? null} />
     </main>

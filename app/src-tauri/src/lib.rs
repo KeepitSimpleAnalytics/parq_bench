@@ -228,6 +228,8 @@ struct AppRuntimeState {
     completion: Mutex<CompletionEngine>,
     /// DuckDB's built-in function reference for editor hover and signature help, loaded once.
     function_docs: Mutex<Option<Arc<Vec<FunctionDoc>>>>,
+    /// Serializes reads and writes of the saved-queries file.
+    saved_queries_lock: Mutex<()>,
 }
 
 impl AppRuntimeState {
@@ -242,6 +244,7 @@ impl AppRuntimeState {
             cancelled_early: Mutex::new(std::collections::VecDeque::new()),
             completion: Mutex::new(CompletionEngine::default()),
             function_docs: Mutex::new(None),
+            saved_queries_lock: Mutex::new(()),
         }
     }
 }
@@ -2409,6 +2412,143 @@ fn sql_function_docs(state: tauri::State<'_, Arc<AppRuntimeState>>) -> Result<Ar
     })
 }
 
+// ── Saved queries ────────────────────────────────────────────────────────────
+
+const SAVED_QUERIES_FILE: &str = "saved_queries.json";
+const SAVED_QUERY_NAME_MAX: usize = 100;
+/// Format version this build reads and writes.
+const SAVED_QUERIES_VERSION: u32 = 1;
+
+#[derive(Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct SavedQuery {
+    name: String,
+    sql: String,
+    /// Milliseconds since the Unix epoch.
+    updated_at_ms: u64,
+}
+
+#[derive(Serialize, serde::Deserialize, Debug)]
+struct SavedQueriesFile {
+    version: u32,
+    queries: Vec<SavedQuery>,
+}
+
+/// Saved queries in `path`, newest first. A missing file is an empty list; a file
+/// that can't be read or parsed is an error (never silently treated as empty, so a
+/// later save can't overwrite it).
+fn read_saved_queries(path: &Path) -> Result<Vec<SavedQuery>, String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Saved queries file can't be read ({}): {e}", path.display())),
+    };
+    let file: SavedQueriesFile = serde_json::from_str(&raw)
+        .map_err(|e| format!("Saved queries file is damaged ({}): {e}", path.display()))?;
+    if file.version > SAVED_QUERIES_VERSION {
+        // Rewriting it would drop whatever the newer format added.
+        return Err(format!(
+            "Saved queries file was written by a newer version of Parq-Bench ({}). Update the app to use it.",
+            path.display()
+        ));
+    }
+    let mut queries = file.queries;
+    queries.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    Ok(queries)
+}
+
+/// Writes to a temporary file next to `path`, flushes it to disk, then renames it over
+/// `path`, so a crash or power loss mid-write leaves the previous file intact.
+fn write_saved_queries(path: &Path, queries: &[SavedQuery]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("create saved queries folder: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(&SavedQueriesFile { version: SAVED_QUERIES_VERSION, queries: queries.to_vec() })
+        .map_err(|e| format!("encode saved queries: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = fs::File::create(&tmp).map_err(|e| format!("write saved queries: {e}"))?;
+        file.write_all(json.as_bytes()).map_err(|e| format!("write saved queries: {e}"))?;
+        file.sync_all().map_err(|e| format!("write saved queries: {e}"))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| format!("replace saved queries file: {e}"))
+}
+
+fn normalized_query_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Give the query a name.".to_string());
+    }
+    if name.chars().count() > SAVED_QUERY_NAME_MAX {
+        return Err(format!("Names can be at most {SAVED_QUERY_NAME_MAX} characters."));
+    }
+    Ok(name.to_string())
+}
+
+/// Adds or replaces (by name, ignoring case) a saved query. Returns the new list.
+fn upsert_saved_query(path: &Path, name: &str, sql: &str, now_ms: u64) -> Result<Vec<SavedQuery>, String> {
+    let name = normalized_query_name(name)?;
+    let mut queries = read_saved_queries(path)?;
+    queries.retain(|q| q.name.to_lowercase() != name.to_lowercase());
+    queries.insert(0, SavedQuery { name, sql: sql.to_string(), updated_at_ms: now_ms });
+    write_saved_queries(path, &queries)?;
+    Ok(queries)
+}
+
+/// Removes the saved query with this name (ignoring case). Returns the new list.
+fn remove_saved_query(path: &Path, name: &str) -> Result<Vec<SavedQuery>, String> {
+    let mut queries = read_saved_queries(path)?;
+    let before = queries.len();
+    queries.retain(|q| q.name.to_lowercase() != name.trim().to_lowercase());
+    if queries.len() != before {
+        write_saved_queries(path, &queries)?;
+    }
+    Ok(queries)
+}
+
+fn saved_queries_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join(SAVED_QUERIES_FILE))
+        .map_err(|e| format!("find the app data folder: {e}"))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[tauri::command(async)]
+fn list_saved_queries(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<SavedQuery>, String> {
+    let _guard = state.saved_queries_lock.lock().map_err(|_| "Saved queries lock poisoned.".to_string())?;
+    read_saved_queries(&saved_queries_path(&app)?)
+}
+
+#[tauri::command(async)]
+fn save_query(
+    name: String,
+    sql: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<SavedQuery>, String> {
+    let _guard = state.saved_queries_lock.lock().map_err(|_| "Saved queries lock poisoned.".to_string())?;
+    upsert_saved_query(&saved_queries_path(&app)?, &name, &sql, now_ms())
+}
+
+#[tauri::command(async)]
+fn delete_saved_query(
+    name: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<SavedQuery>, String> {
+    let _guard = state.saved_queries_lock.lock().map_err(|_| "Saved queries lock poisoned.".to_string())?;
+    remove_saved_query(&saved_queries_path(&app)?, &name)
+}
+
 /// Sheet names from an .xlsx (a zip archive) by reading `xl/workbook.xml`.
 /// The excel extension has no function that lists sheets.
 fn xlsx_sheet_names(path: &str) -> Result<Vec<String>, String> {
@@ -4565,6 +4705,9 @@ pub fn run() {
             sync_completion_tables,
             sql_completions,
             sql_function_docs,
+            list_saved_queries,
+            save_query,
+            delete_saved_query,
             get_log_path
         ])
         .run(tauri::generate_context!())
@@ -4638,6 +4781,65 @@ mod editor_tests {
         let dir = std::env::temp_dir().join(format!("parq_bench_{name}_{nanos}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn saved_queries_round_trip_newest_first() {
+        let path = temp_dir("saved_round_trip").join("sub").join(SAVED_QUERIES_FILE);
+        assert!(read_saved_queries(&path).unwrap().is_empty(), "missing file is an empty list");
+        upsert_saved_query(&path, "  Revenue ", "SELECT 1", 100).unwrap();
+        let list = upsert_saved_query(&path, "Counts", "SELECT 2", 200).unwrap();
+        assert_eq!(list.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(), ["Counts", "Revenue"]);
+        assert_eq!(read_saved_queries(&path).unwrap(), list);
+        assert!(!path.with_extension("json.tmp").exists(), "temporary file is renamed away");
+    }
+
+    #[test]
+    fn saving_an_existing_name_replaces_it_ignoring_case() {
+        let path = temp_dir("saved_replace").join(SAVED_QUERIES_FILE);
+        upsert_saved_query(&path, "Revenue", "SELECT 1", 100).unwrap();
+        upsert_saved_query(&path, "Other", "SELECT 9", 150).unwrap();
+        let list = upsert_saved_query(&path, "revenue", "SELECT 2", 200).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], SavedQuery { name: "revenue".into(), sql: "SELECT 2".into(), updated_at_ms: 200 });
+    }
+
+    #[test]
+    fn deleting_removes_only_that_query() {
+        let path = temp_dir("saved_delete").join(SAVED_QUERIES_FILE);
+        upsert_saved_query(&path, "A", "SELECT 1", 1).unwrap();
+        upsert_saved_query(&path, "B", "SELECT 2", 2).unwrap();
+        let list = remove_saved_query(&path, "a").unwrap();
+        assert_eq!(list.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(), ["B"]);
+        assert_eq!(remove_saved_query(&path, "missing").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn saved_query_names_are_required_and_bounded() {
+        let path = temp_dir("saved_names").join(SAVED_QUERIES_FILE);
+        assert!(upsert_saved_query(&path, "   ", "SELECT 1", 1).is_err());
+        assert!(upsert_saved_query(&path, &"x".repeat(SAVED_QUERY_NAME_MAX + 1), "SELECT 1", 1).is_err());
+        assert!(upsert_saved_query(&path, &"x".repeat(SAVED_QUERY_NAME_MAX), "SELECT 1", 1).is_ok());
+    }
+
+    #[test]
+    fn a_damaged_saved_queries_file_is_an_error_and_never_overwritten() {
+        let path = temp_dir("saved_damaged").join(SAVED_QUERIES_FILE);
+        fs::write(&path, "{ not json").unwrap();
+        assert!(read_saved_queries(&path).unwrap_err().contains("damaged"));
+        assert!(upsert_saved_query(&path, "A", "SELECT 1", 1).is_err());
+        assert!(remove_saved_query(&path, "A").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn a_saved_queries_file_from_a_newer_version_is_refused_not_rewritten() {
+        let path = temp_dir("saved_newer").join(SAVED_QUERIES_FILE);
+        let newer = r#"{"version": 2, "queries": [], "folders": ["kept"]}"#;
+        fs::write(&path, newer).unwrap();
+        assert!(read_saved_queries(&path).unwrap_err().contains("newer version"));
+        assert!(upsert_saved_query(&path, "A", "SELECT 1", 1).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), newer);
     }
 
     /// Long enough to still be running when cancelled (~10^10 row pairs).

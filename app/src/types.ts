@@ -269,6 +269,14 @@ export type RecentFile = {
   openedAt: number | null;
 };
 
+/** A named query kept in the app data folder (backend `list_saved_queries`). */
+export type SavedQuery = {
+  name: string;
+  sql: string;
+  /** Milliseconds since the Unix epoch. */
+  updated_at_ms: number;
+};
+
 export type QueryHistoryEntry = {
   sql: string;
   timestamp: number;
