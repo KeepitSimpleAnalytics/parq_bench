@@ -118,6 +118,7 @@ describe("planRun", () => {
       setup: ["CREATE TEMP TABLE t AS SELECT 1 x"],
       start: 0,
       end: sql.length,
+      starts: [0, sql.indexOf("SELECT * FROM t")],
     });
   });
 
@@ -125,6 +126,7 @@ describe("planRun", () => {
     const plan = planRun(splitSqlStatements(" SELECT 1"), 10);
     expect(plan?.start).toBe(11);
     expect(plan?.end).toBe(19);
+    expect(plan?.starts).toEqual([11]);
   });
 
   it("returns null when there is nothing to run", () => {

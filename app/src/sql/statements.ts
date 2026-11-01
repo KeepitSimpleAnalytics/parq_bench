@@ -151,6 +151,8 @@ export interface RunPlan {
   /** Source range that will run, for highlighting. */
   start: number;
   end: number;
+  /** Source offset of each statement's text: the setup statements in order, then `sql`. */
+  starts: number[];
 }
 
 export function planRun(statements: SqlStatement[], offsetBase = 0): RunPlan | null {
@@ -161,5 +163,6 @@ export function planRun(statements: SqlStatement[], offsetBase = 0): RunPlan | n
     setup: statements.slice(0, -1).map((s) => s.text),
     start: offsetBase + statements[0].start,
     end: offsetBase + last.end,
+    starts: statements.map((s) => offsetBase + s.start),
   };
 }

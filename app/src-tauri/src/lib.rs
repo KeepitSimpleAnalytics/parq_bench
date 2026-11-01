@@ -226,6 +226,8 @@ struct AppRuntimeState {
     cancelled_early: Mutex<std::collections::VecDeque<String>>,
     /// Long-lived connection holding empty mirror tables for SQL autocomplete.
     completion: Mutex<CompletionEngine>,
+    /// DuckDB's built-in function reference for editor hover and signature help, loaded once.
+    function_docs: Mutex<Option<Arc<Vec<FunctionDoc>>>>,
 }
 
 impl AppRuntimeState {
@@ -239,6 +241,7 @@ impl AppRuntimeState {
             running_queries: Mutex::new(HashMap::new()),
             cancelled_early: Mutex::new(std::collections::VecDeque::new()),
             completion: Mutex::new(CompletionEngine::default()),
+            function_docs: Mutex::new(None),
         }
     }
 }
@@ -2295,6 +2298,115 @@ fn sql_completions(
         (Some(conn), true) => sql_completions_for(conn, &text, 200),
         _ => Err("SQL autocomplete is not ready.".to_string()),
     }
+}
+
+// ── Function reference (hover + signature help) ─────────────────────────────
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct FunctionParam {
+    name: String,
+    /// None for macros, whose parameters are untyped.
+    duckdb_type: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct FunctionSignature {
+    params: Vec<FunctionParam>,
+    /// Type of the trailing variadic argument (`concat(ANY, ...)`), if any.
+    varargs: Option<String>,
+    returns: Option<String>,
+}
+
+/// One function name with all of its overloads, from `duckdb_functions()`.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct FunctionDoc {
+    name: String,
+    /// scalar, aggregate, window, macro, table or table_macro.
+    kind: String,
+    description: Option<String>,
+    examples: Vec<String>,
+    /// Distinct overloads, in DuckDB's order.
+    signatures: Vec<FunctionSignature>,
+}
+
+fn json_string_list(raw: Option<String>) -> Vec<Option<String>> {
+    raw.and_then(|r| serde_json::from_str::<Vec<Option<String>>>(&r).ok())
+        .unwrap_or_default()
+}
+
+/// Reads `duckdb_functions()` into one entry per (name, kind), overloads grouped and
+/// de-duplicated. Pragmas are left out: they aren't called like functions.
+fn load_function_docs(conn: &Connection) -> Result<Vec<FunctionDoc>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT function_name, function_type, description, return_type, \
+                    to_json(parameters)::VARCHAR, to_json(parameter_types)::VARCHAR, \
+                    varargs, to_json(examples)::VARCHAR \
+             FROM duckdb_functions() \
+             WHERE function_type <> 'pragma' \
+             ORDER BY lower(function_name), function_type, function_oid",
+        )
+        .map_err(|e| format!("prepare function reference: {e}"))?;
+    let mut rows = stmt.query([]).map_err(|e| format!("read function reference: {e}"))?;
+    let mut docs: Vec<FunctionDoc> = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| format!("read function reference: {e}"))? {
+        let get = |i: usize| -> Result<Option<String>, String> {
+            row.get::<_, Option<String>>(i).map_err(|e| format!("read function reference: {e}"))
+        };
+        let name = get(0)?.unwrap_or_default();
+        let kind = get(1)?.unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let names = json_string_list(get(4)?);
+        let types = json_string_list(get(5)?);
+        let params = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| FunctionParam {
+                name: n.clone().unwrap_or_else(|| format!("arg{}", i + 1)),
+                duckdb_type: types.get(i).cloned().flatten(),
+            })
+            .collect();
+        let signature = FunctionSignature { params, varargs: get(6)?, returns: get(3)? };
+        let description = get(2)?.filter(|d| !d.trim().is_empty());
+        let examples: Vec<String> = json_string_list(get(7)?).into_iter().flatten().collect();
+
+        match docs.last_mut() {
+            Some(doc) if doc.name == name && doc.kind == kind => {
+                if !doc.signatures.contains(&signature) {
+                    doc.signatures.push(signature);
+                }
+                if doc.description.is_none() {
+                    doc.description = description;
+                }
+                for example in examples {
+                    if !doc.examples.contains(&example) {
+                        doc.examples.push(example);
+                    }
+                }
+            }
+            _ => docs.push(FunctionDoc { name, kind, description, examples, signatures: vec![signature] }),
+        }
+    }
+    Ok(docs)
+}
+
+/// DuckDB's function reference, read on first use and then cached for the session.
+#[tauri::command(async)]
+fn sql_function_docs(state: tauri::State<'_, Arc<AppRuntimeState>>) -> Result<Arc<Vec<FunctionDoc>>, String> {
+    let st = state.inner().clone();
+    if let Some(docs) = st.function_docs.lock().map_err(|_| "Function reference lock poisoned.".to_string())?.clone() {
+        return Ok(docs);
+    }
+    on_duckdb_thread(move || {
+        let started = Instant::now();
+        let conn = Connection::open_in_memory().map_err(|e| format!("open DuckDB: {e}"))?;
+        let docs = Arc::new(load_function_docs(&conn)?);
+        *st.function_docs.lock().map_err(|_| "Function reference lock poisoned.".to_string())? = Some(docs.clone());
+        log_perf(&st, "sql_function_docs", &format!("duration_ms={} functions={}", started.elapsed().as_millis(), docs.len()));
+        Ok(docs)
+    })
 }
 
 /// Sheet names from an .xlsx (a zip archive) by reading `xl/workbook.xml`.
@@ -4452,6 +4564,7 @@ pub fn run() {
             prepare_sql_completions,
             sync_completion_tables,
             sql_completions,
+            sql_function_docs,
             get_log_path
         ])
         .run(tauri::generate_context!())
@@ -4462,6 +4575,50 @@ pub fn run() {
 mod editor_tests {
     use super::*;
     use std::sync::OnceLock;
+
+    #[test]
+    fn function_docs_group_overloads_with_types_and_descriptions() {
+        let conn = Connection::open_in_memory().unwrap();
+        let docs = load_function_docs(&conn).unwrap();
+        assert!(docs.len() > 500, "expected hundreds of functions, got {}", docs.len());
+
+        let find = |name: &str, kind: &str| docs.iter().find(|d| d.name == name && d.kind == kind)
+            .unwrap_or_else(|| panic!("{name} ({kind}) missing"));
+        let trunc = find("date_trunc", "scalar");
+        assert!(trunc.description.as_deref().unwrap_or("").contains("Truncate"));
+        assert!(trunc.signatures.len() >= 2, "date_trunc has several overloads");
+        let first = &trunc.signatures[0];
+        assert_eq!(first.params.len(), 2);
+        assert_eq!(first.params[0].duckdb_type.as_deref(), Some("VARCHAR"));
+        assert!(!trunc.examples.is_empty());
+
+        let sum = find("sum", "aggregate");
+        assert!(sum.signatures.iter().all(|s| s.returns.is_some()));
+
+        // Table functions carry named parameters; pragmas are left out entirely.
+        assert!(find("read_parquet", "table").signatures[0].params.iter().any(|p| p.name == "hive_partitioning"));
+        assert!(docs.iter().all(|d| d.kind != "pragma"));
+
+        // One entry per (name, kind), each signature listed once.
+        let mut keys: Vec<(&str, &str)> = docs.iter().map(|d| (d.name.as_str(), d.kind.as_str())).collect();
+        let total = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), total);
+        for d in &docs {
+            for (i, sig) in d.signatures.iter().enumerate() {
+                assert!(!d.signatures[..i].contains(sig), "{} repeats a signature", d.name);
+            }
+        }
+    }
+
+    #[test]
+    fn function_docs_mark_variadic_functions() {
+        let conn = Connection::open_in_memory().unwrap();
+        let docs = load_function_docs(&conn).unwrap();
+        let concat = docs.iter().find(|d| d.name == "concat" && d.kind == "scalar").expect("concat");
+        assert!(concat.signatures.iter().any(|s| s.varargs.is_some()), "concat takes any number of arguments");
+    }
 
     fn install_autocomplete() {
         static DONE: OnceLock<()> = OnceLock::new();

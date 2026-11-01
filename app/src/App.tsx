@@ -67,6 +67,8 @@ import { usePerspective } from "./hooks/usePerspective";
 import { useWorkspace } from "./hooks/useWorkspace";
 import { useDragDrop } from "./hooks/useDragDrop";
 import { useSqlCompletions } from "./hooks/useSqlCompletions";
+import { useSqlErrorMarkers } from "./hooks/useSqlErrorMarkers";
+import { useSqlReference } from "./hooks/useSqlReference";
 import { SettingsModal } from "./components/SettingsModal";
 import { AboutModal } from "./components/AboutModal";
 import { VirtualScrollGrid } from "./components/VirtualScrollGrid";
@@ -187,6 +189,8 @@ function App() {
     workspaceMonacoRef, workspaceEditorRef, workspaceEditorReady,
     workspaceTables, workspaceTableSchemas, workspaceQueryResult,
   );
+  useSqlReference(workspaceMonacoRef, workspaceEditorRef, workspaceEditorReady, workspaceTables, workspaceTableSchemas);
+  const sqlErrorMarkers = useSqlErrorMarkers(workspaceMonacoRef, workspaceEditorRef, workspaceEditorReady);
 
   const { dragOverZone } = useDragDrop({
     activeTab, previewPaneRef, sqlPaneRef,
@@ -433,6 +437,8 @@ function App() {
     // One cancellable operation at a time, so Cancel always stops the one that's running.
     if (loading || runningOp) return;
     const plan = planEditorRun(mode);
+    // Read with the plan: the offsets in it are only valid for this version of the text.
+    const editorVersion = sqlErrorMarkers.versionNow();
     if (!plan) {
       setSqlError("Write a SQL query first.");
       return;
@@ -447,6 +453,7 @@ function App() {
     const op = startOperation("query");
     setLoading(true);
     setSqlError(null);
+    sqlErrorMarkers.clearError();
     setQueryStartedAt(op.startedAt);
     if (resultTab === "plan") setResultTab("results");
     flashRange(plan.start, plan.end);
@@ -475,6 +482,7 @@ function App() {
     } catch (err) {
       if (finishOperation(op, err)) return;
       const message = friendlyError(String(err));
+      sqlErrorMarkers.markError(plan, String(err), message, editorVersion);
       if (message.includes("Referenced column")) {
         const availableColumns = Array.from(new Set(Object.values(workspaceTableSchemas).flat().map((c) => c.name)));
         const sample = availableColumns.slice(0, 18);
@@ -505,13 +513,19 @@ function App() {
     const op = startOperation("explain");
     setExplainLoading(true);
     setSqlError(null);
+    sqlErrorMarkers.clearError();
+    const editorVersion = sqlErrorMarkers.versionNow();
     setResultTab("plan");
     flashRange(plan.start, plan.end);
     try {
       setExplainPlan(await invoke<string>("explain_workspace_query", { sql: plan.sql, queryId: op.id }));
       finishOperation(op);
     } catch (err) {
-      if (!finishOperation(op, err)) setSqlError(friendlyError(String(err)));
+      if (!finishOperation(op, err)) {
+        const message = friendlyError(String(err));
+        sqlErrorMarkers.markError(plan, String(err), message, editorVersion);
+        setSqlError(message);
+      }
     } finally {
       setExplainLoading(false);
     }
@@ -1148,6 +1162,9 @@ function App() {
                       fontSize: editorFontSize,
                       scrollBeyondLastLine: false,
                       lineNumbers: "on",
+                      // Hover cards and parameter hints open above the line; let them extend
+                      // past the editor's edges instead of being clipped near the top.
+                      fixedOverflowWidgets: true,
                     }}
                   />
                 </div>

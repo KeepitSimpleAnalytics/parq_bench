@@ -12,8 +12,9 @@ import type {
   WorkspaceTableInfo,
 } from "../types";
 import { friendlyError, sqlIdentifierInsertText } from "../utils";
-import { splitSqlStatements } from "../sql/statements";
+import { editorContext } from "../sql/editorContext";
 import { findTableReferences } from "../sql/aliases";
+import { findSchema } from "../sql/reference";
 
 /** Keywords offered by the basic list (used until DuckDB's autocomplete is ready). */
 const BASIC_KEYWORDS = [
@@ -29,14 +30,6 @@ const IN_SELECT_LIST_RE = /\bSELECT\b(?:(?!\bFROM\b)[\s\S])*$/i;
 
 function unquoteIdentifier(name: string): string {
   return name.startsWith('"') ? name.slice(1, -1).replace(/""/g, '"') : name;
-}
-
-function findSchema(schemas: WorkspaceSchemaByAlias, table: string): { alias: string; schema: PreviewColumn[] } | null {
-  const lower = table.toLowerCase();
-  for (const [alias, schema] of Object.entries(schemas)) {
-    if (alias.toLowerCase() === lower) return { alias, schema };
-  }
-  return null;
 }
 
 function completionKind(monaco: typeof Monaco, kind: string): Monaco.languages.CompletionItemKind {
@@ -64,31 +57,6 @@ function kindLabel(kind: string): string {
     case "table_function": return "table function";
     default: return kind.replace(/_/g, " ");
   }
-}
-
-interface EditorContext {
-  /** Offset where the statement under the cursor starts (or the cursor, for a new one). */
-  statementStart: number;
-  /** The whole statement under the cursor, including text after the cursor. */
-  statement: string;
-  /** The statement's text up to the cursor. */
-  before: string;
-}
-
-function editorContext(model: Monaco.editor.ITextModel, position: Monaco.Position): EditorContext {
-  const full = model.getValue();
-  const offset = model.getOffsetAt(position);
-  const current = splitSqlStatements(full).find((s) =>
-    offset >= s.start &&
-    (offset < s.terminatorEnd || (offset === s.terminatorEnd && full[s.terminatorEnd - 1] !== ";")),
-  );
-  if (!current) return { statementStart: offset, statement: "", before: "" };
-  const statementEnd = full[current.terminatorEnd - 1] === ";" ? current.terminatorEnd - 1 : current.terminatorEnd;
-  return {
-    statementStart: current.start,
-    statement: full.slice(current.start, statementEnd),
-    before: full.slice(current.start, offset),
-  };
 }
 
 /**

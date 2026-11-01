@@ -137,6 +137,30 @@ export type ExtensionStatus = {
   size_bytes: number | null;
 };
 
+/** One parameter of a DuckDB function overload. */
+export type FunctionParam = {
+  name: string;
+  /** null for macros, whose parameters are untyped. */
+  duckdb_type: string | null;
+};
+
+export type FunctionSignature = {
+  params: FunctionParam[];
+  /** Type of the trailing variadic argument, if the function takes any number of them. */
+  varargs: string | null;
+  returns: string | null;
+};
+
+/** One function name and kind with all its overloads (backend `sql_function_docs`). */
+export type FunctionDoc = {
+  name: string;
+  /** scalar | aggregate | window | macro | table | table_macro */
+  kind: string;
+  description: string | null;
+  examples: string[];
+  signatures: FunctionSignature[];
+};
+
 /** One suggestion from DuckDB's sql_auto_complete (backend `sql_completions`). */
 export type SqlCompletion = {
   text: string;
