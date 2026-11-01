@@ -1,6 +1,7 @@
-import React from "react";
+import React, { useMemo } from "react";
 import type { PreviewColumn } from "../types";
 import { ROW_HEIGHT } from "../constants";
+import { isNumericDuckType } from "../utils";
 
 export interface VirtualScrollGridProps {
   schema: PreviewColumn[];
@@ -25,8 +26,9 @@ export const VirtualScrollGrid = React.memo(function VirtualScrollGrid({
   onScroll,
   onCopyColumn,
 }: VirtualScrollGridProps) {
+  const numeric = useMemo(() => schema.map((c) => isNumericDuckType(c.duckdb_type)), [schema]);
   return (
-    <>
+    <div className="virtual-wrap">
       <div className="virtual-header-track">
         <div
           className="virtual-header-row"
@@ -36,12 +38,14 @@ export const VirtualScrollGrid = React.memo(function VirtualScrollGrid({
             transform: `translateX(-${scrollLeft}px)`,
           }}
         >
-          {schema.map((col) => (
-            <div key={col.name} className="virtual-cell virtual-cell-head col-copyable"
-              title={`${col.duckdb_type} — click to copy`}
+          {schema.map((col, i) => (
+            <button key={col.name} type="button"
+              className={numeric[i] ? "virtual-cell virtual-cell-head num" : "virtual-cell virtual-cell-head"}
+              title="Click to copy column name"
               onClick={() => onCopyColumn(col.name)}>
-              {col.name}
-            </div>
+              <span className="th-name">{col.name}</span>
+              <span className="th-type">{col.duckdb_type}</span>
+            </button>
           ))}
         </div>
       </div>
@@ -65,16 +69,22 @@ export const VirtualScrollGrid = React.memo(function VirtualScrollGrid({
                   gridTemplateColumns: columnGridTemplate,
                 }}
               >
-                {schema.map((col, colIndex) => (
-                  <div key={`virtual-cell-${index}-${col.name}`} className="virtual-cell" title={row?.[colIndex] ?? "NULL"}>
-                    {row ? (row[colIndex] ?? "NULL") : "..."}
-                  </div>
-                ))}
+                {schema.map((col, colIndex) => {
+                  const value = row ? row[colIndex] ?? null : undefined;
+                  const cls = numeric[colIndex] ? "virtual-cell num" : "virtual-cell";
+                  if (value === undefined) {
+                    return <div key={col.name} className={`${cls} loading-cell`}>…</div>;
+                  }
+                  if (value === null) {
+                    return <div key={col.name} className={cls}><span className="null-cell">NULL</span></div>;
+                  }
+                  return <div key={col.name} className={cls} title={value}>{value}</div>;
+                })}
               </div>
             );
           })}
         </div>
       </div>
-    </>
+    </div>
   );
 });

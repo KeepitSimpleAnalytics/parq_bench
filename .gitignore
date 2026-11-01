@@ -34,3 +34,7 @@ sample_data/
 # Internal docs (not part of release)
 YOUTUBE_SCRIPT.md
 potential_enhancements.md
+
+# Large local benchmark data
+testdata/parquet/tpch/
+*.tsbuildinfo

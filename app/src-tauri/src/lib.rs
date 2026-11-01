@@ -6,8 +6,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Cursor, Write as _};
-use std::path::PathBuf;
+use std::io::{Cursor, Read as _, Write as _};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -70,7 +70,8 @@ struct ParquetSchemaColumn {
 #[derive(Serialize)]
 struct ParquetPreviewResponse {
     file_path: String,
-    file_size_bytes: u64,
+    /// None for URLs (no local file to measure).
+    file_size_bytes: Option<u64>,
     total_rows: u64,
     row_offset: u64,
     row_limit: u32,
@@ -107,6 +108,12 @@ struct FlattenedColumn {
 enum WorkspaceSourceKind {
     Parquet,
     Delimited,
+    /// `.xlsx` via the on-demand `excel` extension.
+    Excel,
+    /// One table or view of a SQLite database via the on-demand `sqlite` extension.
+    Sqlite,
+    /// A Delta Lake table folder via the on-demand `delta` extension.
+    Delta,
 }
 
 impl WorkspaceSourceKind {
@@ -114,6 +121,9 @@ impl WorkspaceSourceKind {
         match self {
             Self::Parquet => "parquet",
             Self::Delimited => "delimited",
+            Self::Excel => "excel",
+            Self::Sqlite => "sqlite",
+            Self::Delta => "delta",
         }
     }
 }
@@ -125,6 +135,11 @@ struct WorkspaceTableRegistration {
     is_glob: bool,
     source_kind: WorkspaceSourceKind,
     delimiter: Option<String>,
+    row_count: Option<u64>,
+    /// Excel sheet or SQLite table/view name.
+    object_name: Option<String>,
+    /// Excel only: whether the first row holds column names.
+    header: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -132,9 +147,24 @@ struct WorkspaceTableInfo {
     alias: String,
     file_path: String,
     is_glob: bool,
+    is_remote: bool,
     source_kind: String,
     delimiter: Option<String>,
+    object_name: Option<String>,
+    header: Option<bool>,
     file_size_bytes: Option<u64>,
+    row_count: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct SourcePeekResponse {
+    source_kind: String,
+    detected_delimiter: Option<String>,
+    has_header: Option<bool>,
+    matched_files: Option<u64>,
+    row_count: Option<u64>,
+    schema: Vec<ParquetSchemaColumn>,
+    rows: Vec<Vec<Option<String>>>,
 }
 
 #[derive(Serialize)]
@@ -582,10 +612,8 @@ fn schema_from_flattened(flattened: &[FlattenedColumn]) -> Vec<ParquetSchemaColu
 }
 
 fn parquet_total_rows(conn: &Connection, normalized_path: &str, source: &str) -> Result<u64, String> {
-    let metadata_sql = format!(
-        "SELECT COALESCE(SUM(num_rows), 0)::UBIGINT FROM parquet_metadata('{normalized_path}')"
-    );
-    if let Ok(rows) = conn.query_row(&metadata_sql, [], |row| row.get::<_, u64>(0)) {
+    // Footer metadata gives the count without scanning; fall back to COUNT(*) only if it fails.
+    if let Ok(rows) = parquet_metadata_row_count(conn, normalized_path) {
         return Ok(rows);
     }
 
@@ -684,16 +712,26 @@ fn parse_workspace_source_kind(source_kind: Option<String>) -> Result<WorkspaceS
     match normalized.as_str() {
         "parquet" => Ok(WorkspaceSourceKind::Parquet),
         "delimited" => Ok(WorkspaceSourceKind::Delimited),
-        _ => Err("Unsupported workspace source type. Use 'parquet' or 'delimited'.".to_string()),
+        "excel" => Ok(WorkspaceSourceKind::Excel),
+        "sqlite" => Ok(WorkspaceSourceKind::Sqlite),
+        "delta" => Ok(WorkspaceSourceKind::Delta),
+        _ => Err(
+            "Unsupported workspace source type. Use 'parquet', 'delimited', 'excel', 'sqlite' or 'delta'."
+                .to_string(),
+        ),
     }
 }
 
-fn default_delimiter_for_path(path: &str) -> char {
+/// Delimiter implied by a file extension. `None` means "let DuckDB's CSV
+/// sniffer detect it" (used for .csv, .txt, .data and anything unknown).
+fn default_delimiter_for_path(path: &str) -> Option<char> {
     let lower = path.trim().to_ascii_lowercase();
     if lower.ends_with(".tsv") {
-        '\t'
+        Some('\t')
+    } else if lower.ends_with(".psv") {
+        Some('|')
     } else {
-        ','
+        None
     }
 }
 
@@ -728,18 +766,16 @@ fn resolve_workspace_delimiter(
     delimiter: Option<String>,
 ) -> Result<Option<String>, String> {
     match source_kind {
-        WorkspaceSourceKind::Parquet => Ok(None),
+        WorkspaceSourceKind::Parquet
+        | WorkspaceSourceKind::Excel
+        | WorkspaceSourceKind::Sqlite
+        | WorkspaceSourceKind::Delta => Ok(None),
         WorkspaceSourceKind::Delimited => {
-            let resolved = if let Some(raw) = delimiter {
-                if raw.trim().is_empty() {
-                    default_delimiter_for_path(file_path)
-                } else {
-                    parse_delimiter_char(&raw)?
-                }
-            } else {
-                default_delimiter_for_path(file_path)
+            let resolved = match delimiter {
+                Some(raw) if !raw.trim().is_empty() => Some(parse_delimiter_char(&raw)?),
+                _ => default_delimiter_for_path(file_path),
             };
-            Ok(Some(resolved.to_string()))
+            Ok(resolved.map(|c| c.to_string()))
         }
     }
 }
@@ -753,15 +789,151 @@ fn workspace_source_sql(table: &WorkspaceTableRegistration) -> String {
                 .delimiter
                 .as_deref()
                 .and_then(|value| value.chars().next())
-                .unwrap_or_else(|| default_delimiter_for_path(&table.file_path));
-            let escaped_delim = escape_sql_literal(&delimiter.to_string());
-            format!("read_csv_auto('{path}', delim='{escaped_delim}')")
+                .or_else(|| default_delimiter_for_path(&table.file_path));
+            match delimiter {
+                Some(d) => {
+                    let escaped_delim = escape_sql_literal(&d.to_string());
+                    format!("read_csv_auto('{path}', delim='{escaped_delim}')")
+                }
+                // No explicit delimiter: let DuckDB's sniffer detect it.
+                None => format!("read_csv_auto('{path}')"),
+            }
         }
+        WorkspaceSourceKind::Excel => {
+            let mut args = format!("'{path}'");
+            if let Some(sheet) = table.object_name.as_deref() {
+                args.push_str(&format!(", sheet => '{}'", escape_sql_literal(sheet)));
+            }
+            if let Some(header) = table.header {
+                args.push_str(&format!(", header => {header}"));
+            }
+            format!("read_xlsx({args})")
+        }
+        WorkspaceSourceKind::Sqlite => {
+            let name = escape_sql_literal(table.object_name.as_deref().unwrap_or_default());
+            format!("sqlite_scan('{path}', '{name}')")
+        }
+        WorkspaceSourceKind::Delta => format!("delta_scan('{path}')"),
     }
 }
 
+/// `http://` or `https://` source, read through the on-demand `httpfs` extension.
+fn is_remote_path(path: &str) -> bool {
+    let lower = path.trim_start().to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+/// Registered tables an SQL statement refers to: those whose alias appears as a whole
+/// word (case-insensitive). Every command opens a fresh connection, so only these need
+/// a view, and a table the statement doesn't use (an unreachable URL, an extension that
+/// can't be downloaded) can't make it fail.
+fn tables_referenced_by(
+    sql: &str,
+    tables: &[WorkspaceTableRegistration],
+) -> Vec<WorkspaceTableRegistration> {
+    let lower = sql.to_ascii_lowercase();
+    tables
+        .iter()
+        .filter(|t| contains_word(&lower, &t.alias.to_ascii_lowercase()))
+        .cloned()
+        .collect()
+}
+
+/// The registered tables with the given aliases (case-insensitive).
+fn tables_with_aliases(
+    tables: &[WorkspaceTableRegistration],
+    aliases: &[&str],
+) -> Vec<WorkspaceTableRegistration> {
+    tables
+        .iter()
+        .filter(|t| aliases.iter().any(|a| t.alias.eq_ignore_ascii_case(a)))
+        .cloned()
+        .collect()
+}
+
+/// `word` (ASCII) occurs in `haystack` with no identifier character on either side.
+fn contains_word(haystack: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(found) = haystack[from..].find(word) {
+        let start = from + found;
+        let end = start + word.len();
+        let before_ok = haystack[..start].chars().next_back().map_or(true, |c| !is_ident(c));
+        let after_ok = haystack[end..].chars().next().map_or(true, |c| !is_ident(c));
+        if before_ok && after_ok {
+            return true;
+        }
+        // `word` starts with an ASCII byte, so start + 1 is a char boundary.
+        from = start + 1;
+    }
+    false
+}
+
+/// For logs: drop a URL's query string and fragment, which can carry access tokens.
+fn redact_for_log(path: &str) -> String {
+    if is_remote_path(path) {
+        path.split(['?', '#']).next().unwrap_or(path).to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+/// A `scheme://` path other than http(s) (s3://, gs://, hf://, …). These need
+/// credentials or extensions the app doesn't manage, so they aren't accepted.
+fn has_unsupported_scheme(path: &str) -> bool {
+    let trimmed = path.trim_start();
+    match trimmed.find("://") {
+        Some(idx) => {
+            let scheme = &trimmed[..idx];
+            !scheme.is_empty()
+                && scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+                && !is_remote_path(trimmed)
+        }
+        None => false,
+    }
+}
+
+/// Shared checks for peek and register: the path exists (local sources), the
+/// source kind supports the requested mode, and required options are present.
+fn validate_workspace_source(
+    path: &str,
+    is_glob: bool,
+    kind: WorkspaceSourceKind,
+    object_name: Option<&str>,
+) -> Result<(), String> {
+    if has_unsupported_scheme(path) {
+        return Err("Only local paths and http(s):// links are supported.".to_string());
+    }
+    let remote = is_remote_path(path);
+    if remote {
+        if is_glob {
+            return Err("Folders can't be read from a URL. Enter a single file's URL.".to_string());
+        }
+        if !matches!(kind, WorkspaceSourceKind::Parquet | WorkspaceSourceKind::Delimited) {
+            return Err("Only Parquet and delimited text files can be read from a URL.".to_string());
+        }
+    } else if !is_glob && fs::metadata(path).is_err() {
+        return Err("Workspace file path does not exist.".to_string());
+    }
+    if is_glob && !matches!(kind, WorkspaceSourceKind::Parquet | WorkspaceSourceKind::Delimited) {
+        return Err("Folder mode supports Parquet and delimited text files only.".to_string());
+    }
+    if kind == WorkspaceSourceKind::Delta && !Path::new(path).is_dir() {
+        return Err("A Delta table is a folder. Choose the table's folder (the one containing _delta_log).".to_string());
+    }
+    if kind == WorkspaceSourceKind::Sqlite && object_name.map_or(true, |n| n.trim().is_empty()) {
+        return Err("Choose a table from the SQLite database.".to_string());
+    }
+    Ok(())
+}
+
 fn workspace_table_info(entry: &WorkspaceTableRegistration) -> WorkspaceTableInfo {
-    let file_size_bytes = if entry.is_glob {
+    let is_remote = is_remote_path(&entry.file_path);
+    // Globs, URLs and Delta folders have no single on-disk size.
+    let file_size_bytes = if entry.is_glob || is_remote || entry.source_kind == WorkspaceSourceKind::Delta {
         None
     } else {
         fs::metadata(&entry.file_path).ok().map(|meta| meta.len())
@@ -770,9 +942,13 @@ fn workspace_table_info(entry: &WorkspaceTableRegistration) -> WorkspaceTableInf
         alias: entry.alias.clone(),
         file_path: entry.file_path.clone(),
         is_glob: entry.is_glob,
+        is_remote,
         source_kind: entry.source_kind.as_str().to_string(),
         delimiter: entry.delimiter.clone(),
+        object_name: entry.object_name.clone(),
+        header: entry.header,
         file_size_bytes,
+        row_count: entry.row_count,
     }
 }
 
@@ -783,7 +959,8 @@ fn apply_workspace_tables(
     for table in tables {
         let ident = escape_sql_ident(&table.alias);
         let source = workspace_source_sql(table);
-        let flattened = flattened_columns_for_source(conn, &source)?;
+        let flattened = flattened_columns_for_source(conn, &source)
+            .map_err(|e| format!("register workspace table '{}': {e}", table.alias))?;
         let projection = flattened_projection_sql(&flattened, false);
         conn.execute_batch(&format!(
             "CREATE OR REPLACE VIEW \"{ident}\" AS SELECT {projection} FROM {source};"
@@ -862,8 +1039,8 @@ fn export_workspace_query_to_file(
     table_aliases: Option<&[String]>,
 ) -> Result<(), String> {
     let normalized_format = format.trim().to_ascii_lowercase();
-    if normalized_format != "csv" && normalized_format != "parquet" {
-        return Err("Unsupported export format. Use 'csv' or 'parquet'.".to_string());
+    if !matches!(normalized_format.as_str(), "csv" | "parquet" | "xlsx") {
+        return Err("Unsupported export format. Use 'csv', 'parquet' or 'xlsx'.".to_string());
     }
     let escaped_path = escape_sql_string_literal(output_path);
     let timestamp = {
@@ -873,7 +1050,16 @@ fn export_workspace_query_to_file(
         format!("{}Z", d.as_secs())
     };
 
-    if normalized_format == "csv" {
+    if normalized_format == "xlsx" {
+        // Excel has no place for the query/table metadata the other formats carry.
+        // COPY ... (FORMAT xlsx) doesn't autoload, so load the extension first.
+        ensure_extension_loaded(conn, "excel")?;
+        let copy_sql = format!(
+            "COPY (SELECT * FROM ({sql}) AS _q) TO '{escaped_path}' (FORMAT xlsx, HEADER true);"
+        );
+        conn.execute_batch(&copy_sql)
+            .map_err(|e| format!("export workspace query: {e}"))?;
+    } else if normalized_format == "csv" {
         // Write metadata comment header then COPY output
         let mut meta_header = String::new();
         if let Some(qt) = query_text {
@@ -1251,7 +1437,7 @@ fn arrow_ipc_payload(
     Ok(payload)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn preview_parquet(
     file_path: String,
     row_limit: u32,
@@ -1263,9 +1449,15 @@ fn preview_parquet(
         let conn = open_configured_duckdb(&st)?;
         let conn = &conn;
         let started = Instant::now();
-        let file_size_bytes = fs::metadata(&file_path)
-            .map_err(|e| format!("read file metadata: {e}"))?
-            .len();
+        let file_size_bytes = if is_remote_path(&file_path) {
+            None
+        } else {
+            Some(
+                fs::metadata(&file_path)
+                    .map_err(|e| format!("read file metadata: {e}"))?
+                    .len(),
+            )
+        };
         let normalized = escape_sql_string_literal(&file_path);
         let source = format!("read_parquet('{normalized}')");
         let total_rows = parquet_total_rows(conn, &normalized, &source)?;
@@ -1280,7 +1472,7 @@ fn preview_parquet(
             &format!(
                 "duration_ms={} file_size_bytes={} schema_cols={} rows={}",
                 started.elapsed().as_millis(),
-                file_size_bytes,
+                file_size_bytes.map_or_else(|| "remote".to_string(), |b| b.to_string()),
                 schema.len(),
                 rows.len()
             ),
@@ -1298,7 +1490,7 @@ fn preview_parquet(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn fetch_parquet_rows(
     file_path: String,
     row_offset: u64,
@@ -1510,13 +1702,378 @@ fn write_text_report(path: String, contents: String) -> Result<(), String> {
     fs::write(&path, contents).map_err(|e| format!("write report file: {e}"))
 }
 
-#[tauri::command]
+fn parquet_metadata_row_count(conn: &Connection, normalized_path: &str) -> Result<u64, String> {
+    let sql = format!(
+        "SELECT COALESCE(SUM(num_rows), 0)::UBIGINT FROM parquet_file_metadata('{normalized_path}')"
+    );
+    conn.query_row(&sql, [], |row| row.get::<_, u64>(0))
+        .map_err(|e| format!("read parquet metadata: {e}"))
+}
+
+// ── On-demand extensions ────────────────────────────────────────────────
+//
+// Parquet and JSON are statically linked. Everything below is downloaded by
+// DuckDB the first time a query needs it (autoinstall/autoload), or ahead of
+// time from Settings. Nothing is loaded at startup.
+
+/// Extensions offered in Settings. Install requests are limited to this list.
+const MANAGED_EXTENSIONS: [&str; 5] = ["excel", "sqlite_scanner", "httpfs", "delta", "icu"];
+
+#[derive(Serialize)]
+struct ExtensionStatus {
+    name: String,
+    installed: bool,
+    loaded: bool,
+    size_bytes: Option<u64>,
+}
+
+fn managed_extension_name(name: &str) -> Result<&'static str, String> {
+    let lower = name.trim().to_ascii_lowercase();
+    let canonical = if lower == "sqlite" { "sqlite_scanner" } else { lower.as_str() };
+    MANAGED_EXTENSIONS
+        .iter()
+        .copied()
+        .find(|ext| *ext == canonical)
+        .ok_or_else(|| format!("Unknown extension: {name}"))
+}
+
+fn extension_statuses(conn: &Connection) -> Result<Vec<ExtensionStatus>, String> {
+    MANAGED_EXTENSIONS
+        .iter()
+        .map(|&name| {
+            let (installed, loaded, install_path) = conn
+                .query_row(
+                    "SELECT installed, loaded, install_path FROM duckdb_extensions() WHERE extension_name = ?",
+                    [name],
+                    |r| Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?, r.get::<_, Option<String>>(2)?)),
+                )
+                .map_err(|e| format!("read extension status for {name}: {e}"))?;
+            let size_bytes = if installed {
+                install_path
+                    .filter(|p| !p.is_empty())
+                    .and_then(|p| fs::metadata(p).ok())
+                    .map(|m| m.len())
+            } else {
+                None
+            };
+            Ok(ExtensionStatus { name: name.to_string(), installed, loaded, size_bytes })
+        })
+        .collect()
+}
+
+/// LOAD a managed extension, installing it first if needed. Needed where
+/// DuckDB doesn't autoload (e.g. `COPY ... (FORMAT xlsx)`).
+fn ensure_extension_loaded(conn: &Connection, name: &str) -> Result<(), String> {
+    let ext = managed_extension_name(name)?;
+    let load_err = match conn.execute_batch(&format!("LOAD {ext};")) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    // Not installed yet (or broken): install, then load. Report both errors if that fails too.
+    conn.execute_batch(&format!("INSTALL {ext}; LOAD {ext};"))
+        .map_err(|e| format!("load {ext} extension: {e} (first attempt: {load_err})"))
+}
+
+#[tauri::command(async)]
+fn list_extensions(
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<ExtensionStatus>, String> {
+    let st = state.inner().clone();
+    on_duckdb_thread(move || extension_statuses(&open_configured_duckdb(&st)?))
+}
+
+#[tauri::command(async)]
+fn install_extension(
+    name: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<ExtensionStatus>, String> {
+    let ext = managed_extension_name(&name)?;
+    let st = state.inner().clone();
+    on_duckdb_thread(move || {
+        let conn = open_configured_duckdb(&st)?;
+        let started = Instant::now();
+        conn.execute_batch(&format!("INSTALL {ext};"))
+            .map_err(|e| format!("install extension: {e}"))?;
+        log_perf(
+            &st,
+            "extension_install",
+            &format!("name={ext} duration_ms={}", started.elapsed().as_millis()),
+        );
+        extension_statuses(&conn)
+    })
+}
+
+/// Sheet names from an .xlsx (a zip archive) by reading `xl/workbook.xml`.
+/// The excel extension has no function that lists sheets.
+fn xlsx_sheet_names(path: &str) -> Result<Vec<String>, String> {
+    let file = fs::File::open(path).map_err(|e| format!("open xlsx: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("read xlsx (is it a valid .xlsx file?): {e}"))?;
+    let mut xml = String::new();
+    archive
+        .by_name("xl/workbook.xml")
+        .map_err(|e| format!("read xlsx workbook: {e}"))?
+        .read_to_string(&mut xml)
+        .map_err(|e| format!("read xlsx workbook: {e}"))?;
+    let names = parse_workbook_sheet_names(&xml);
+    if names.is_empty() {
+        return Err("No sheets found in this .xlsx file.".to_string());
+    }
+    Ok(names)
+}
+
+fn parse_workbook_sheet_names(xml: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = xml;
+    while let Some(lt) = rest.find('<') {
+        rest = &rest[lt + 1..];
+        // `>` is legal unescaped inside attribute values, so end the tag at the first `>` outside quotes.
+        let Some(end) = tag_end(rest) else { break };
+        let tag = &rest[..end];
+        let element_end = tag
+            .find(|c: char| c.is_whitespace() || c == '/')
+            .unwrap_or(tag.len());
+        let element = &tag[..element_end];
+        // Generators may namespace-prefix elements (e.g. `<x:sheet>`).
+        if element.rsplit(':').next() == Some("sheet") {
+            if let Some(name) = xml_attribute(tag, "name") {
+                names.push(xml_unescape(&name));
+            }
+        }
+        rest = &rest[end + 1..];
+    }
+    names
+}
+
+fn xml_attribute(tag: &str, attribute: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let pattern = format!("{attribute}={quote}");
+        let mut from = 0;
+        while let Some(found) = tag[from..].find(&pattern) {
+            let at = from + found;
+            // Whole attribute name only (not e.g. `sheetname=`).
+            if tag[..at].ends_with(char::is_whitespace) {
+                let start = at + pattern.len();
+                let len = tag[start..].find(quote)?;
+                return Some(tag[start..start + len].to_string());
+            }
+            from = at + pattern.len();
+        }
+    }
+    None
+}
+
+/// Byte index of the `>` that closes a tag, skipping any inside quoted attribute values.
+fn tag_end(rest: &str) -> Option<usize> {
+    let mut quote: Option<char> = None;
+    for (i, c) in rest.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None, '>') => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Decodes the five named XML entities and numeric references (`&#39;`, `&#x27;`).
+fn xml_unescape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let decoded = after.find(';').and_then(|semi| {
+            let entity = &after[..semi];
+            let ch = match entity {
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "amp" => Some('&'),
+                _ => entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                    .map(|hex| u32::from_str_radix(hex, 16))
+                    .or_else(|| entity.strip_prefix('#').map(|dec| dec.parse::<u32>()))
+                    .and_then(Result::ok)
+                    .and_then(char::from_u32),
+            };
+            ch.map(|c| (c, semi))
+        });
+        match decoded {
+            Some((c, semi)) => {
+                out.push(c);
+                rest = &after[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+#[tauri::command(async)]
+fn list_xlsx_sheets(file_path: String) -> Result<Vec<String>, String> {
+    let path = file_path.trim().to_string();
+    if fs::metadata(&path).is_err() {
+        return Err("Workspace file path does not exist.".to_string());
+    }
+    xlsx_sheet_names(&path)
+}
+
+#[derive(Serialize)]
+struct SqliteObject {
+    name: String,
+    /// "table" or "view".
+    kind: String,
+}
+
+fn sqlite_objects(conn: &Connection, path: &str) -> Result<Vec<SqliteObject>, String> {
+    let escaped = escape_sql_string_literal(path);
+    let sql = format!(
+        "SELECT name, type FROM sqlite_scan('{escaped}', 'sqlite_master') \
+         WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite!_%' ESCAPE '!' \
+         ORDER BY type = 'view', name"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("list sqlite tables: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| Ok(SqliteObject { name: r.get(0)?, kind: r.get(1)? }))
+        .map_err(|e| format!("list sqlite tables: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("list sqlite tables: {e}"))
+}
+
+#[tauri::command(async)]
+fn list_sqlite_tables(
+    file_path: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<SqliteObject>, String> {
+    let path = file_path.trim().to_string();
+    if fs::metadata(&path).is_err() {
+        return Err("Workspace file path does not exist.".to_string());
+    }
+    let st = state.inner().clone();
+    on_duckdb_thread(move || sqlite_objects(&open_configured_duckdb(&st)?, &path))
+}
+
+/// Inspect a source before it is mounted: detected delimiter/header, glob
+/// match count, schema, and the first few rows.
+#[tauri::command(async)]
+fn peek_workspace_source(
+    file_path: String,
+    is_glob: Option<bool>,
+    source_kind: Option<String>,
+    delimiter: Option<String>,
+    object_name: Option<String>,
+    header: Option<bool>,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<SourcePeekResponse, String> {
+    ensure_memory_guard_clear(state.as_ref())?;
+    let trimmed_path = file_path.trim().to_string();
+    if trimmed_path.is_empty() {
+        return Err("File path is required.".to_string());
+    }
+    let use_glob = is_glob.unwrap_or(false);
+    let kind = parse_workspace_source_kind(source_kind)?;
+    let object_name = object_name.filter(|n| !n.trim().is_empty());
+    validate_workspace_source(&trimmed_path, use_glob, kind, object_name.as_deref())?;
+    let resolved_delimiter = resolve_workspace_delimiter(&kind, &trimmed_path, delimiter)?;
+    let registration = WorkspaceTableRegistration {
+        alias: "_peek".to_string(),
+        file_path: trimmed_path,
+        is_glob: use_glob,
+        source_kind: kind,
+        delimiter: resolved_delimiter,
+        row_count: None,
+        object_name,
+        header: if kind == WorkspaceSourceKind::Excel { header } else { None },
+    };
+    let st = state.inner().clone();
+    on_duckdb_thread(move || peek_source(&open_configured_duckdb(&st)?, &registration))
+}
+
+fn peek_source(
+    conn: &Connection,
+    registration: &WorkspaceTableRegistration,
+) -> Result<SourcePeekResponse, String> {
+    let normalized = escape_sql_string_literal(&registration.file_path);
+
+    let (matched_files, first_file) = if registration.is_glob {
+        let count: u64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*)::UBIGINT FROM glob('{normalized}')"),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("match glob pattern: {e}"))?;
+        if count == 0 {
+            return Err(format!("No files match {}", registration.file_path));
+        }
+        let first: String = conn
+            .query_row(
+                &format!("SELECT file FROM glob('{normalized}') ORDER BY file LIMIT 1"),
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("match glob pattern: {e}"))?;
+        (Some(count), first)
+    } else {
+        (None, registration.file_path.clone())
+    };
+
+    let (detected_delimiter, has_header) =
+        if registration.source_kind == WorkspaceSourceKind::Delimited {
+            let sniff_path = escape_sql_string_literal(&first_file);
+            let sniff_sql = match registration.delimiter.as_deref() {
+                Some(d) => format!(
+                    "SELECT Delimiter, HasHeader FROM sniff_csv('{sniff_path}', delim='{}')",
+                    escape_sql_literal(d)
+                ),
+                None => format!("SELECT Delimiter, HasHeader FROM sniff_csv('{sniff_path}')"),
+            };
+            let (d, h): (String, bool) = conn
+                .query_row(&sniff_sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map_err(|e| format!("detect delimiter: {e}"))?;
+            (Some(d), Some(h))
+        } else {
+            (None, None)
+        };
+
+    let source = workspace_source_sql(registration);
+    let select_sql = format!("SELECT * FROM {source}");
+    let schema = query_schema(conn, &select_sql)?;
+    let (rows, _) = query_rows_with_limit(conn, &select_sql, &schema, 5)?;
+    let row_count = if registration.source_kind == WorkspaceSourceKind::Parquet {
+        Some(parquet_metadata_row_count(conn, &normalized)?)
+    } else {
+        None
+    };
+
+    Ok(SourcePeekResponse {
+        source_kind: registration.source_kind.as_str().to_string(),
+        detected_delimiter,
+        has_header,
+        matched_files,
+        row_count,
+        schema,
+        rows,
+    })
+}
+
+#[tauri::command(async)]
 fn register_workspace_table(
     alias: String,
     file_path: String,
     is_glob: Option<bool>,
     source_kind: Option<String>,
     delimiter: Option<String>,
+    object_name: Option<String>,
+    header: Option<bool>,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<WorkspaceTableInfo, String> {
     ensure_memory_guard_clear(state.as_ref())?;
@@ -1534,12 +2091,34 @@ fn register_workspace_table(
     }
 
     let use_glob = is_glob.unwrap_or(false);
-    if !use_glob && fs::metadata(trimmed_path).is_err() {
-        return Err("Workspace file path does not exist.".to_string());
-    }
     let parsed_source_kind = parse_workspace_source_kind(source_kind)?;
+    let object_name = object_name.filter(|n| !n.trim().is_empty());
+    validate_workspace_source(trimmed_path, use_glob, parsed_source_kind, object_name.as_deref())?;
     let resolved_delimiter =
         resolve_workspace_delimiter(&parsed_source_kind, trimmed_path, delimiter)?;
+
+    // Row count from Parquet footer metadata (cheap; no data scan). Delimited
+    // sources would need a full scan, so they report no count.
+    let row_count = if parsed_source_kind == WorkspaceSourceKind::Parquet {
+        let st = state.inner().clone();
+        let path_for_count = trimmed_path.to_string();
+        match on_duckdb_thread(move || {
+            let conn = open_configured_duckdb(&st)?;
+            parquet_metadata_row_count(&conn, &escape_sql_string_literal(&path_for_count))
+        }) {
+            Ok(count) => Some(count),
+            Err(err) => {
+                log_perf(
+                    state.as_ref(),
+                    "workspace_row_count_unavailable",
+                    &format!("path={} error={err}", redact_for_log(trimmed_path)),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mut tables = state
         .workspace_tables
@@ -1551,6 +2130,9 @@ fn register_workspace_table(
         is_glob: use_glob,
         source_kind: parsed_source_kind,
         delimiter: resolved_delimiter,
+        row_count,
+        object_name,
+        header: if parsed_source_kind == WorkspaceSourceKind::Excel { header } else { None },
     };
     if let Some(existing) = tables
         .iter_mut()
@@ -1635,7 +2217,7 @@ fn remove_workspace_table(
     Ok(())
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn run_workspace_query(
     sql: String,
     row_limit: u32,
@@ -1650,7 +2232,7 @@ fn run_workspace_query(
     };
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
-        apply_workspace_tables(&conn, &tables)?;
+        apply_workspace_tables(&conn, &tables_referenced_by(&sql, &tables))?;
         let conn = &conn;
         let started = Instant::now();
         let trimmed = sql.trim().trim_end_matches(';').trim().to_string();
@@ -1736,7 +2318,7 @@ fn run_workspace_query(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn describe_workspace_table(
     alias: String,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
@@ -1768,12 +2350,12 @@ fn describe_workspace_table(
     };
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
-        apply_workspace_tables(&conn, &tables)?;
+        apply_workspace_tables(&conn, &tables_with_aliases(&tables, &[alias_trimmed.as_str()]))?;
         table_schema_for_alias(&conn, &alias_trimmed)
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn export_workspace_query(
     sql: String,
     output_path: String,
@@ -1797,7 +2379,7 @@ fn export_workspace_query(
     };
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
-        apply_workspace_tables(&conn, &tables)?;
+        apply_workspace_tables(&conn, &tables_referenced_by(&normalized_sql, &tables))?;
         let conn = &conn;
         let started = Instant::now();
         export_workspace_query_to_file(
@@ -1836,7 +2418,7 @@ fn export_workspace_query(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn explain_workspace_query(
     sql: String,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
@@ -1850,7 +2432,7 @@ fn explain_workspace_query(
     };
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
-        apply_workspace_tables(&conn, &tables)?;
+        apply_workspace_tables(&conn, &tables_referenced_by(&sql, &tables))?;
         let conn = &conn;
         let normalized_sql = normalize_single_sql_statement(&sql)?;
         let explain_sql = format!("EXPLAIN ANALYZE {normalized_sql}");
@@ -1867,7 +2449,7 @@ fn explain_workspace_query(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn summarize_workspace_table(
     alias: String,
     deep: Option<bool>,
@@ -1894,7 +2476,7 @@ fn summarize_workspace_table(
     let use_fast_path = !deep.unwrap_or(false) && source_kind == WorkspaceSourceKind::Parquet;
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
-        apply_workspace_tables(&conn, &tables)?;
+        apply_workspace_tables(&conn, &tables_with_aliases(&tables, &[alias_trimmed.as_str()]))?;
         let conn = &conn;
         let started = Instant::now();
 
@@ -1981,7 +2563,7 @@ fn summarize_workspace_table(
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn diff_workspace_schema(
     left_alias: String,
     right_alias: String,
@@ -2024,7 +2606,7 @@ fn diff_workspace_schema(
     };
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
-        apply_workspace_tables(&conn, &tables)?;
+        apply_workspace_tables(&conn, &tables_with_aliases(&tables, &[left_trimmed.as_str(), right_trimmed.as_str()]))?;
         let conn = &conn;
         let left_schema = table_schema_for_alias(conn, &left_trimmed)?;
         let right_schema = table_schema_for_alias(conn, &right_trimmed)?;
@@ -2067,12 +2649,14 @@ mod tests {
         apply_workspace_tables, build_workspace_schema_diff, compute_duckdb_memory_limit_bytes,
         compute_duckdb_threads, escape_sql_string_literal, export_workspace_query_to_file,
         flattened_columns_for_source, is_select_like, normalize_single_sql_statement,
-        open_configured_duckdb, parquet_rows_page, parquet_total_rows, query_rows_with_limit,
+        open_configured_duckdb, parquet_metadata_row_count, parquet_rows_page, parquet_total_rows, query_rows_with_limit,
         query_schema, schema_from_flattened, start_socket_server_for_payload,
         table_schema_for_alias, AppRuntimeState, ParquetSchemaColumn, WorkspaceSourceKind,
-        WorkspaceTableRegistration, DUCKDB_MEMORY_CAP_BYTES,
+        WorkspaceTableRegistration, DUCKDB_MEMORY_CAP_BYTES, default_delimiter_for_path,
+        peek_source, resolve_workspace_delimiter,
     };
     use futures_util::StreamExt;
+    use duckdb::Connection;
     use std::fs;
     use std::io::ErrorKind;
     use std::sync::Arc;
@@ -2144,6 +2728,27 @@ mod tests {
         assert_eq!(rows[0][1].as_deref(), Some("alpha"));
         assert_eq!(rows[2][0].as_deref(), Some("3"));
         assert_eq!(rows[2][1].as_deref(), Some("gamma"));
+
+        let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn parquet_row_count_comes_from_footer_metadata() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let temp_file = unique_test_parquet_path();
+        let escaped_path = escape_sql_string_literal(&temp_file);
+        conn.execute_batch(&format!(
+            "COPY (SELECT range AS id FROM range(1234)) TO '{escaped_path}' (FORMAT PARQUET, ROW_GROUP_SIZE 500);"
+        ))
+        .expect("write multi-row-group parquet fixture");
+
+        // Must succeed on its own; parquet_total_rows only scans if this errors.
+        let from_metadata =
+            parquet_metadata_row_count(&conn, &escaped_path).expect("row count from metadata");
+        assert_eq!(from_metadata, 1234);
+        let source = format!("read_parquet('{escaped_path}')");
+        assert_eq!(parquet_total_rows(&conn, &escaped_path, &source).expect("total rows"), 1234);
 
         let _ = fs::remove_file(&temp_file);
     }
@@ -2279,6 +2884,9 @@ mod tests {
                 is_glob: false,
                 source_kind: WorkspaceSourceKind::Parquet,
                 delimiter: None,
+                row_count: None,
+                object_name: None,
+                header: None,
             },
             WorkspaceTableRegistration {
                 alias: "right_tbl".to_string(),
@@ -2286,6 +2894,9 @@ mod tests {
                 is_glob: false,
                 source_kind: WorkspaceSourceKind::Parquet,
                 delimiter: None,
+                row_count: None,
+                object_name: None,
+                header: None,
             },
         ];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
@@ -2325,6 +2936,9 @@ mod tests {
             is_glob: false,
             source_kind: WorkspaceSourceKind::Parquet,
             delimiter: None,
+            row_count: None,
+            object_name: None,
+            header: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
 
@@ -2357,6 +2971,9 @@ mod tests {
             is_glob: false,
             source_kind: WorkspaceSourceKind::Parquet,
             delimiter: None,
+            row_count: None,
+            object_name: None,
+            header: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
 
@@ -2442,6 +3059,9 @@ mod tests {
             is_glob: false,
             source_kind: WorkspaceSourceKind::Parquet,
             delimiter: None,
+            row_count: None,
+            object_name: None,
+            header: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply workspace tables");
 
@@ -2477,6 +3097,9 @@ mod tests {
             is_glob: false,
             source_kind: WorkspaceSourceKind::Delimited,
             delimiter: None,
+            row_count: None,
+            object_name: None,
+            header: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply csv workspace table");
 
@@ -2508,6 +3131,9 @@ mod tests {
             is_glob: false,
             source_kind: WorkspaceSourceKind::Delimited,
             delimiter: Some("\t".to_string()),
+            row_count: None,
+            object_name: None,
+            header: None,
         }];
         apply_workspace_tables(&conn, &tables).expect("apply tsv workspace table");
 
@@ -2523,6 +3149,126 @@ mod tests {
         assert_eq!(rows[1][1].as_deref(), Some("beta"));
 
         let _ = fs::remove_file(&tsv_path);
+    }
+
+    fn delimited_registration(alias: &str, path: &str, is_glob: bool) -> WorkspaceTableRegistration {
+        WorkspaceTableRegistration {
+            alias: alias.to_string(),
+            file_path: path.to_string(),
+            is_glob,
+            source_kind: WorkspaceSourceKind::Delimited,
+            delimiter: resolve_workspace_delimiter(&WorkspaceSourceKind::Delimited, path, None)
+                .expect("resolve delimiter"),
+            row_count: None,
+            object_name: None,
+            header: None,
+        }
+    }
+
+    fn query_two_rows(conn: &Connection, sql: &str) -> Vec<Vec<Option<String>>> {
+        let schema = query_schema(conn, sql).expect("schema");
+        let (rows, _) = query_rows_with_limit(conn, sql, &schema, 10).expect("rows");
+        rows
+    }
+
+    #[test]
+    fn default_delimiter_maps_extensions() {
+        assert_eq!(default_delimiter_for_path("a.tsv"), Some('\t'));
+        assert_eq!(default_delimiter_for_path("A.PSV"), Some('|'));
+        assert_eq!(default_delimiter_for_path("dir/*.psv"), Some('|'));
+        assert_eq!(default_delimiter_for_path("a.csv"), None);
+        assert_eq!(default_delimiter_for_path("a.txt"), None);
+    }
+
+    #[test]
+    fn workspace_query_reads_psv_with_pipe_delimiter() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let path = unique_test_output_path("psv");
+        fs::write(&path, "id|label\n1|alpha\n2|beta\n").expect("write psv fixture");
+
+        let reg = delimited_registration("psv_tbl", &path, false);
+        assert_eq!(reg.delimiter.as_deref(), Some("|"));
+        apply_workspace_tables(&conn, &[reg]).expect("apply psv table");
+
+        let rows = query_two_rows(&conn, "SELECT id, label FROM psv_tbl ORDER BY id");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][1].as_deref(), Some("alpha"));
+        assert_eq!(rows[1][1].as_deref(), Some("beta"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn workspace_query_sniffs_pipe_delimited_txt() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let path = unique_test_output_path("txt");
+        fs::write(&path, "id|label|score\n1|alpha|3.5\n2|beta|4.0\n").expect("write txt fixture");
+
+        let reg = delimited_registration("txt_tbl", &path, false);
+        assert_eq!(reg.delimiter, None, ".txt should defer to the sniffer");
+        apply_workspace_tables(&conn, &[reg]).expect("apply txt table");
+
+        let schema = query_schema(&conn, "SELECT * FROM txt_tbl").expect("txt schema");
+        assert_eq!(schema.len(), 3, "pipe-delimited .txt must split into 3 columns");
+        let rows = query_two_rows(&conn, "SELECT id, label FROM txt_tbl ORDER BY id");
+        assert_eq!(rows[0][1].as_deref(), Some("alpha"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn workspace_query_reads_csv_glob_folder() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let dir = std::path::PathBuf::from(unique_test_output_path("dir"));
+        fs::create_dir_all(&dir).expect("create glob dir");
+        fs::write(dir.join("a.csv"), "id,label\n1,alpha\n").expect("write a.csv");
+        fs::write(dir.join("b.csv"), "id,label\n2,beta\n").expect("write b.csv");
+        let pattern = dir.join("*.csv").to_string_lossy().to_string();
+
+        let reg = delimited_registration("glob_tbl", &pattern, true);
+        apply_workspace_tables(&conn, &[reg.clone()]).expect("apply glob table");
+        let rows = query_two_rows(&conn, "SELECT id, label FROM glob_tbl ORDER BY id");
+        assert_eq!(rows.len(), 2);
+
+        let peek = peek_source(&conn, &reg).expect("peek glob");
+        assert_eq!(peek.matched_files, Some(2));
+        assert_eq!(peek.detected_delimiter.as_deref(), Some(","));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn peek_source_detects_psv_and_returns_sample_rows() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let path = unique_test_output_path("psv");
+        let mut contents = String::from("id|label\n");
+        for i in 0..8 {
+            contents.push_str(&format!("{i}|row{i}\n"));
+        }
+        fs::write(&path, contents).expect("write psv fixture");
+
+        let peek = peek_source(&conn, &delimited_registration("p", &path, false)).expect("peek psv");
+        assert_eq!(peek.detected_delimiter.as_deref(), Some("|"));
+        assert_eq!(peek.has_header, Some(true));
+        assert_eq!(peek.schema.len(), 2);
+        assert_eq!(peek.rows.len(), 5);
+        assert_eq!(peek.matched_files, None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn peek_source_errors_when_glob_matches_nothing() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let dir = std::path::PathBuf::from(unique_test_output_path("emptydir"));
+        fs::create_dir_all(&dir).expect("create dir");
+        let pattern = dir.join("*.psv").to_string_lossy().to_string();
+        let err = peek_source(&conn, &delimited_registration("p", &pattern, true))
+            .err()
+            .expect("empty glob should error");
+        assert!(err.contains("No files match"), "unexpected error: {err}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2585,6 +3331,112 @@ mod tests {
         conn.execute_batch("DROP TABLE test_util").expect("drop table");
     }
 
+    #[test]
+    fn bundled_duckdb_is_v2_with_static_parquet_and_json() {
+        let conn = Connection::open_in_memory().expect("open in-memory duckdb");
+        // Forbid any runtime extension install/load so this only passes if the
+        // extensions are statically linked into the bundled build.
+        conn.execute_batch(
+            "SET autoinstall_known_extensions = false; SET autoload_known_extensions = false;",
+        )
+        .expect("disable extension autoinstall/autoload");
+
+        let version: String = conn
+            .query_row("SELECT version()", [], |row| row.get(0))
+            .expect("query version");
+        assert!(version.starts_with("v2.0."), "unexpected DuckDB version {version}");
+
+        for ext in ["parquet", "json"] {
+            let (loaded, mode): (bool, String) = conn
+                .query_row(
+                    "SELECT loaded, install_mode FROM duckdb_extensions() WHERE extension_name = ?",
+                    [ext],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or_else(|e| panic!("look up {ext} extension: {e}"));
+            assert!(loaded, "{ext} extension not loaded");
+            assert_eq!(mode, "STATICALLY_LINKED", "{ext} extension install mode");
+        }
+
+        let temp_file = unique_test_parquet_path();
+        let escaped_path = escape_sql_string_literal(&temp_file);
+        conn.execute_batch(&format!(
+            "COPY (SELECT 42::INTEGER AS answer) TO '{escaped_path}' (FORMAT PARQUET);"
+        ))
+        .expect("write parquet without INSTALL");
+        let answer: i32 = conn
+            .query_row(
+                &format!("SELECT answer FROM read_parquet('{escaped_path}')"),
+                [],
+                |row| row.get(0),
+            )
+            .expect("read parquet without INSTALL");
+        assert_eq!(answer, 42);
+
+        let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn timestamptz_round_trips_through_preview_and_query() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let temp_file = unique_test_parquet_path();
+        let escaped_path = escape_sql_string_literal(&temp_file);
+
+        conn.execute_batch(&format!(
+            "COPY (
+                SELECT 1::BIGINT AS id, TIMESTAMPTZ '2024-03-15 12:34:56+00' AS ts
+            ) TO '{escaped_path}' (FORMAT PARQUET);"
+        ))
+        .expect("write timestamptz parquet fixture");
+
+        let source = format!("read_parquet('{escaped_path}')");
+        let flattened = flattened_columns_for_source(&conn, &source).expect("load flattened columns");
+        let schema = schema_from_flattened(&flattened);
+        let ts_col = schema.iter().find(|c| c.name == "ts").expect("ts column present");
+        assert!(
+            ts_col.duckdb_type.contains("TIME ZONE") || ts_col.duckdb_type == "TIMESTAMPTZ",
+            "unexpected ts type {}",
+            ts_col.duckdb_type
+        );
+
+        let preview = parquet_rows_page(&conn, &source, &flattened, 0, 10).expect("preview rows");
+        assert_eq!(preview.len(), 1);
+        let preview_ts = preview[0][1].as_deref().expect("preview ts not null");
+        assert!(preview_ts.starts_with("2024-03-15"), "preview ts = {preview_ts}");
+
+        let sql = format!("SELECT ts FROM {source}");
+        let query_schema_cols = query_schema(&conn, &sql).expect("query schema");
+        let (rows, _) =
+            query_rows_with_limit(&conn, &sql, &query_schema_cols, 10).expect("query rows");
+        let query_ts = rows[0][0].as_deref().expect("query ts not null");
+        assert!(query_ts.starts_with("2024-03-15"), "query ts = {query_ts}");
+
+        let _ = fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn untyped_null_query_renders_and_exports() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let sql = "SELECT NULL AS x";
+
+        let schema = query_schema(&conn, sql).expect("schema for untyped NULL");
+        assert_eq!(schema.len(), 1);
+        assert_eq!(schema[0].name, "x");
+        let (rows, _) = query_rows_with_limit(&conn, sql, &schema, 10).expect("rows for untyped NULL");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], None);
+
+        for format in ["csv", "parquet"] {
+            let out = unique_test_output_path(format);
+            export_workspace_query_to_file(&conn, sql, &out, format, Some(sql), None)
+                .unwrap_or_else(|e| panic!("export untyped NULL to {format}: {e}"));
+            assert!(fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false));
+            let _ = fs::remove_file(&out);
+        }
+    }
+
     fn unique_test_parquet_path() -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2607,6 +3459,378 @@ mod tests {
             "parq_bench_test_export_{nanos}_{thread_id}.{extension}"
         ));
         path.to_string_lossy().to_string()
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    use super::*;
+    use std::sync::OnceLock;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Downloads the extensions these tests use, once per test run and serially, so
+    /// parallel tests never race to install the same file. Needs internet the first
+    /// time; DuckDB caches them in ~/.duckdb/extensions afterwards.
+    fn install_test_extensions() {
+        static DONE: OnceLock<()> = OnceLock::new();
+        DONE.get_or_init(|| {
+            Connection::open_in_memory()
+                .expect("open duckdb")
+                .execute_batch("INSTALL excel; INSTALL sqlite_scanner; INSTALL delta;")
+                .expect("install test extensions (needs internet on first run)");
+        });
+    }
+
+    fn temp_path(name: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let thread = format!("{:?}", thread::current().id()).replace(['(', ')'], "");
+        let mut path = std::env::temp_dir();
+        path.push(format!("parq_bench_ext_{nanos}_{thread}_{name}"));
+        path.to_string_lossy().to_string()
+    }
+
+    fn reg(
+        alias: &str,
+        path: &str,
+        kind: WorkspaceSourceKind,
+        object_name: Option<&str>,
+        header: Option<bool>,
+    ) -> WorkspaceTableRegistration {
+        WorkspaceTableRegistration {
+            alias: alias.to_string(),
+            file_path: path.to_string(),
+            is_glob: false,
+            source_kind: kind,
+            delimiter: None,
+            row_count: None,
+            object_name: object_name.map(str::to_string),
+            header,
+        }
+    }
+
+    fn rows(conn: &Connection, sql: &str) -> Vec<Vec<Option<String>>> {
+        let schema = query_schema(conn, sql).expect("schema");
+        query_rows_with_limit(conn, sql, &schema, 100).expect("rows").0
+    }
+
+    #[test]
+    fn startup_connection_loads_no_downloadable_extensions() {
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).expect("open configured duckdb");
+        let loaded: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT extension_name FROM duckdb_extensions() \
+                     WHERE loaded AND install_mode <> 'STATICALLY_LINKED'",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        assert!(loaded.is_empty(), "extensions loaded at startup: {loaded:?}");
+    }
+
+    #[test]
+    fn managed_extension_names_are_whitelisted() {
+        assert_eq!(managed_extension_name("excel").unwrap(), "excel");
+        assert_eq!(managed_extension_name(" SQLite ").unwrap(), "sqlite_scanner");
+        assert_eq!(managed_extension_name("ICU").unwrap(), "icu");
+        assert!(managed_extension_name("spatial").is_err());
+        assert!(managed_extension_name("excel; DROP TABLE x").is_err());
+        assert!(managed_extension_name("").is_err());
+    }
+
+    #[test]
+    fn extension_statuses_report_installed_size_and_not_loaded() {
+        install_test_extensions();
+        let conn = Connection::open_in_memory().unwrap();
+        let statuses = extension_statuses(&conn).expect("statuses");
+        let names: Vec<&str> = statuses.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, MANAGED_EXTENSIONS.to_vec());
+        let excel = statuses.iter().find(|s| s.name == "excel").unwrap();
+        assert!(excel.installed);
+        assert!(!excel.loaded, "listing must not load extensions");
+        assert!(excel.size_bytes.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn workbook_xml_sheet_names_parse() {
+        let xml = r#"<?xml version="1.0"?><workbook xmlns:r="x"><sheets>
+            <sheet name="Sales &amp; Returns" sheetId="1" r:id="rId1"/>
+            <sheet sheetId="2" name='Q2' r:id="rId2"/>
+            <x:sheet name="Third" sheetId="3"/></sheets>
+            <definedNames><definedName name="NotASheet">A1</definedName></definedNames></workbook>"#;
+        assert_eq!(parse_workbook_sheet_names(xml), vec!["Sales & Returns", "Q2", "Third"]);
+    }
+
+    #[test]
+    fn xlsx_sheet_names_read_from_zip_and_reject_non_xlsx() {
+        // Hand-built archive with two sheets (DuckDB writes one sheet per file).
+        let path = temp_path("two_sheets.xlsx");
+        {
+            let mut zip = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("xl/workbook.xml", opts).unwrap();
+            zip.write_all(br#"<workbook><sheets><sheet name="Alpha" sheetId="1"/><sheet name="Beta" sheetId="2"/></sheets></workbook>"#)
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        assert_eq!(xlsx_sheet_names(&path).unwrap(), vec!["Alpha", "Beta"]);
+        let _ = fs::remove_file(&path);
+
+        let bad = temp_path("not_really.xlsx");
+        fs::write(&bad, b"plain text").unwrap();
+        assert!(xlsx_sheet_names(&bad).is_err());
+        let _ = fs::remove_file(&bad);
+    }
+
+    #[test]
+    fn excel_export_then_register_and_query() {
+        install_test_extensions();
+        let state = AppRuntimeState::new();
+        let path = temp_path("people.xlsx");
+        {
+            let conn = open_configured_duckdb(&state).unwrap();
+            export_workspace_query_to_file(
+                &conn,
+                "SELECT range::INTEGER AS id, 'name_' || range AS name FROM range(3)",
+                &path,
+                "xlsx",
+                Some("ignored for xlsx"),
+                None,
+            )
+            .expect("export xlsx");
+        }
+        let sheets = xlsx_sheet_names(&path).expect("sheets of exported file");
+        assert_eq!(sheets.len(), 1);
+
+        // A fresh connection reads it back (read_xlsx autoloads the extension).
+        let conn = open_configured_duckdb(&state).unwrap();
+        apply_workspace_tables(
+            &conn,
+            &[
+                reg("people", &path, WorkspaceSourceKind::Excel, Some(&sheets[0]), Some(true)),
+                reg("raw", &path, WorkspaceSourceKind::Excel, Some(&sheets[0]), Some(false)),
+            ],
+        )
+        .expect("register excel tables");
+        let people = rows(&conn, "SELECT id, name FROM people ORDER BY id");
+        assert_eq!(people.len(), 3);
+        assert_eq!(people[2][1].as_deref(), Some("name_2"));
+        // Excel stores every number as a float.
+        assert_eq!(query_schema(&conn, "SELECT id FROM people").unwrap()[0].duckdb_type, "DOUBLE");
+        // header => false keeps the header row as data.
+        assert_eq!(rows(&conn, "SELECT * FROM raw").len(), 4);
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn excel_export_handles_common_and_nested_types() {
+        install_test_extensions();
+        let state = AppRuntimeState::new();
+        let conn = open_configured_duckdb(&state).unwrap();
+        let path = temp_path("types.xlsx");
+        export_workspace_query_to_file(
+            &conn,
+            "SELECT 1.5::DECIMAL(10,2) AS d, TIMESTAMP '2024-01-01 10:00:00' AS ts, \
+             DATE '2024-02-03' AS dt, true AS b, 123456789012::HUGEINT AS h, \
+             [1, 2] AS l, {'a': 1} AS s, NULL AS n",
+            &path,
+            "xlsx",
+            None,
+            None,
+        )
+        .expect("export mixed types to xlsx");
+        assert!(fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sqlite_lists_tables_and_views_and_queries_them() {
+        install_test_extensions();
+        let state = AppRuntimeState::new();
+        let path = temp_path("app.db");
+        {
+            let conn = open_configured_duckdb(&state).unwrap();
+            conn.execute_batch(&format!(
+                "ATTACH '{}' AS s (TYPE sqlite); \
+                 CREATE TABLE s.people AS SELECT 1 AS id, 'ada' AS name; \
+                 CREATE TABLE s.orders AS SELECT 7 AS id; \
+                 CREATE VIEW s.v_people AS SELECT name FROM s.people; \
+                 DETACH s;",
+                escape_sql_string_literal(&path)
+            ))
+            .expect("create sqlite fixture");
+        }
+        let conn = open_configured_duckdb(&state).unwrap();
+        let listed: Vec<(String, String)> = sqlite_objects(&conn, &path)
+            .expect("list sqlite objects")
+            .into_iter()
+            .map(|o| (o.name, o.kind))
+            .collect();
+        let expected: Vec<(String, String)> = [("orders", "table"), ("people", "table"), ("v_people", "view")]
+            .iter()
+            .map(|(n, k)| (n.to_string(), k.to_string()))
+            .collect();
+        assert_eq!(listed, expected);
+
+        apply_workspace_tables(
+            &conn,
+            &[
+                reg("people", &path, WorkspaceSourceKind::Sqlite, Some("people"), None),
+                reg("vp", &path, WorkspaceSourceKind::Sqlite, Some("v_people"), None),
+            ],
+        )
+        .expect("register sqlite tables");
+        assert_eq!(rows(&conn, "SELECT name FROM people")[0][0].as_deref(), Some("ada"));
+        assert_eq!(rows(&conn, "SELECT name FROM vp").len(), 1);
+        drop(conn);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn delta_table_folder_registers_and_queries() {
+        install_test_extensions();
+        let state = AppRuntimeState::new();
+        let dir = temp_path("delta_tbl");
+        {
+            let conn = open_configured_duckdb(&state).unwrap();
+            // An attached Delta path is a single table, created under the attached name.
+            conn.execute_batch(&format!(
+                "ATTACH '{}' AS dl (TYPE delta); \
+                 CREATE TABLE dl.dl (id INTEGER, label VARCHAR); \
+                 INSERT INTO dl.dl VALUES (1, 'a'), (2, 'b'); \
+                 DETACH dl;",
+                escape_sql_string_literal(&dir)
+            ))
+            .expect("create delta fixture");
+        }
+        assert!(validate_workspace_source(&dir, false, WorkspaceSourceKind::Delta, None).is_ok());
+        let conn = open_configured_duckdb(&state).unwrap();
+        apply_workspace_tables(&conn, &[reg("events", &dir, WorkspaceSourceKind::Delta, None, None)])
+            .expect("register delta table");
+        let r = rows(&conn, "SELECT id, label FROM events ORDER BY id");
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[1][1].as_deref(), Some("b"));
+        drop(conn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_paths_and_source_validation() {
+        assert!(is_remote_path("https://host/x.parquet"));
+        assert!(is_remote_path("  HTTP://host/x.csv"));
+        assert!(!is_remote_path("C:\\data\\x.parquet"));
+        assert!(!is_remote_path("s3://bucket/key.parquet"));
+
+        use WorkspaceSourceKind::*;
+        // URLs skip the local existence check but only allow Parquet/delimited files.
+        assert!(validate_workspace_source("https://host/x.parquet", false, Parquet, None).is_ok());
+        assert!(validate_workspace_source("https://host/x.csv", false, Delimited, None).is_ok());
+        assert!(validate_workspace_source("https://host/x.xlsx", false, Excel, None).is_err());
+        assert!(validate_workspace_source("https://host/*.parquet", true, Parquet, None).is_err());
+
+        let file = temp_path("db.sqlite");
+        fs::write(&file, b"x").unwrap();
+        assert!(validate_workspace_source(&file, false, Sqlite, None).is_err());
+        assert!(validate_workspace_source(&file, false, Sqlite, Some(" ")).is_err());
+        assert!(validate_workspace_source(&file, false, Sqlite, Some("people")).is_ok());
+        assert!(validate_workspace_source(&file, false, Delta, None).is_err());
+        assert!(validate_workspace_source(&format!("{file}*.xlsx"), true, Excel, None).is_err());
+        assert!(validate_workspace_source(&temp_path("missing.parquet"), false, Parquet, None).is_err());
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn broken_table_only_affects_statements_that_use_it() {
+        let state = AppRuntimeState::new();
+        let csv = temp_path("ok.csv");
+        fs::write(&csv, "id,label\n1,a\n").unwrap();
+        let tables = vec![
+            WorkspaceTableRegistration {
+                delimiter: None,
+                ..reg("good", &csv, WorkspaceSourceKind::Delimited, None, None)
+            },
+            // Stands in for an unreachable URL or missing extension: building its view fails.
+            reg("broken_url", &temp_path("deleted.parquet"), WorkspaceSourceKind::Parquet, None, None),
+        ];
+        let sql = "SELECT label FROM good";
+        let referenced = tables_referenced_by(sql, &tables);
+        assert_eq!(referenced.len(), 1);
+        let conn = open_configured_duckdb(&state).unwrap();
+        apply_workspace_tables(&conn, &referenced).expect("only the used table is built");
+        assert_eq!(rows(&conn, sql)[0][0].as_deref(), Some("a"));
+
+        // A statement that does use the broken table gets that table's error.
+        let conn = open_configured_duckdb(&state).unwrap();
+        let err = apply_workspace_tables(&conn, &tables_referenced_by("SELECT * FROM Broken_URL", &tables))
+            .expect_err("broken table must fail when used");
+        assert!(err.contains("broken_url"), "{err}");
+        let _ = fs::remove_file(&csv);
+    }
+
+    #[test]
+    fn alias_matching_is_whole_word_and_case_insensitive() {
+        assert!(contains_word("select * from sales", "sales"));
+        assert!(contains_word("select * from \"sales\" s", "sales"));
+        assert!(contains_word("join sales\non", "sales"));
+        assert!(!contains_word("select * from sales_2024", "sales"));
+        assert!(!contains_word("select * from presales", "sales"));
+        assert!(contains_word("from presales, sales", "sales"));
+        let tables = vec![
+            reg("Sales", "a.parquet", WorkspaceSourceKind::Parquet, None, None),
+            reg("sales_2024", "b.parquet", WorkspaceSourceKind::Parquet, None, None),
+        ];
+        let picked: Vec<String> = tables_referenced_by("SELECT * FROM SALES", &tables).into_iter().map(|t| t.alias).collect();
+        assert_eq!(picked, vec!["Sales"]);
+        assert_eq!(tables_with_aliases(&tables, &["SALES_2024"]).len(), 1);
+    }
+
+    #[test]
+    fn non_http_schemes_are_rejected_and_urls_redacted_in_logs() {
+        use WorkspaceSourceKind::*;
+        for p in ["s3://bucket/*.parquet", "gs://b/x.parquet", "hf://datasets/x/*.csv", "file:///C:/x.parquet"] {
+            assert!(has_unsupported_scheme(p), "{p}");
+            assert!(validate_workspace_source(p, true, Parquet, None).is_err(), "{p}");
+            assert!(validate_workspace_source(p, false, Parquet, None).is_err(), "{p}");
+        }
+        assert!(!has_unsupported_scheme("https://h/x.parquet"));
+        assert!(!has_unsupported_scheme("C:\\data\\x.parquet"));
+        assert!(!has_unsupported_scheme("C:/data/*.csv"));
+        assert_eq!(redact_for_log("https://h/x.parquet?sig=SECRET#f"), "https://h/x.parquet");
+        assert_eq!(redact_for_log("C:\\a?b.parquet"), "C:\\a?b.parquet");
+    }
+
+    #[test]
+    fn workbook_parser_handles_unescaped_gt_and_numeric_refs() {
+        let xml = r#"<sheets><sheet name="a>b" sheetId="1"/><sheet name="Tom&#39;s &#x26; Co" sheetId="2"/><sheet name="lone & amp" sheetId="3"/></sheets>"#;
+        assert_eq!(parse_workbook_sheet_names(xml), vec!["a>b", "Tom's & Co", "lone & amp"]);
+    }
+
+    #[test]
+    fn source_sql_for_new_kinds() {
+        use WorkspaceSourceKind::*;
+        assert_eq!(
+            workspace_source_sql(&reg("a", "C:\\d\\b.xlsx", Excel, Some("Q'1"), Some(false))),
+            "read_xlsx('C:/d/b.xlsx', sheet => 'Q''1', header => false)"
+        );
+        assert_eq!(
+            workspace_source_sql(&reg("a", "C:\\d\\b.xlsx", Excel, None, None)),
+            "read_xlsx('C:/d/b.xlsx')"
+        );
+        assert_eq!(
+            workspace_source_sql(&reg("a", "C:\\d\\app.db", Sqlite, Some("my table"), None)),
+            "sqlite_scan('C:/d/app.db', 'my table')"
+        );
+        assert_eq!(workspace_source_sql(&reg("a", "C:\\d\\tbl", Delta, None, None)), "delta_scan('C:/d/tbl')");
+        assert_eq!(
+            workspace_source_sql(&reg("a", "https://h/x.parquet", Parquet, None, None)),
+            "read_parquet('https://h/x.parquet')"
+        );
     }
 }
 
@@ -2641,16 +3865,8 @@ pub fn run() {
                     *guard = Some(log_path);
                 }
             }
-
-            // Warm up: install + load the parquet extension on a throwaway
-            // connection so the first real user query doesn't pay the cost.
-            let warmup_state = Arc::clone(&state);
-            thread::spawn(move || {
-                if let Ok(conn) = Connection::open_in_memory() {
-                    let _ = conn.execute_batch("INSTALL parquet; LOAD parquet;");
-                    log_perf(&warmup_state, "duckdb_warmup", "parquet extension preloaded");
-                }
-            });
+            // Parquet and JSON are statically linked via the `parquet` / `json`
+            // crate features, so no runtime INSTALL/LOAD (and no network) is needed.
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2664,6 +3880,11 @@ pub fn run() {
             start_arrow_socket_server,
             write_text_report,
             register_workspace_table,
+            peek_workspace_source,
+            list_xlsx_sheets,
+            list_sqlite_tables,
+            list_extensions,
+            install_extension,
             list_workspace_tables,
             rename_workspace_table,
             remove_workspace_table,

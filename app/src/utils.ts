@@ -5,12 +5,15 @@ import type {
   QueryHistoryEntry,
   AppSettings,
   WorkspaceSourceKind,
+  RecentFile,
 } from "./types";
 import {
   DEFAULT_SETTINGS,
   DELIMITED_EXTENSIONS,
+  EXCEL_EXTENSIONS,
+  SQLITE_EXTENSIONS,
+  MANAGED_EXTENSIONS,
   UI_THEME_STORAGE_KEY,
-  UI_WORKSPACE_SLOW_MODE_STORAGE_KEY,
   UI_ACTIVE_TAB_STORAGE_KEY,
   UI_RECENT_FILES_STORAGE_KEY,
   UI_QUERY_HISTORY_STORAGE_KEY,
@@ -21,8 +24,15 @@ import {
   PERSPECTIVE_RESTORE_TIMEOUT_CHART_MS,
 } from "./constants";
 
+/** http(s):// source (read through DuckDB's on-demand httpfs extension). */
+export function isRemotePath(path: string): boolean {
+  return /^\s*https?:\/\//i.test(path);
+}
+
 export function detectSourceKind(filePath: string): WorkspaceSourceKind {
-  const lower = filePath.toLowerCase().replace(/[/\\]+$/, "");
+  let lower = filePath.toLowerCase().replace(/[/\\]+$/, "");
+  // URLs: ignore ?query and #fragment when reading the extension.
+  if (isRemotePath(lower)) lower = lower.replace(/[?#].*$/, "");
   if (lower.includes("*")) {
     for (const ext of DELIMITED_EXTENSIONS) {
       if (lower.endsWith(`*.${ext}`)) return "delimited";
@@ -33,8 +43,16 @@ export function detectSourceKind(filePath: string): WorkspaceSourceKind {
   if (dot !== -1) {
     const ext = lower.slice(dot + 1);
     if (DELIMITED_EXTENSIONS.includes(ext)) return "delimited";
+    if (EXCEL_EXTENSIONS.includes(ext)) return "excel";
+    if (SQLITE_EXTENSIONS.includes(ext)) return "sqlite";
   }
   return "parquet";
+}
+
+/** Friendly name for a DuckDB extension ("sqlite_scanner" → "SQLite"). */
+export function extensionLabel(name: string): string {
+  const key = name.toLowerCase() === "sqlite" ? "sqlite_scanner" : name.toLowerCase();
+  return MANAGED_EXTENSIONS.find((e) => e.name === key)?.label ?? name;
 }
 
 export function readActiveTab(): ActiveTab {
@@ -59,21 +77,109 @@ export function readThemeMode(): ThemeMode {
   return "system";
 }
 
-export function readWorkspaceSlowModeEnabled(): boolean {
-  if (typeof window === "undefined") {
-    return false;
-  }
-  return window.localStorage.getItem(UI_WORKSPACE_SLOW_MODE_STORAGE_KEY) === "1";
-}
-
-export function readRecentFiles(): string[] {
+/** Reads recent files; accepts the pre-0.6 format (plain path strings). */
+export function readRecentFiles(): RecentFile[] {
   if (typeof window === "undefined") return [];
   try {
     const raw = window.localStorage.getItem(UI_RECENT_FILES_STORAGE_KEY);
     if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x: unknown) => typeof x === "string").slice(0, RECENT_FILES_MAX) : [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const files: RecentFile[] = [];
+    for (const item of parsed) {
+      if (typeof item === "string") {
+        files.push({ path: item, sizeBytes: null, openedAt: null });
+      } else if (item && typeof item === "object" && typeof (item as RecentFile).path === "string") {
+        const entry = item as RecentFile;
+        files.push({
+          path: entry.path,
+          sizeBytes: typeof entry.sizeBytes === "number" ? entry.sizeBytes : null,
+          openedAt: typeof entry.openedAt === "number" ? entry.openedAt : null,
+        });
+      }
+    }
+    return files.slice(0, RECENT_FILES_MAX);
   } catch { return []; }
+}
+
+export function fileNameFromPath(path: string): string {
+  return path.replace(/[/\\]+$/, "").split(/[/\\]/).pop() ?? path;
+}
+
+/** 1536 -> "1.5 KB", 4478948229 -> "4.17 GB". */
+export function formatBytes(bytes: number | null): string {
+  if (bytes === null || !Number.isFinite(bytes) || bytes < 0) return "";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const digits = unit === 0 ? 0 : value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unit]}`;
+}
+
+/** Compact row counts for tight spaces: 25 -> "25", 150000 -> "150K", 180000000 -> "180M". */
+export function formatCompactCount(count: number): string {
+  if (count < 1000) return String(count);
+  const units: Array<[number, string]> = [[1e9, "B"], [1e6, "M"], [1e3, "K"]];
+  for (const [size, suffix] of units) {
+    if (count >= size) {
+      const value = count / size;
+      return `${value >= 100 ? value.toFixed(0) : value.toFixed(1).replace(/\.0$/, "")}${suffix}`;
+    }
+  }
+  return String(count);
+}
+
+/** 412 -> "412 ms", 17403 -> "17.4 s". */
+export function formatDuration(ms: number): string {
+  return ms < 1000 ? `${ms.toFixed(0)} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`;
+}
+
+export function formatRelativeTime(epochMs: number, now = Date.now()): string {
+  const diffMin = Math.round((now - epochMs) / 60000);
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin} min ago`;
+  const diffHours = Math.round(diffMin / 60);
+  if (diffHours < 24) return `${diffHours} h ago`;
+  const diffDays = Math.round(diffHours / 24);
+  if (diffDays === 1) return "yesterday";
+  if (diffDays < 7) return `${diffDays} days ago`;
+  return new Date(epochMs).toLocaleDateString();
+}
+
+/** Builds a valid, unused table alias from a file path (e.g. "Sales 2024.csv" -> "sales_2024"). */
+export function suggestAlias(filePath: string, taken: Iterable<string>): string {
+  const takenLower = new Set(Array.from(taken, (a) => a.toLowerCase()));
+  const base = fileNameFromPath(filePath).replace(/\*/g, "").replace(/\.[^.]+$/, "");
+  let sanitized = base.replace(/[^A-Za-z0-9_]/g, "_").replace(/_+/g, "_").replace(/^_|_$/g, "").toLowerCase();
+  if (!sanitized) sanitized = "table";
+  if (!/^[a-z_]/.test(sanitized)) sanitized = `_${sanitized}`;
+  let alias = sanitized;
+  let counter = 2;
+  while (takenLower.has(alias)) {
+    alias = `${sanitized}_${counter}`;
+    counter += 1;
+  }
+  return alias;
+}
+
+export function isValidAlias(alias: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*$/.test(alias);
+}
+
+/** Human label for a delimiter character. */
+export function describeDelimiter(value: string | null): string {
+  switch (value) {
+    case null: return "auto-detected";
+    case ",": return "comma";
+    case "\t": return "tab";
+    case "|": return "pipe";
+    case ";": return "semicolon";
+    default: return `"${value}"`;
+  }
 }
 
 export function readQueryHistory(): QueryHistoryEntry[] {
@@ -215,6 +321,53 @@ export function friendlyError(raw: string): string {
 
   // Strip LINE N: ... ^ caret trace (internal SQL pointer noise)
   msg = msg.replace(/\s*LINE \d+:[\s\S]*\^$/, "").trim();
+
+  // A registered table that can no longer be read (file moved/deleted, link down, …).
+  const tableFailure = msg.match(/^register workspace table '([^']+)':\s*(?:prepare source schema query:\s*)?([\s\S]*)$/i);
+  if (tableFailure) {
+    const [, alias, reason] = tableFailure;
+    const missing = reason.match(/No files found that match the pattern "([^"]+)"/i);
+    const detail = missing
+      ? `${missing[1]} no longer exists. Restore the file or remove the table.`
+      : friendlyError(reason);
+    return `Table "${alias}" can't be read: ${detail}`;
+  }
+
+  // On-demand extension couldn't be downloaded (offline, firewall, proxy).
+  const extMatch = msg.match(/Failed to download extension "([^"]+)"/i);
+  if (extMatch) {
+    return `This needs the ${extensionLabel(extMatch[1])} extension, which couldn't be downloaded. `
+      + "Connect to the internet once to get it; after that it works offline.";
+  }
+
+  // A .db file that isn't SQLite (often a DuckDB database).
+  if (/sqlite_scan|sqlite_master/i.test(msg) && /file is not a database/i.test(msg)) {
+    return "This file isn't a SQLite database. (DuckDB .db files aren't supported as tables.)";
+  }
+
+  // URL sources
+  const unreachable = msg.match(/Could not (?:connect to server|resolve hostname) error for HTTP \w+ to '([^']+)'/i);
+  if (unreachable) {
+    return `Couldn't reach ${unreachable[1]}. Check the URL and your internet connection.`;
+  }
+  const httpStatus = msg.match(/HTTP \w+ error on '([^']+)' \((HTTP \d+[^)]*)\)/i);
+  if (httpStatus) {
+    return `The server returned ${httpStatus[2]} for ${httpStatus[1]}. Check that the link is correct and publicly accessible.`;
+  }
+
+  // Excel
+  if (/Sheet row limit of '1048576' rows exceeded/i.test(msg)) {
+    return "Excel sheets hold at most 1,048,576 rows. Add a LIMIT to the query, or export to CSV or Parquet instead.";
+  }
+  const sheetMissing = msg.match(/Sheet "([^"]+)" not found in xlsx file/i);
+  if (sheetMissing) {
+    return `Sheet "${sheetMissing[1]}" isn't in this workbook.`;
+  }
+
+  // Delta
+  if (/DeltaKernel InvalidTableLocationError/i.test(msg)) {
+    return "This folder isn't a Delta table (it has no _delta_log folder).";
+  }
 
   // File not found
   if (/read file metadata:.*No such file/i.test(msg)) {

@@ -11,15 +11,62 @@ export const ACCEPTANCE_GATE_TIMEOUT_MS = 15000;
 export const PERSPECTIVE_RESTORE_TIMEOUT_DEFAULT_MS = 8000;
 export const PERSPECTIVE_RESTORE_TIMEOUT_CHART_MS = 20000;
 
-export const DELIMITED_EXTENSIONS = ["csv", "tsv", "txt", "data"];
+export const PARQUET_EXTENSIONS = ["parquet"];
+export const DELIMITED_EXTENSIONS = ["csv", "tsv", "psv", "txt", "data"];
+export const EXCEL_EXTENSIONS = ["xlsx"];
+export const SQLITE_EXTENSIONS = ["db", "sqlite", "sqlite3"];
+/** Every extension that can be mounted as a workspace table. Single source of truth for
+ *  file pickers, drag-and-drop filtering and source-kind detection. */
+export const WORKSPACE_EXTENSIONS = [
+  ...PARQUET_EXTENSIONS, ...DELIMITED_EXTENSIONS, ...EXCEL_EXTENSIONS, ...SQLITE_EXTENSIONS,
+];
+/** Folder-mode choice that mounts a Delta Lake table folder instead of a file pattern. */
+export const DELTA_FOLDER_TYPE = "delta";
+/** File types offered when mounting a folder of files (glob). */
+export const WORKSPACE_FOLDER_FILE_TYPES: Array<{ ext: string; label: string }> = [
+  { ext: "parquet", label: "Parquet (*.parquet)" },
+  { ext: "csv", label: "CSV (*.csv)" },
+  { ext: "tsv", label: "TSV (*.tsv)" },
+  { ext: "psv", label: "Pipe-delimited (*.psv)" },
+  { ext: "txt", label: "Text (*.txt)" },
+  { ext: "data", label: "Data (*.data)" },
+  { ext: DELTA_FOLDER_TYPE, label: "Delta Lake table (folder)" },
+];
+
+/** On-demand DuckDB extensions shown in Settings, in display order. `name` matches the backend. */
+export const MANAGED_EXTENSIONS: Array<{ name: string; label: string; purpose: string }> = [
+  { name: "excel", label: "Excel", purpose: "Add .xlsx tables and export results to Excel" },
+  { name: "sqlite_scanner", label: "SQLite", purpose: "Add tables from .db / .sqlite files" },
+  { name: "httpfs", label: "Web URLs", purpose: "Open Parquet and CSV files from https:// links" },
+  { name: "delta", label: "Delta Lake", purpose: "Add Delta table folders" },
+  { name: "icu", label: "Time zones", purpose: "AT TIME ZONE and local-time conversions in SQL" },
+];
 
 export const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";
-export const UI_WORKSPACE_SLOW_MODE_STORAGE_KEY = "parqbench.ui.workspace_slow_mode_enabled";
 export const UI_ACTIVE_TAB_STORAGE_KEY = "parqbench.ui.active_tab";
 export const UI_RECENT_FILES_STORAGE_KEY = "parqbench.ui.recent_files";
 export const UI_QUERY_HISTORY_STORAGE_KEY = "parqbench.ui.query_history";
 export const UI_SETTINGS_STORAGE_KEY = "parqbench.ui.settings";
 export const RECENT_FILES_MAX = 15;
+/** Mirrors PANIC_RSS_RATIO in the backend: app RSS / total RAM that trips the memory guard. */
+export const MEMORY_GUARD_RATIO = 0.85;
+
+/** Chart types shown to users, mapped to Perspective plugin names. */
+export const CHART_TYPES: Array<{ plugin: import("./types").WorkspaceChartPlugin; label: string }> = [
+  { plugin: "X Bar", label: "Bar" },
+  { plugin: "Y Bar", label: "Column" },
+  { plugin: "Y Line", label: "Line" },
+  { plugin: "Treemap", label: "Treemap" },
+  { plugin: "Datagrid", label: "Table" },
+];
+
+export const CHART_AGGREGATES: Array<{ value: string; label: string }> = [
+  { value: "sum", label: "Sum" },
+  { value: "avg", label: "Average" },
+  { value: "count", label: "Count" },
+  { value: "min", label: "Min" },
+  { value: "max", label: "Max" },
+];
 export const QUERY_HISTORY_MAX = 50;
 
 export const DEFAULT_SETTINGS: AppSettings = {

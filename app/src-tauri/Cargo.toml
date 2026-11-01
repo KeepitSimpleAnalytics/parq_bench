@@ -23,13 +23,22 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-duckdb = { version = "1.4.4", features = ["bundled"] }
-arrow-array = "57.3.0"
-arrow-schema = "57.3.0"
-arrow-ipc = "57.3.0"
+duckdb = { version = "=1.20000.1", features = ["bundled", "parquet", "json"] }
+arrow-array = "60"
+arrow-schema = "60"
+arrow-ipc = "60"
 tokio = { version = "1.48.0", features = ["net"] }
 tokio-tungstenite = "0.28.0"
 futures-util = "0.3.31"
 tauri-plugin-dialog = "2.6.0"
 sysinfo = "0.38.1"
 tauri-plugin-clipboard-manager = "2"
+zip = { version = "9.2", default-features = false, features = ["deflate-flate2"] }
+
+# DuckDB (incl. Parquet/JSON, now statically linked) is compiled from C++ source.
+# Unoptimized, `tauri dev` previews run ~2x slower than on 1.4.4, where Parquet came
+# from DuckDB's prebuilt release extension. Optimize it in dev builds; app code stays debug.
+# debug = false keeps DuckDB's own DEBUG assertions off, matching release.
+[profile.dev.package.libduckdb-sys]
+opt-level = 3
+debug = false

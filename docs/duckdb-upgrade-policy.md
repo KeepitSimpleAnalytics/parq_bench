@@ -1,7 +1,7 @@
 # DuckDB Upgrade Policy
 
 This project currently pins DuckDB via `app/src-tauri/Cargo.toml`:
-- `duckdb = { version = "1.4.4", features = ["bundled"] }`
+- `duckdb = { version = "=1.20000.1", features = ["bundled", "parquet", "json"] }` (DuckDB 2.0.0; from 1.5 onward the crate version encodes the DuckDB version as `1.Mmmpp.x` (e.g. 2.0.0 → `1.20000.x`, 1.5.6 → `1.10506.x`); `cargo update` will not cross these on its own)
 
 ## Why pinning is required
 - Workspace SQL, nested-column flattening, and export behavior can change across DuckDB versions.
