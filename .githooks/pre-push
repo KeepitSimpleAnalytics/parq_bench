@@ -1,8 +1,42 @@
 #!/usr/bin/env bash
-# pre-push hook — ensure version strings are in sync before pushing
+# pre-push hook — version checks before anything reaches GitHub.
+#   Pushing to main: blocked unless the version files agree and the bump rules pass
+#     (the same check the Release Gate runs on PRs).
+#   Pushing any other branch: version files must agree; a missing bump is only a
+#     warning, so work-in-progress branches can still be pushed. The PR check enforces it.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REMOTE="${1:-origin}"
+ZERO=0000000000000000000000000000000000000000
+status=0
 
-echo "Running version sync check..."
-"$REPO_ROOT/scripts/check-version-sync.sh"
+# git passes one line per ref: <local ref> <local sha> <remote ref> <remote sha>
+while read -r _local_ref local_sha remote_ref remote_sha; do
+  [[ "$local_sha" == "$ZERO" ]] && continue          # deleting a remote ref
+  [[ "$remote_ref" == refs/heads/* ]] || continue    # tags etc.
+  branch="${remote_ref#refs/heads/}"
+  echo "Version checks for $branch ($local_sha)..."
+  bash "$REPO_ROOT/scripts/check-version-sync.sh" "$local_sha" >/dev/null || {
+    bash "$REPO_ROOT/scripts/check-version-sync.sh" "$local_sha"
+    status=1
+    continue
+  }
+  # Compare with what the remote's main is now: the SHA git is about to replace when
+  # pushing main itself (if we have it), otherwise our copy of origin/main.
+  base=origin/main
+  if [[ "$branch" == "main" && "$remote_sha" != "$ZERO" ]] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    base="$remote_sha"
+  fi
+  if out=$(bash "$REPO_ROOT/scripts/check-version-bump.sh" "$base" "$local_sha" 2>&1); then
+    :
+  elif [[ "$branch" == "main" && "$REMOTE" == "origin" ]]; then
+    echo "$out"
+    status=1
+  else
+    echo "$out"
+    echo "WARNING: $branch needs a version bump before its PR can merge (push allowed)."
+  fi
+done
+
+exit $status
