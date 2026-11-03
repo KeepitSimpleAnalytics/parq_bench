@@ -1,12 +1,60 @@
 name: Release
 
+# Normally called by the Release Gate when a merge to main raises the version
+# (it creates the tag first). Pushing a v* tag by hand also works.
+# If a release run fails partway, use "Re-run failed jobs", or run this workflow by
+# hand (Actions > Release > Run workflow) with the tag.
 on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to release, e.g. v0.8.0. Must already exist and match the app version."
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release, e.g. v0.8.0"
+        required: true
+        type: string
+
+# One release run per tag at a time: a manual tag push and the automatic release of
+# the same version run one after the other, never side by side.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Check the tag matches the app version and is on main
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          bash scripts/check-version-sync.sh
+          version=$(node -p "require('./app/package.json').version")
+          if [ "$TAG" != "v$version" ]; then
+            echo "ERROR: tag $TAG does not match the app version v$version. Not releasing."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "ERROR: $TAG is not on main. Only merged code is released."
+            exit 1
+          fi
+          echo "Releasing $TAG"
+
   release:
+    needs: verify
     permissions:
       contents: write
     strategy:
@@ -26,6 +74,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'

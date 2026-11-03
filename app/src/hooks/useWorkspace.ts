@@ -9,13 +9,21 @@ import type {
   WorkspaceQueryResponse,
   WorkspaceTableInfo,
   PerspectiveContext,
+  RunningOperation,
 } from "../types";
 import { isNumericDuckType, coerceWorkspaceCell, friendlyError } from "../utils";
+import { writesOutsideApp } from "../sql/statements";
 
 interface UseWorkspaceParams {
   workspaceTables: WorkspaceTableInfo[];
   workspaceQueryResult: WorkspaceQueryResponse | null;
-  readWorkspaceSql: () => string;
+  /** The statement (and setup statements) that produced the current results. */
+  getLastRun: () => { sql: string; setup: string[] } | null;
+  /** Registers a cancellable operation; `finish` returns true if it was cancelled. */
+  operations: {
+    start: (kind: RunningOperation["kind"]) => RunningOperation;
+    finish: (op: RunningOperation, err?: unknown) => boolean;
+  };
   loadPerspectiveDataset: (
     dataset: Array<Record<string, unknown>>,
     restoreConfig: Record<string, unknown>,
@@ -28,7 +36,8 @@ interface UseWorkspaceParams {
 export function useWorkspace({
   workspaceTables,
   workspaceQueryResult,
-  readWorkspaceSql,
+  getLastRun,
+  operations,
   loadPerspectiveDataset,
   setLoading,
   setError,
@@ -109,13 +118,23 @@ export function useWorkspace({
   }
 
   async function exportWorkspaceQuery(format: ExportFormat) {
-    if (!workspaceQueryResult || workspaceQueryResult.rows.length === 0) {
+    if (!workspaceQueryResult || !workspaceQueryResult.returns_rows || workspaceQueryResult.rows.length === 0) {
       setError("Run a query with results before exporting.");
       return;
     }
-    const sqlText = readWorkspaceSql();
-    if (!sqlText.trim()) {
-      setError("Workspace SQL query is required before export.");
+    // Export re-runs exactly what produced the results, not whatever the editor holds now.
+    const lastRun = getLastRun();
+    if (!lastRun) {
+      setError("Run a query with results before exporting.");
+      return;
+    }
+    // Exporting a "Run all" result runs its setup statements again; never repeat ones
+    // that write files or could change an attached database.
+    if (lastRun.setup.some(writesOutsideApp)) {
+      setError(
+        "Export would run this script's COPY, EXPORT or ATTACH statements again. "
+        + "Run the final query on its own (select it and press Ctrl+Enter), then export.",
+      );
       return;
     }
 
@@ -134,19 +153,23 @@ export function useWorkspace({
       return;
     }
 
+    const op = operations.start("export");
     setLoading(true);
     setError(null);
     try {
       const result = await invoke<WorkspaceExportResponse>("export_workspace_query", {
-        sql: sqlText,
+        sql: lastRun.sql,
+        setupSql: lastRun.setup,
         outputPath: selected,
         format,
-        queryText: sqlText,
+        queryText: lastRun.sql,
         tableAliases: workspaceTables.map((t) => t.alias),
+        queryId: op.id,
       });
+      operations.finish(op);
       setWorkspaceExport(result);
     } catch (err) {
-      setError(friendlyError(String(err)));
+      if (!operations.finish(op, err)) setError(friendlyError(String(err)));
     } finally {
       setLoading(false);
     }

@@ -4,7 +4,7 @@ use arrow_schema::{DataType, Field, Schema};
 use duckdb::Connection;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Cursor, Read as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -61,7 +61,7 @@ struct SocketServerInfo {
     payload_bytes: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct ParquetSchemaColumn {
     name: String,
     duckdb_type: String,
@@ -167,7 +167,7 @@ struct SourcePeekResponse {
     rows: Vec<Vec<Option<String>>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WorkspaceQueryResponse {
     sql: String,
     row_limit: u32,
@@ -176,6 +176,8 @@ struct WorkspaceQueryResponse {
     elapsed_ms: u128,
     schema: Vec<ParquetSchemaColumn>,
     rows: Vec<Vec<Option<String>>>,
+    /// False for DDL/DML/utility statements, whose one row is just a status message.
+    returns_rows: bool,
 }
 
 #[derive(Serialize)]
@@ -217,6 +219,17 @@ struct AppRuntimeState {
     total_memory_bytes: AtomicU64,
     workspace_tables: Mutex<Vec<WorkspaceTableRegistration>>,
     log_file: Mutex<Option<PathBuf>>,
+    /// Queries that can be cancelled or polled for progress, keyed by a frontend-chosen id.
+    running_queries: Mutex<HashMap<String, RunningQuery>>,
+    /// Ids cancelled before their query registered (e.g. Esc right after Ctrl+Enter).
+    /// Bounded; only touched while `running_queries` is locked.
+    cancelled_early: Mutex<std::collections::VecDeque<String>>,
+    /// Long-lived connection holding empty mirror tables for SQL autocomplete.
+    completion: Mutex<CompletionEngine>,
+    /// DuckDB's built-in function reference for editor hover and signature help, loaded once.
+    function_docs: Mutex<Option<Arc<Vec<FunctionDoc>>>>,
+    /// Serializes reads and writes of the saved-queries file.
+    saved_queries_lock: Mutex<()>,
 }
 
 impl AppRuntimeState {
@@ -227,8 +240,166 @@ impl AppRuntimeState {
             total_memory_bytes: AtomicU64::new(0),
             workspace_tables: Mutex::new(Vec::new()),
             log_file: Mutex::new(None),
+            running_queries: Mutex::new(HashMap::new()),
+            cancelled_early: Mutex::new(std::collections::VecDeque::new()),
+            completion: Mutex::new(CompletionEngine::default()),
+            function_docs: Mutex::new(None),
+            saved_queries_lock: Mutex::new(()),
         }
     }
+}
+
+// ── Cancellable queries ─────────────────────────────────────────────────────
+
+/// Error text returned for a query the user cancelled. The frontend matches it exactly.
+const QUERY_CANCELLED: &str = "Query cancelled.";
+
+struct RunningQuery {
+    interrupt: Arc<duckdb::InterruptHandle>,
+    progress: duckdb::ProgressHandle,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Removes a query from the running registry when dropped, so finished, failed and
+/// panicked queries never linger.
+struct RunningQueryGuard {
+    state: Arc<AppRuntimeState>,
+    id: Option<String>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl RunningQueryGuard {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Call between steps (setup statements, schema, rows, COPY): DuckDB's interrupt
+    /// only stops the statement running at that moment, so a cancel that lands in a
+    /// gap would otherwise be ignored by the next statement.
+    fn check(&self) -> Result<(), String> {
+        if self.is_cancelled() {
+            Err(QUERY_CANCELLED.to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Turns any outcome into `QUERY_CANCELLED` once the user has cancelled. A query
+    /// that finished in the same instant is still reported as cancelled, so a
+    /// cancelled run never produces a result the user asked to stop.
+    fn finish<T>(&self, outcome: Result<T, String>) -> Result<T, String> {
+        if self.is_cancelled() {
+            Err(QUERY_CANCELLED.to_string())
+        } else {
+            outcome
+        }
+    }
+}
+
+impl Drop for RunningQueryGuard {
+    fn drop(&mut self) {
+        if let Some(id) = &self.id {
+            if let Ok(mut map) = self.state.running_queries.lock() {
+                map.remove(id);
+            }
+        }
+    }
+}
+
+/// Registers `conn` under `query_id` so `cancel_workspace_query` and
+/// `workspace_query_progress` can reach it. Without an id the query simply isn't
+/// cancellable. Progress tracking is best effort: if DuckDB refuses it, the query
+/// still runs and reports no percentage.
+fn track_query(
+    state: &Arc<AppRuntimeState>,
+    query_id: Option<String>,
+    conn: &Connection,
+) -> Result<RunningQueryGuard, String> {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let id = query_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
+    if let Some(id) = &id {
+        if let Err(e) = conn.set_query_progress_tracking(true) {
+            log_perf(state, "query_progress", &format!("tracking_unavailable error={e}"));
+        }
+        let mut map = state
+            .running_queries
+            .lock()
+            .map_err(|_| "Running query lock poisoned.".to_string())?;
+        if let Ok(mut early) = state.cancelled_early.lock() {
+            if let Some(pos) = early.iter().position(|e| e == id) {
+                early.remove(pos);
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+        map.insert(
+            id.clone(),
+            RunningQuery {
+                interrupt: conn.interrupt_handle(),
+                progress: conn.progress_handle(),
+                cancelled: cancelled.clone(),
+            },
+        );
+    }
+    Ok(RunningQueryGuard { state: state.clone(), id, cancelled })
+}
+
+/// How many not-yet-registered cancels to remember.
+const CANCELLED_EARLY_MAX: usize = 64;
+
+/// Cancels a running query. Returns false when no query with that id is running:
+/// it already finished, or hasn't registered yet, in which case the cancel is kept
+/// and applied when it does (`track_query`).
+fn cancel_running_query(state: &AppRuntimeState, query_id: &str) -> Result<bool, String> {
+    let id = query_id.trim();
+    let map = state
+        .running_queries
+        .lock()
+        .map_err(|_| "Running query lock poisoned.".to_string())?;
+    match map.get(id) {
+        Some(query) => {
+            query.cancelled.store(true, Ordering::SeqCst);
+            query.interrupt.interrupt();
+            Ok(true)
+        }
+        None => {
+            if !id.is_empty() {
+                let mut early = state
+                    .cancelled_early
+                    .lock()
+                    .map_err(|_| "Running query lock poisoned.".to_string())?;
+                if early.len() >= CANCELLED_EARLY_MAX {
+                    early.pop_front();
+                }
+                early.push_back(id.to_string());
+            }
+            Ok(false)
+        }
+    }
+}
+
+#[tauri::command]
+fn cancel_workspace_query(
+    query_id: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<bool, String> {
+    cancel_running_query(state.as_ref(), &query_id)
+}
+
+/// Percentage (0–100) of the running query, or None when DuckDB has no estimate
+/// or the query isn't running.
+#[tauri::command]
+fn workspace_query_progress(
+    query_id: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Option<f64>, String> {
+    let map = state
+        .running_queries
+        .lock()
+        .map_err(|_| "Running query lock poisoned.".to_string())?;
+    Ok(map
+        .get(query_id.trim())
+        .and_then(|q| q.progress.query_progress().percentage())
+        .map(|p| p.clamp(0.0, 100.0)))
 }
 
 #[derive(Serialize)]
@@ -666,17 +837,137 @@ fn normalize_single_sql_statement(sql: &str) -> Result<String, String> {
     if normalized.is_empty() {
         return Err("SQL query is required.".to_string());
     }
-    if normalized.contains(';') {
-        return Err("Only a single SQL statement is supported.".to_string());
+    let mut statements = split_sql_statements(&normalized);
+    match statements.len() {
+        0 => Err("SQL query is required.".to_string()),
+        1 => Ok(statements.remove(0)),
+        _ => Err("Only a single SQL statement is supported.".to_string()),
     }
-    Ok(normalized)
+}
+
+/// `sql` without leading whitespace, `-- line` and `/* block */` comments.
+fn skip_leading_comments(sql: &str) -> &str {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.find('\n').map_or("", |i| &after[i + 1..]).trim_start();
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.find("*/").map_or("", |i| &after[i + 2..]).trim_start();
+        } else {
+            return rest;
+        }
+    }
+}
+
+/// Splits SQL on `;`, ignoring semicolons inside 'strings', "identifiers",
+/// $$dollar$$ strings, -- line comments and /* block comments */. Returns trimmed,
+/// non-empty statements. Mirrors `splitSqlStatements` in the frontend.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    // Whether `current` holds anything besides whitespace and comments.
+    let mut has_code = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            '\'' | '"' => {
+                // Quoted text; a doubled quote is an escaped quote.
+                has_code = true;
+                current.push(c);
+                i += 1;
+                while i < chars.len() {
+                    current.push(chars[i]);
+                    if chars[i] == c {
+                        if chars.get(i + 1) == Some(&c) {
+                            current.push(c);
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            '-' if next == Some('-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    current.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '/' if next == Some('*') => {
+                current.push_str("/*");
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    current.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    current.push_str("*/");
+                    i += 2;
+                }
+            }
+            '$' => {
+                // $tag$ ... $tag$ (tag may be empty). A lone `$` (e.g. `$1`) is plain text.
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                let tag_is_valid = j < chars.len()
+                    && chars[j] == '$'
+                    && !chars.get(i + 1).is_some_and(|ch| ch.is_ascii_digit());
+                has_code = true;
+                if tag_is_valid {
+                    let tag: String = chars[i..=j].iter().collect();
+                    let tag_chars: Vec<char> = tag.chars().collect();
+                    current.push_str(&tag);
+                    i = j + 1;
+                    loop {
+                        if i >= chars.len() {
+                            break;
+                        }
+                        if chars[i..].starts_with(&tag_chars) {
+                            current.push_str(&tag);
+                            i += tag_chars.len();
+                            break;
+                        }
+                        current.push(chars[i]);
+                        i += 1;
+                    }
+                } else {
+                    current.push(c);
+                    i += 1;
+                }
+            }
+            ';' => {
+                if has_code {
+                    statements.push(skip_leading_comments(&current).trim_end().to_string());
+                }
+                current.clear();
+                has_code = false;
+                i += 1;
+            }
+            _ => {
+                has_code |= !c.is_whitespace();
+                current.push(c);
+                i += 1;
+            }
+        }
+    }
+    if has_code {
+        statements.push(skip_leading_comments(&current).trim_end().to_string());
+    }
+    statements
 }
 
 /// Returns true if the SQL is a SELECT-like statement that returns rows
 /// (SELECT, WITH, VALUES, TABLE, FROM). Everything else (INSTALL, LOAD,
 /// CALL, CREATE, DROP, INSERT, etc.) is a utility/DDL/DML statement.
 fn is_select_like(sql: &str) -> bool {
-    let upper = sql.trim_start().to_uppercase();
+    let upper = skip_leading_comments(sql).to_uppercase();
     upper.starts_with("SELECT ")
         || upper.starts_with("SELECT\n")
         || upper.starts_with("SELECT\t")
@@ -971,7 +1262,8 @@ fn apply_workspace_tables(
 }
 
 fn query_schema(conn: &Connection, sql: &str) -> Result<Vec<ParquetSchemaColumn>, String> {
-    let describe_sql = format!("DESCRIBE SELECT * FROM ({sql}) AS _q");
+    // The newline ends a trailing `-- comment` before the closing parenthesis.
+    let describe_sql = format!("DESCRIBE SELECT * FROM ({sql}\n) AS _q");
     let mut schema_stmt = conn
         .prepare(&describe_sql)
         .map_err(|e| format!("prepare workspace schema query: {e}"))?;
@@ -994,6 +1286,19 @@ fn query_rows_with_limit(
     schema: &[ParquetSchemaColumn],
     row_limit: u32,
 ) -> Result<(Vec<Vec<Option<String>>>, bool), String> {
+    query_rows_with_limit_cancellable(conn, sql, schema, row_limit, &AtomicBool::new(false))
+}
+
+/// Like `query_rows_with_limit`, but stops converting rows once `cancelled` is set.
+/// DuckDB's interrupt stops execution; this covers a cancel that lands while the
+/// finished result is still being turned into strings.
+fn query_rows_with_limit_cancellable(
+    conn: &Connection,
+    sql: &str,
+    schema: &[ParquetSchemaColumn],
+    row_limit: u32,
+    cancelled: &AtomicBool,
+) -> Result<(Vec<Vec<Option<String>>>, bool), String> {
     let projection = schema
         .iter()
         .map(|col| {
@@ -1005,7 +1310,7 @@ fn query_rows_with_limit(
 
     let safe_limit = row_limit.max(1) as usize;
     let fetch_limit = safe_limit.saturating_add(1);
-    let query_sql = format!("SELECT {projection} FROM ({sql}) AS _q LIMIT {fetch_limit}");
+    let query_sql = format!("SELECT {projection} FROM ({sql}\n) AS _q LIMIT {fetch_limit}");
     let mut stmt = conn
         .prepare(&query_sql)
         .map_err(|e| format!("prepare workspace query rows: {e}"))?;
@@ -1020,14 +1325,53 @@ fn query_rows_with_limit(
             Ok(values)
         })
         .map_err(|e| format!("run workspace query rows: {e}"))?;
-    let mut rows = row_iter
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("collect workspace query rows: {e}"))?;
+    let mut rows = Vec::new();
+    for row in row_iter {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(QUERY_CANCELLED.to_string());
+        }
+        rows.push(row.map_err(|e| format!("collect workspace query rows: {e}"))?);
+    }
     let truncated = rows.len() > safe_limit;
     if truncated {
         rows.truncate(safe_limit);
     }
     Ok((rows, truncated))
+}
+
+/// Files a workspace export may write: the output, the CSV staging file
+/// (`<output>.tmp`), and DuckDB's own `tmp_<name>` file next to whatever it COPYs to.
+fn export_artifact_paths(output_path: &str) -> Vec<PathBuf> {
+    let duckdb_tmp = |target: &Path| -> Option<PathBuf> {
+        let name = target.file_name()?.to_string_lossy().into_owned();
+        Some(target.with_file_name(format!("tmp_{name}")))
+    };
+    let output = PathBuf::from(output_path);
+    let staging = PathBuf::from(format!("{output_path}.tmp"));
+    let mut paths = vec![output.clone(), staging.clone()];
+    paths.extend(duckdb_tmp(&output));
+    paths.extend(duckdb_tmp(&staging));
+    paths
+}
+
+/// Snapshot of which export files already existed, so cleanup never deletes a
+/// file the user had before the export started.
+fn existing_export_artifacts(output_path: &str) -> Vec<PathBuf> {
+    export_artifact_paths(output_path)
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// Removes files a failed or cancelled export created. Files that existed before
+/// are left alone: CSV only replaces the output after a complete write, and DuckDB
+/// writes to `tmp_<name>` first when the target already exists.
+fn remove_partial_export(output_path: &str, existed_before: &[PathBuf]) {
+    for path in export_artifact_paths(output_path) {
+        if !existed_before.contains(&path) {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 fn export_workspace_query_to_file(
@@ -1055,7 +1399,7 @@ fn export_workspace_query_to_file(
         // COPY ... (FORMAT xlsx) doesn't autoload, so load the extension first.
         ensure_extension_loaded(conn, "excel")?;
         let copy_sql = format!(
-            "COPY (SELECT * FROM ({sql}) AS _q) TO '{escaped_path}' (FORMAT xlsx, HEADER true);"
+            "COPY (SELECT * FROM ({sql}\n) AS _q) TO '{escaped_path}' (FORMAT xlsx, HEADER true);"
         );
         conn.execute_batch(&copy_sql)
             .map_err(|e| format!("export workspace query: {e}"))?;
@@ -1075,7 +1419,7 @@ fn export_workspace_query_to_file(
         let temp_path = format!("{output_path}.tmp");
         let escaped_temp = escape_sql_string_literal(&temp_path);
         let copy_sql = format!(
-            "COPY (SELECT * FROM ({sql}) AS _q) TO '{escaped_temp}' (FORMAT CSV, HEADER TRUE);"
+            "COPY (SELECT * FROM ({sql}\n) AS _q) TO '{escaped_temp}' (FORMAT CSV, HEADER TRUE);"
         );
         conn.execute_batch(&copy_sql)
             .map_err(|e| format!("export workspace query: {e}"))?;
@@ -1101,7 +1445,7 @@ fn export_workspace_query_to_file(
         }
         let kv_metadata = kv_pairs.join(", ");
         let copy_sql = format!(
-            "COPY (SELECT * FROM ({sql}) AS _q) TO '{escaped_path}' (FORMAT PARQUET, KV_METADATA {{{kv_metadata}}});"
+            "COPY (SELECT * FROM ({sql}\n) AS _q) TO '{escaped_path}' (FORMAT PARQUET, KV_METADATA {{{kv_metadata}}});"
         );
         conn.execute_batch(&copy_sql)
             .map_err(|e| format!("export workspace query: {e}"))?;
@@ -1717,7 +2061,7 @@ fn parquet_metadata_row_count(conn: &Connection, normalized_path: &str) -> Resul
 // time from Settings. Nothing is loaded at startup.
 
 /// Extensions offered in Settings. Install requests are limited to this list.
-const MANAGED_EXTENSIONS: [&str; 5] = ["excel", "sqlite_scanner", "httpfs", "delta", "icu"];
+const MANAGED_EXTENSIONS: [&str; 6] = ["excel", "sqlite_scanner", "httpfs", "delta", "icu", "autocomplete"];
 
 #[derive(Serialize)]
 struct ExtensionStatus {
@@ -1801,6 +2145,408 @@ fn install_extension(
         );
         extension_statuses(&conn)
     })
+}
+
+// ── SQL autocomplete ────────────────────────────────────────────────────────
+
+/// A workspace table as the completion engine sees it: a name and typed columns.
+#[derive(Clone, Debug, serde::Deserialize)]
+struct CompletionTable {
+    alias: String,
+    columns: Vec<CompletionColumn>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct CompletionColumn {
+    name: String,
+    duckdb_type: String,
+}
+
+/// DuckDB's `sql_auto_complete` runs against a connection's catalog. This connection
+/// holds *empty* tables shaped like the workspace tables, so completion never reads
+/// user files and a broken table can't affect it.
+#[derive(Default)]
+struct CompletionEngine {
+    conn: Option<Connection>,
+    tables: Vec<CompletionTable>,
+    /// The autocomplete extension is installed and loaded on `conn`.
+    ready: bool,
+}
+
+#[derive(Serialize, Debug)]
+struct SqlCompletion {
+    text: String,
+    /// Where the replaced word starts, in UTF-16 code units from the start of the input
+    /// (the unit Monaco and JavaScript strings use).
+    start: usize,
+    kind: String,
+    /// Lower is better.
+    score: u64,
+    /// Text DuckDB suggests appending after the completion, e.g. a space after a keyword.
+    extra: Option<String>,
+}
+
+/// Creates the mirror tables. A table whose column types DuckDB can't parse is
+/// created with VARCHAR columns instead; types only show up as completion
+/// details, so the names are what matters.
+fn create_completion_tables(conn: &Connection, tables: &[CompletionTable]) {
+    for table in tables.iter().filter(|t| !t.columns.is_empty()) {
+        let name = escape_sql_ident(&table.alias);
+        let typed = table
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\" {}", escape_sql_ident(&c.name), c.duckdb_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if conn.execute_batch(&format!("CREATE TABLE \"{name}\" ({typed});")).is_ok() {
+            continue;
+        }
+        let untyped = table
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\" VARCHAR", escape_sql_ident(&c.name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = conn.execute_batch(&format!("CREATE OR REPLACE TABLE \"{name}\" ({untyped});"));
+    }
+}
+
+/// Opens a fresh completion connection with the given tables. Loads autocomplete
+/// when it's installed; never downloads it (that's `prepare_sql_completions`).
+fn build_completion_engine(tables: Vec<CompletionTable>) -> Result<CompletionEngine, String> {
+    let conn = Connection::open_in_memory().map_err(|e| format!("open completion DuckDB: {e}"))?;
+    // One thread is plenty for catalog lookups, and the engine stays tiny.
+    conn.execute_batch("PRAGMA threads = 1;")
+        .map_err(|e| format!("configure completion DuckDB: {e}"))?;
+    let ready = conn.execute_batch("LOAD autocomplete;").is_ok();
+    create_completion_tables(&conn, &tables);
+    Ok(CompletionEngine { conn: Some(conn), tables, ready })
+}
+
+/// Byte offset → UTF-16 offset within `text`. Offsets inside a character round down.
+fn utf16_offset(text: &str, byte_offset: usize) -> usize {
+    let mut end = byte_offset.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].encode_utf16().count()
+}
+
+fn sql_completions_for(conn: &Connection, text: &str, limit: usize) -> Result<Vec<SqlCompletion>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT suggestion, suggestion_start, suggestion_type, suggestion_score, extra_char \
+             FROM sql_auto_complete(?) ORDER BY suggestion_score LIMIT ?",
+        )
+        .map_err(|e| format!("prepare completion: {e}"))?;
+    let rows = stmt
+        .query_map(duckdb::params![text, limit as i64], |row| {
+            let start: i64 = row.get(1)?;
+            Ok(SqlCompletion {
+                text: row.get(0)?,
+                start: utf16_offset(text, start.max(0) as usize),
+                kind: row.get(2)?,
+                score: row.get::<_, Option<u64>>(3)?.unwrap_or(0),
+                extra: row.get(4)?,
+            })
+        })
+        .map_err(|e| format!("run completion: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("collect completions: {e}"))
+}
+
+/// Downloads (first use only) and loads the autocomplete extension. The download runs
+/// on its own connection so completion requests aren't blocked behind it.
+#[tauri::command(async)]
+fn prepare_sql_completions(state: tauri::State<'_, Arc<AppRuntimeState>>) -> Result<(), String> {
+    let st = state.inner().clone();
+    on_duckdb_thread(move || {
+        let started = Instant::now();
+        let installer = Connection::open_in_memory().map_err(|e| format!("open DuckDB: {e}"))?;
+        ensure_extension_loaded(&installer, "autocomplete")?;
+        drop(installer);
+        // Rebuild under the lock so a concurrent table sync can't be overwritten.
+        let mut engine = st.completion.lock().map_err(|_| "Completion lock poisoned.".to_string())?;
+        let rebuilt = build_completion_engine(engine.tables.clone())?;
+        if !rebuilt.ready {
+            return Err("load autocomplete extension: installed but failed to load".to_string());
+        }
+        *engine = rebuilt;
+        drop(engine);
+        log_perf(&st, "sql_completions_prepare", &format!("duration_ms={}", started.elapsed().as_millis()));
+        Ok(())
+    })
+}
+
+/// Replaces the completion engine's mirror tables (called when workspace schemas change).
+#[tauri::command(async)]
+fn sync_completion_tables(
+    tables: Vec<CompletionTable>,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<(), String> {
+    let mut engine = state.completion.lock().map_err(|_| "Completion lock poisoned.".to_string())?;
+    *engine = build_completion_engine(tables)?;
+    Ok(())
+}
+
+/// Completions for `text`, which ends at the cursor. Errors when autocomplete isn't
+/// loaded yet, so the frontend can keep its basic suggestions.
+#[tauri::command(async)]
+fn sql_completions(
+    text: String,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<SqlCompletion>, String> {
+    let engine = state.completion.lock().map_err(|_| "Completion lock poisoned.".to_string())?;
+    match (&engine.conn, engine.ready) {
+        (Some(conn), true) => sql_completions_for(conn, &text, 200),
+        _ => Err("SQL autocomplete is not ready.".to_string()),
+    }
+}
+
+// ── Function reference (hover + signature help) ─────────────────────────────
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct FunctionParam {
+    name: String,
+    /// None for macros, whose parameters are untyped.
+    duckdb_type: Option<String>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct FunctionSignature {
+    params: Vec<FunctionParam>,
+    /// Type of the trailing variadic argument (`concat(ANY, ...)`), if any.
+    varargs: Option<String>,
+    returns: Option<String>,
+}
+
+/// One function name with all of its overloads, from `duckdb_functions()`.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct FunctionDoc {
+    name: String,
+    /// scalar, aggregate, window, macro, table or table_macro.
+    kind: String,
+    description: Option<String>,
+    examples: Vec<String>,
+    /// Distinct overloads, in DuckDB's order.
+    signatures: Vec<FunctionSignature>,
+}
+
+fn json_string_list(raw: Option<String>) -> Vec<Option<String>> {
+    raw.and_then(|r| serde_json::from_str::<Vec<Option<String>>>(&r).ok())
+        .unwrap_or_default()
+}
+
+/// Reads `duckdb_functions()` into one entry per (name, kind), overloads grouped and
+/// de-duplicated. Pragmas are left out: they aren't called like functions.
+fn load_function_docs(conn: &Connection) -> Result<Vec<FunctionDoc>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT function_name, function_type, description, return_type, \
+                    to_json(parameters)::VARCHAR, to_json(parameter_types)::VARCHAR, \
+                    varargs, to_json(examples)::VARCHAR \
+             FROM duckdb_functions() \
+             WHERE function_type <> 'pragma' \
+             ORDER BY lower(function_name), function_type, function_oid",
+        )
+        .map_err(|e| format!("prepare function reference: {e}"))?;
+    let mut rows = stmt.query([]).map_err(|e| format!("read function reference: {e}"))?;
+    let mut docs: Vec<FunctionDoc> = Vec::new();
+    while let Some(row) = rows.next().map_err(|e| format!("read function reference: {e}"))? {
+        let get = |i: usize| -> Result<Option<String>, String> {
+            row.get::<_, Option<String>>(i).map_err(|e| format!("read function reference: {e}"))
+        };
+        let name = get(0)?.unwrap_or_default();
+        let kind = get(1)?.unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let names = json_string_list(get(4)?);
+        let types = json_string_list(get(5)?);
+        let params = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| FunctionParam {
+                name: n.clone().unwrap_or_else(|| format!("arg{}", i + 1)),
+                duckdb_type: types.get(i).cloned().flatten(),
+            })
+            .collect();
+        let signature = FunctionSignature { params, varargs: get(6)?, returns: get(3)? };
+        let description = get(2)?.filter(|d| !d.trim().is_empty());
+        let examples: Vec<String> = json_string_list(get(7)?).into_iter().flatten().collect();
+
+        match docs.last_mut() {
+            Some(doc) if doc.name == name && doc.kind == kind => {
+                if !doc.signatures.contains(&signature) {
+                    doc.signatures.push(signature);
+                }
+                if doc.description.is_none() {
+                    doc.description = description;
+                }
+                for example in examples {
+                    if !doc.examples.contains(&example) {
+                        doc.examples.push(example);
+                    }
+                }
+            }
+            _ => docs.push(FunctionDoc { name, kind, description, examples, signatures: vec![signature] }),
+        }
+    }
+    Ok(docs)
+}
+
+/// DuckDB's function reference, read on first use and then cached for the session.
+#[tauri::command(async)]
+fn sql_function_docs(state: tauri::State<'_, Arc<AppRuntimeState>>) -> Result<Arc<Vec<FunctionDoc>>, String> {
+    let st = state.inner().clone();
+    if let Some(docs) = st.function_docs.lock().map_err(|_| "Function reference lock poisoned.".to_string())?.clone() {
+        return Ok(docs);
+    }
+    on_duckdb_thread(move || {
+        let started = Instant::now();
+        let conn = Connection::open_in_memory().map_err(|e| format!("open DuckDB: {e}"))?;
+        let docs = Arc::new(load_function_docs(&conn)?);
+        *st.function_docs.lock().map_err(|_| "Function reference lock poisoned.".to_string())? = Some(docs.clone());
+        log_perf(&st, "sql_function_docs", &format!("duration_ms={} functions={}", started.elapsed().as_millis(), docs.len()));
+        Ok(docs)
+    })
+}
+
+// ── Saved queries ────────────────────────────────────────────────────────────
+
+const SAVED_QUERIES_FILE: &str = "saved_queries.json";
+const SAVED_QUERY_NAME_MAX: usize = 100;
+/// Format version this build reads and writes.
+const SAVED_QUERIES_VERSION: u32 = 1;
+
+#[derive(Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+struct SavedQuery {
+    name: String,
+    sql: String,
+    /// Milliseconds since the Unix epoch.
+    updated_at_ms: u64,
+}
+
+#[derive(Serialize, serde::Deserialize, Debug)]
+struct SavedQueriesFile {
+    version: u32,
+    queries: Vec<SavedQuery>,
+}
+
+/// Saved queries in `path`, newest first. A missing file is an empty list; a file
+/// that can't be read or parsed is an error (never silently treated as empty, so a
+/// later save can't overwrite it).
+fn read_saved_queries(path: &Path) -> Result<Vec<SavedQuery>, String> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Saved queries file can't be read ({}): {e}", path.display())),
+    };
+    let file: SavedQueriesFile = serde_json::from_str(&raw)
+        .map_err(|e| format!("Saved queries file is damaged ({}): {e}", path.display()))?;
+    if file.version > SAVED_QUERIES_VERSION {
+        // Rewriting it would drop whatever the newer format added.
+        return Err(format!(
+            "Saved queries file was written by a newer version of Parq-Bench ({}). Update the app to use it.",
+            path.display()
+        ));
+    }
+    let mut queries = file.queries;
+    queries.sort_by(|a, b| b.updated_at_ms.cmp(&a.updated_at_ms));
+    Ok(queries)
+}
+
+/// Writes to a temporary file next to `path`, flushes it to disk, then renames it over
+/// `path`, so a crash or power loss mid-write leaves the previous file intact.
+fn write_saved_queries(path: &Path, queries: &[SavedQuery]) -> Result<(), String> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| format!("create saved queries folder: {e}"))?;
+    }
+    let json = serde_json::to_string_pretty(&SavedQueriesFile { version: SAVED_QUERIES_VERSION, queries: queries.to_vec() })
+        .map_err(|e| format!("encode saved queries: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = fs::File::create(&tmp).map_err(|e| format!("write saved queries: {e}"))?;
+        file.write_all(json.as_bytes()).map_err(|e| format!("write saved queries: {e}"))?;
+        file.sync_all().map_err(|e| format!("write saved queries: {e}"))?;
+    }
+    fs::rename(&tmp, path).map_err(|e| format!("replace saved queries file: {e}"))
+}
+
+fn normalized_query_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Give the query a name.".to_string());
+    }
+    if name.chars().count() > SAVED_QUERY_NAME_MAX {
+        return Err(format!("Names can be at most {SAVED_QUERY_NAME_MAX} characters."));
+    }
+    Ok(name.to_string())
+}
+
+/// Adds or replaces (by name, ignoring case) a saved query. Returns the new list.
+fn upsert_saved_query(path: &Path, name: &str, sql: &str, now_ms: u64) -> Result<Vec<SavedQuery>, String> {
+    let name = normalized_query_name(name)?;
+    let mut queries = read_saved_queries(path)?;
+    queries.retain(|q| q.name.to_lowercase() != name.to_lowercase());
+    queries.insert(0, SavedQuery { name, sql: sql.to_string(), updated_at_ms: now_ms });
+    write_saved_queries(path, &queries)?;
+    Ok(queries)
+}
+
+/// Removes the saved query with this name (ignoring case). Returns the new list.
+fn remove_saved_query(path: &Path, name: &str) -> Result<Vec<SavedQuery>, String> {
+    let mut queries = read_saved_queries(path)?;
+    let before = queries.len();
+    queries.retain(|q| q.name.to_lowercase() != name.trim().to_lowercase());
+    if queries.len() != before {
+        write_saved_queries(path, &queries)?;
+    }
+    Ok(queries)
+}
+
+fn saved_queries_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join(SAVED_QUERIES_FILE))
+        .map_err(|e| format!("find the app data folder: {e}"))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[tauri::command(async)]
+fn list_saved_queries(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<SavedQuery>, String> {
+    let _guard = state.saved_queries_lock.lock().map_err(|_| "Saved queries lock poisoned.".to_string())?;
+    read_saved_queries(&saved_queries_path(&app)?)
+}
+
+#[tauri::command(async)]
+fn save_query(
+    name: String,
+    sql: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<SavedQuery>, String> {
+    let _guard = state.saved_queries_lock.lock().map_err(|_| "Saved queries lock poisoned.".to_string())?;
+    upsert_saved_query(&saved_queries_path(&app)?, &name, &sql, now_ms())
+}
+
+#[tauri::command(async)]
+fn delete_saved_query(
+    name: String,
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppRuntimeState>>,
+) -> Result<Vec<SavedQuery>, String> {
+    let _guard = state.saved_queries_lock.lock().map_err(|_| "Saved queries lock poisoned.".to_string())?;
+    remove_saved_query(&saved_queries_path(&app)?, &name)
 }
 
 /// Sheet names from an .xlsx (a zip archive) by reading `xl/workbook.xml`.
@@ -2218,9 +2964,14 @@ fn remove_workspace_table(
 }
 
 #[tauri::command(async)]
+/// Runs one statement and returns its rows. `setup_sql` holds earlier statements
+/// (from "Run all") that run first on the same connection, so the last statement
+/// can use what they create. The frontend splits scripts into statements.
 fn run_workspace_query(
     sql: String,
+    setup_sql: Option<Vec<String>>,
     row_limit: u32,
+    query_id: Option<String>,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<WorkspaceQueryResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
@@ -2232,43 +2983,52 @@ fn run_workspace_query(
     };
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
-        apply_workspace_tables(&conn, &tables_referenced_by(&sql, &tables))?;
-        let conn = &conn;
-        let started = Instant::now();
+        let guard = track_query(&st, query_id, &conn)?;
+        let outcome = run_statements(&st, &conn, &tables, &sql, setup_sql.as_deref().unwrap_or(&[]), row_limit, &guard);
+        guard.finish(outcome)
+    })
+}
+
+fn run_statements(
+    st: &Arc<AppRuntimeState>,
+    conn: &Connection,
+    tables: &[WorkspaceTableRegistration],
+    sql: &str,
+    setup_sql: &[String],
+    row_limit: u32,
+    guard: &RunningQueryGuard,
+) -> Result<WorkspaceQueryResponse, String> {
+    let st = st.clone();
+    {
         let trimmed = sql.trim().trim_end_matches(';').trim().to_string();
         if trimmed.is_empty() {
             return Err("SQL query is required.".to_string());
         }
+        let mut all_sql = setup_sql.join("\n");
+        all_sql.push('\n');
+        all_sql.push_str(&trimmed);
+        guard.check()?;
+        apply_workspace_tables(conn, &tables_referenced_by(&all_sql, tables))?;
+        let started = Instant::now();
         let safe_limit = row_limit.max(1);
 
-        // Multi-statement batch (contains semicolons) — execute as utility batch
-        if trimmed.contains(';') {
-            conn.execute_batch(&sql.trim())
-                .map_err(|e| format!("execute batch: {e}"))?;
-            let elapsed_ms = started.elapsed().as_millis();
-            log_perf(
-                &st,
-                "run_workspace_query",
-                &format!("duration_ms={} batch_statement=true", elapsed_ms),
-            );
-            return Ok(WorkspaceQueryResponse {
-                sql: trimmed,
-                row_limit: safe_limit,
-                row_count: 0,
-                truncated: false,
-                elapsed_ms,
-                schema: vec![ParquetSchemaColumn {
-                    name: "result".to_string(),
-                    duckdb_type: "VARCHAR".to_string(),
-                }],
-                rows: vec![vec![Some("Batch executed successfully.".to_string())]],
-            });
+        for (index, statement) in setup_sql.iter().enumerate() {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            guard.check()?;
+            conn.execute_batch(statement)
+                .map_err(|e| format!("statement {} of {}: {e}", index + 1, setup_sql.len() + 1))?;
         }
 
+        guard.check()?;
         if is_select_like(&trimmed) {
             let schema = query_schema(conn, &trimmed)?;
-            let (rows, truncated) =
-                query_rows_with_limit(conn, &trimmed, &schema, safe_limit)?;
+            guard.check()?;
+            let (rows, truncated) = query_rows_with_limit_cancellable(
+                conn, &trimmed, &schema, safe_limit, &guard.cancelled,
+            )?;
             let elapsed_ms = started.elapsed().as_millis();
             log_perf(
                 &st,
@@ -2290,6 +3050,7 @@ fn run_workspace_query(
                 elapsed_ms,
                 schema,
                 rows,
+                returns_rows: true,
             })
         } else {
             // Utility / DDL / DML statement — execute directly, no rows returned
@@ -2313,9 +3074,10 @@ fn run_workspace_query(
                     duckdb_type: "VARCHAR".to_string(),
                 }],
                 rows: vec![vec![Some("Statement executed successfully.".to_string())]],
+                returns_rows: false,
             })
         }
-    })
+    }
 }
 
 #[tauri::command(async)]
@@ -2356,16 +3118,20 @@ fn describe_workspace_table(
 }
 
 #[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
 fn export_workspace_query(
     sql: String,
+    setup_sql: Option<Vec<String>>,
     output_path: String,
     format: String,
     query_text: Option<String>,
     table_aliases: Option<Vec<String>>,
+    query_id: Option<String>,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<WorkspaceExportResponse, String> {
     ensure_memory_guard_clear(state.as_ref())?;
     let normalized_sql = normalize_single_sql_statement(&sql)?;
+    let setup_sql = setup_sql.unwrap_or_default();
     let trimmed_path = output_path.trim().to_string();
     if trimmed_path.is_empty() {
         return Err("Output path is required.".to_string());
@@ -2379,17 +3145,41 @@ fn export_workspace_query(
     };
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
-        apply_workspace_tables(&conn, &tables_referenced_by(&normalized_sql, &tables))?;
-        let conn = &conn;
-        let started = Instant::now();
-        export_workspace_query_to_file(
-            conn,
-            &normalized_sql,
-            &trimmed_path,
-            &format,
-            query_text.as_deref(),
-            table_aliases.as_deref(),
-        )?;
+        let guard = track_query(&st, query_id, &conn)?;
+        let existed_before = existing_export_artifacts(&trimmed_path);
+        let mut all_sql = setup_sql.join("\n");
+        all_sql.push('\n');
+        all_sql.push_str(&normalized_sql);
+        let written = (|| {
+            guard.check()?;
+            apply_workspace_tables(&conn, &tables_referenced_by(&all_sql, &tables))?;
+            for statement in setup_sql.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                guard.check()?;
+                conn.execute_batch(statement)
+                    .map_err(|e| format!("export setup statement: {e}"))?;
+            }
+            guard.check()?;
+            let started = Instant::now();
+            export_workspace_query_to_file(
+                &conn,
+                &normalized_sql,
+                &trimmed_path,
+                &format,
+                query_text.as_deref(),
+                table_aliases.as_deref(),
+            )?;
+            Ok(started)
+        })();
+        // A file that was written completely is kept and reported, even if Cancel
+        // arrived in the same instant: deleting a finished export would lose work,
+        // and an overwritten file can't be restored anyway.
+        let started = match written {
+            Ok(started) => started,
+            Err(e) => {
+                remove_partial_export(&trimmed_path, &existed_before);
+                return guard.finish(Err(e));
+            }
+        };
 
         let file_size_bytes = fs::metadata(&trimmed_path)
             .map(|meta| meta.len())
@@ -2421,6 +3211,7 @@ fn export_workspace_query(
 #[tauri::command(async)]
 fn explain_workspace_query(
     sql: String,
+    query_id: Option<String>,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<String, String> {
     ensure_memory_guard_clear(state.as_ref())?;
@@ -2432,20 +3223,26 @@ fn explain_workspace_query(
     };
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
-        apply_workspace_tables(&conn, &tables_referenced_by(&sql, &tables))?;
-        let conn = &conn;
-        let normalized_sql = normalize_single_sql_statement(&sql)?;
-        let explain_sql = format!("EXPLAIN ANALYZE {normalized_sql}");
-        let mut stmt = conn
-            .prepare(&explain_sql)
-            .map_err(|e| format!("prepare explain: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| format!("run explain: {e}"))?;
-        let lines: Vec<String> = rows
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("collect explain rows: {e}"))?;
-        Ok(lines.join("\n"))
+        // EXPLAIN ANALYZE runs the query, so it can take as long as the query itself.
+        let guard = track_query(&st, query_id, &conn)?;
+        let outcome = (|| {
+            guard.check()?;
+            apply_workspace_tables(&conn, &tables_referenced_by(&sql, &tables))?;
+            let normalized_sql = normalize_single_sql_statement(&sql)?;
+            guard.check()?;
+            let explain_sql = format!("EXPLAIN ANALYZE {normalized_sql}");
+            let mut stmt = conn
+                .prepare(&explain_sql)
+                .map_err(|e| format!("prepare explain: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| format!("run explain: {e}"))?;
+            let lines: Vec<String> = rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("collect explain rows: {e}"))?;
+            Ok(lines.join("\n"))
+        })();
+        guard.finish(outcome)
     })
 }
 
@@ -2453,6 +3250,7 @@ fn explain_workspace_query(
 fn summarize_workspace_table(
     alias: String,
     deep: Option<bool>,
+    query_id: Option<String>,
     state: tauri::State<'_, Arc<AppRuntimeState>>,
 ) -> Result<Vec<std::collections::HashMap<String, String>>, String> {
     ensure_memory_guard_clear(state.as_ref())?;
@@ -2476,90 +3274,97 @@ fn summarize_workspace_table(
     let use_fast_path = !deep.unwrap_or(false) && source_kind == WorkspaceSourceKind::Parquet;
     on_duckdb_thread(move || {
         let conn = open_configured_duckdb(&st)?;
-        apply_workspace_tables(&conn, &tables_with_aliases(&tables, &[alias_trimmed.as_str()]))?;
-        let conn = &conn;
-        let started = Instant::now();
+        // Exact stats scan the whole table, so they can be cancelled.
+        let guard = track_query(&st, query_id, &conn)?;
+        let outcome = (|| {
+            guard.check()?;
+            apply_workspace_tables(&conn, &tables_with_aliases(&tables, &[alias_trimmed.as_str()]))?;
+            let conn = &conn;
+            let started = Instant::now();
 
-        let (col_names, sql) = if use_fast_path {
-            let escaped_path = escape_sql_string_literal(&file_path);
-            let cols = vec![
-                "column_name", "column_type", "min", "max", "count", "null_percentage",
-            ];
-            let q = format!(
-                concat!(
-                    "SELECT ",
-                    "s.name AS column_name, ",
-                    "s.type AS column_type, ",
-                    "COALESCE(CAST(MIN(TRY_CAST(m.stats_min_value AS DOUBLE)) AS VARCHAR), MIN(m.stats_min_value)) AS min, ",
-                    "COALESCE(CAST(MAX(TRY_CAST(m.stats_max_value AS DOUBLE)) AS VARCHAR), MAX(m.stats_max_value)) AS max, ",
-                    "CAST(SUM(m.num_values) AS VARCHAR) AS count, ",
-                    "CAST(ROUND(SUM(m.stats_null_count) * 100.0 ",
-                    "/ NULLIF(SUM(m.num_values), 0), 2) AS VARCHAR) AS null_percentage ",
-                    "FROM parquet_schema('{}') s ",
-                    "JOIN parquet_metadata('{}') m ON s.name = m.path_in_schema ",
-                    "WHERE s.name != 'duckdb_schema' ",
-                    "GROUP BY s.name, m.column_id, s.type ",
-                    "ORDER BY m.column_id"
-                ),
-                escaped_path, escaped_path
-            );
-            (cols, q)
-        } else {
-            let ident = escape_sql_ident(&alias_trimmed);
-            let cols = vec![
-                "column_name", "column_type", "min", "max", "approx_unique",
-                "avg", "std", "q25", "q50", "q75", "count", "null_percentage",
-            ];
-            let q = format!(
-                concat!(
-                    "SELECT ",
-                    "CAST(column_name AS VARCHAR) AS column_name, ",
-                    "CAST(column_type AS VARCHAR) AS column_type, ",
-                    "CAST(min AS VARCHAR) AS min, ",
-                    "CAST(max AS VARCHAR) AS max, ",
-                    "CAST(approx_unique AS VARCHAR) AS approx_unique, ",
-                    "CAST(avg AS VARCHAR) AS avg, ",
-                    "CAST(std AS VARCHAR) AS std, ",
-                    "CAST(q25 AS VARCHAR) AS q25, ",
-                    "CAST(q50 AS VARCHAR) AS q50, ",
-                    "CAST(q75 AS VARCHAR) AS q75, ",
-                    "CAST(count AS VARCHAR) AS count, ",
-                    "CAST(null_percentage AS VARCHAR) AS null_percentage ",
-                    "FROM (SUMMARIZE \"{}\")"
-                ),
-                ident
-            );
-            (cols, q)
-        };
+            let (col_names, sql) = if use_fast_path {
+                let escaped_path = escape_sql_string_literal(&file_path);
+                let cols = vec![
+                    "column_name", "column_type", "min", "max", "count", "null_percentage",
+                ];
+                let q = format!(
+                    concat!(
+                        "SELECT ",
+                        "s.name AS column_name, ",
+                        "s.type AS column_type, ",
+                        "COALESCE(CAST(MIN(TRY_CAST(m.stats_min_value AS DOUBLE)) AS VARCHAR), MIN(m.stats_min_value)) AS min, ",
+                        "COALESCE(CAST(MAX(TRY_CAST(m.stats_max_value AS DOUBLE)) AS VARCHAR), MAX(m.stats_max_value)) AS max, ",
+                        "CAST(SUM(m.num_values) AS VARCHAR) AS count, ",
+                        "CAST(ROUND(SUM(m.stats_null_count) * 100.0 ",
+                        "/ NULLIF(SUM(m.num_values), 0), 2) AS VARCHAR) AS null_percentage ",
+                        "FROM parquet_schema('{}') s ",
+                        "JOIN parquet_metadata('{}') m ON s.name = m.path_in_schema ",
+                        "WHERE s.name != 'duckdb_schema' ",
+                        "GROUP BY s.name, m.column_id, s.type ",
+                        "ORDER BY m.column_id"
+                    ),
+                    escaped_path, escaped_path
+                );
+                (cols, q)
+            } else {
+                let ident = escape_sql_ident(&alias_trimmed);
+                let cols = vec![
+                    "column_name", "column_type", "min", "max", "approx_unique",
+                    "avg", "std", "q25", "q50", "q75", "count", "null_percentage",
+                ];
+                let q = format!(
+                    concat!(
+                        "SELECT ",
+                        "CAST(column_name AS VARCHAR) AS column_name, ",
+                        "CAST(column_type AS VARCHAR) AS column_type, ",
+                        "CAST(min AS VARCHAR) AS min, ",
+                        "CAST(max AS VARCHAR) AS max, ",
+                        "CAST(approx_unique AS VARCHAR) AS approx_unique, ",
+                        "CAST(avg AS VARCHAR) AS avg, ",
+                        "CAST(std AS VARCHAR) AS std, ",
+                        "CAST(q25 AS VARCHAR) AS q25, ",
+                        "CAST(q50 AS VARCHAR) AS q50, ",
+                        "CAST(q75 AS VARCHAR) AS q75, ",
+                        "CAST(count AS VARCHAR) AS count, ",
+                        "CAST(null_percentage AS VARCHAR) AS null_percentage ",
+                        "FROM (SUMMARIZE \"{}\")"
+                    ),
+                    ident
+                );
+                (cols, q)
+            };
 
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| format!("prepare summarize: {e}"))?;
-        let row_iter = stmt
-            .query_map([], |row| {
-                let mut map = std::collections::HashMap::new();
-                for (i, name) in col_names.iter().enumerate() {
-                    let val: String = row.get::<_, Option<String>>(i)?.unwrap_or_default();
-                    map.insert(name.to_string(), val);
-                }
-                Ok(map)
-            })
-            .map_err(|e| format!("run summarize: {e}"))?;
-        let results: Vec<std::collections::HashMap<String, String>> = row_iter
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("collect summarize rows: {e}"))?;
-        let log_label = if use_fast_path { "summarize_workspace_table_fast" } else { "summarize_workspace_table" };
-        log_perf(
-            &st,
-            log_label,
-            &format!(
-                "alias={} duration_ms={} rows={}",
-                alias_trimmed,
-                started.elapsed().as_millis(),
-                results.len(),
-            ),
-        );
-        Ok(results)
+            guard.check()?;
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|e| format!("prepare summarize: {e}"))?;
+            let row_iter = stmt
+                .query_map([], |row| {
+                    let mut map = std::collections::HashMap::new();
+                    for (i, name) in col_names.iter().enumerate() {
+                        let val: String = row.get::<_, Option<String>>(i)?.unwrap_or_default();
+                        map.insert(name.to_string(), val);
+                    }
+                    Ok(map)
+                })
+                .map_err(|e| format!("run summarize: {e}"))?;
+            let results: Vec<std::collections::HashMap<String, String>> = row_iter
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("collect summarize rows: {e}"))?;
+            let log_label = if use_fast_path { "summarize_workspace_table_fast" } else { "summarize_workspace_table" };
+            log_perf(
+                &st,
+                log_label,
+                &format!(
+                    "alias={} duration_ms={} rows={}",
+                    alias_trimmed,
+                    started.elapsed().as_millis(),
+                    results.len(),
+                ),
+            );
+            Ok(results)
+        })();
+        guard.finish(outcome)
     })
 }
 
@@ -3894,8 +4699,454 @@ pub fn run() {
             explain_workspace_query,
             summarize_workspace_table,
             diff_workspace_schema,
+            cancel_workspace_query,
+            workspace_query_progress,
+            prepare_sql_completions,
+            sync_completion_tables,
+            sql_completions,
+            sql_function_docs,
+            list_saved_queries,
+            save_query,
+            delete_saved_query,
             get_log_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+    use std::sync::OnceLock;
+
+    #[test]
+    fn function_docs_group_overloads_with_types_and_descriptions() {
+        let conn = Connection::open_in_memory().unwrap();
+        let docs = load_function_docs(&conn).unwrap();
+        assert!(docs.len() > 500, "expected hundreds of functions, got {}", docs.len());
+
+        let find = |name: &str, kind: &str| docs.iter().find(|d| d.name == name && d.kind == kind)
+            .unwrap_or_else(|| panic!("{name} ({kind}) missing"));
+        let trunc = find("date_trunc", "scalar");
+        assert!(trunc.description.as_deref().unwrap_or("").contains("Truncate"));
+        assert!(trunc.signatures.len() >= 2, "date_trunc has several overloads");
+        let first = &trunc.signatures[0];
+        assert_eq!(first.params.len(), 2);
+        assert_eq!(first.params[0].duckdb_type.as_deref(), Some("VARCHAR"));
+        assert!(!trunc.examples.is_empty());
+
+        let sum = find("sum", "aggregate");
+        assert!(sum.signatures.iter().all(|s| s.returns.is_some()));
+
+        // Table functions carry named parameters; pragmas are left out entirely.
+        assert!(find("read_parquet", "table").signatures[0].params.iter().any(|p| p.name == "hive_partitioning"));
+        assert!(docs.iter().all(|d| d.kind != "pragma"));
+
+        // One entry per (name, kind), each signature listed once.
+        let mut keys: Vec<(&str, &str)> = docs.iter().map(|d| (d.name.as_str(), d.kind.as_str())).collect();
+        let total = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), total);
+        for d in &docs {
+            for (i, sig) in d.signatures.iter().enumerate() {
+                assert!(!d.signatures[..i].contains(sig), "{} repeats a signature", d.name);
+            }
+        }
+    }
+
+    #[test]
+    fn function_docs_mark_variadic_functions() {
+        let conn = Connection::open_in_memory().unwrap();
+        let docs = load_function_docs(&conn).unwrap();
+        let concat = docs.iter().find(|d| d.name == "concat" && d.kind == "scalar").expect("concat");
+        assert!(concat.signatures.iter().any(|s| s.varargs.is_some()), "concat takes any number of arguments");
+    }
+
+    fn install_autocomplete() {
+        static DONE: OnceLock<()> = OnceLock::new();
+        DONE.get_or_init(|| {
+            Connection::open_in_memory()
+                .expect("open duckdb")
+                .execute_batch("INSTALL autocomplete;")
+                .expect("install autocomplete (needs internet on first run)");
+        });
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("parq_bench_{name}_{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn saved_queries_round_trip_newest_first() {
+        let path = temp_dir("saved_round_trip").join("sub").join(SAVED_QUERIES_FILE);
+        assert!(read_saved_queries(&path).unwrap().is_empty(), "missing file is an empty list");
+        upsert_saved_query(&path, "  Revenue ", "SELECT 1", 100).unwrap();
+        let list = upsert_saved_query(&path, "Counts", "SELECT 2", 200).unwrap();
+        assert_eq!(list.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(), ["Counts", "Revenue"]);
+        assert_eq!(read_saved_queries(&path).unwrap(), list);
+        assert!(!path.with_extension("json.tmp").exists(), "temporary file is renamed away");
+    }
+
+    #[test]
+    fn saving_an_existing_name_replaces_it_ignoring_case() {
+        let path = temp_dir("saved_replace").join(SAVED_QUERIES_FILE);
+        upsert_saved_query(&path, "Revenue", "SELECT 1", 100).unwrap();
+        upsert_saved_query(&path, "Other", "SELECT 9", 150).unwrap();
+        let list = upsert_saved_query(&path, "revenue", "SELECT 2", 200).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], SavedQuery { name: "revenue".into(), sql: "SELECT 2".into(), updated_at_ms: 200 });
+    }
+
+    #[test]
+    fn deleting_removes_only_that_query() {
+        let path = temp_dir("saved_delete").join(SAVED_QUERIES_FILE);
+        upsert_saved_query(&path, "A", "SELECT 1", 1).unwrap();
+        upsert_saved_query(&path, "B", "SELECT 2", 2).unwrap();
+        let list = remove_saved_query(&path, "a").unwrap();
+        assert_eq!(list.iter().map(|q| q.name.as_str()).collect::<Vec<_>>(), ["B"]);
+        assert_eq!(remove_saved_query(&path, "missing").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn saved_query_names_are_required_and_bounded() {
+        let path = temp_dir("saved_names").join(SAVED_QUERIES_FILE);
+        assert!(upsert_saved_query(&path, "   ", "SELECT 1", 1).is_err());
+        assert!(upsert_saved_query(&path, &"x".repeat(SAVED_QUERY_NAME_MAX + 1), "SELECT 1", 1).is_err());
+        assert!(upsert_saved_query(&path, &"x".repeat(SAVED_QUERY_NAME_MAX), "SELECT 1", 1).is_ok());
+    }
+
+    #[test]
+    fn a_damaged_saved_queries_file_is_an_error_and_never_overwritten() {
+        let path = temp_dir("saved_damaged").join(SAVED_QUERIES_FILE);
+        fs::write(&path, "{ not json").unwrap();
+        assert!(read_saved_queries(&path).unwrap_err().contains("damaged"));
+        assert!(upsert_saved_query(&path, "A", "SELECT 1", 1).is_err());
+        assert!(remove_saved_query(&path, "A").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn a_saved_queries_file_from_a_newer_version_is_refused_not_rewritten() {
+        let path = temp_dir("saved_newer").join(SAVED_QUERIES_FILE);
+        let newer = r#"{"version": 2, "queries": [], "folders": ["kept"]}"#;
+        fs::write(&path, newer).unwrap();
+        assert!(read_saved_queries(&path).unwrap_err().contains("newer version"));
+        assert!(upsert_saved_query(&path, "A", "SELECT 1", 1).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), newer);
+    }
+
+    /// Long enough to still be running when cancelled (~10^10 row pairs).
+    const SLOW_SQL: &str = "SELECT sum(a.range * b.range) AS s FROM range(100000) a, range(100000) b";
+
+    /// Runs `sql` the way `run_workspace_query` does, on its own thread.
+    fn spawn_tracked_query(
+        st: &Arc<AppRuntimeState>,
+        id: &str,
+        sql: &'static str,
+    ) -> thread::JoinHandle<Result<WorkspaceQueryResponse, String>> {
+        let st = st.clone();
+        let id = id.to_string();
+        thread::spawn(move || {
+            let conn = open_configured_duckdb(&st)?;
+            let guard = track_query(&st, Some(id), &conn)?;
+            let outcome = run_statements(&st, &conn, &[], sql, &[], 10, &guard);
+            guard.finish(outcome)
+        })
+    }
+
+    fn wait_until_registered(st: &AppRuntimeState, id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !st.running_queries.lock().unwrap().contains_key(id) {
+            assert!(Instant::now() < deadline, "query {id} never registered");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn cancel_interrupts_a_running_query_and_clears_the_registry() {
+        let st = Arc::new(AppRuntimeState::new());
+        let handle = spawn_tracked_query(&st, "q-cancel", SLOW_SQL);
+        wait_until_registered(&st, "q-cancel");
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        assert!(cancel_running_query(&st, "q-cancel").unwrap());
+        let result = handle.join().unwrap();
+        assert_eq!(result.unwrap_err(), QUERY_CANCELLED);
+        assert!(started.elapsed() < Duration::from_secs(5), "cancel took {:?}", started.elapsed());
+        assert!(st.running_queries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelling_an_unknown_query_reports_false() {
+        let st = AppRuntimeState::new();
+        assert!(!cancel_running_query(&st, "nope").unwrap());
+    }
+
+    #[test]
+    fn finished_and_failed_queries_leave_the_registry() {
+        let st = Arc::new(AppRuntimeState::new());
+        let ok = spawn_tracked_query(&st, "q-ok", "SELECT 42 AS answer").join().unwrap().unwrap();
+        assert_eq!(ok.rows, vec![vec![Some("42".to_string())]]);
+        let err = spawn_tracked_query(&st, "q-err", "SELECT * FROM missing_table").join().unwrap();
+        assert!(err.unwrap_err().contains("missing_table"));
+        assert!(st.running_queries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn progress_is_reported_while_a_scan_runs() {
+        let st = Arc::new(AppRuntimeState::new());
+        let handle = spawn_tracked_query(&st, "q-progress", SLOW_SQL);
+        wait_until_registered(&st, "q-progress");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = None;
+        while seen.is_none() && Instant::now() < deadline {
+            seen = st
+                .running_queries
+                .lock()
+                .unwrap()
+                .get("q-progress")
+                .and_then(|q| q.progress.query_progress().percentage());
+            thread::sleep(Duration::from_millis(50));
+        }
+        cancel_running_query(&st, "q-progress").unwrap();
+        let _ = handle.join();
+        let pct = seen.expect("no progress estimate within 10 s");
+        assert!((0.0..=100.0).contains(&pct), "progress {pct}");
+    }
+
+    #[test]
+    fn setup_statements_run_first_on_the_same_connection() {
+        let st = Arc::new(AppRuntimeState::new());
+        let conn = open_configured_duckdb(&st).unwrap();
+        let guard = track_query(&st, None, &conn).unwrap();
+        let setup = vec![
+            "CREATE TEMP TABLE t AS SELECT 1 AS x UNION ALL SELECT 2".to_string(),
+            "INSERT INTO t VALUES (3)".to_string(),
+        ];
+        let result = run_statements(&st, &conn, &[], "SELECT sum(x) AS total FROM t", &setup, 10, &guard).unwrap();
+        assert_eq!(result.rows, vec![vec![Some("6".to_string())]]);
+        let failing = vec!["CREATE TABLE u AS SELECT * FROM nowhere".to_string()];
+        let err = run_statements(&st, &conn, &[], "SELECT 1", &failing, 10, &guard).unwrap_err();
+        assert!(err.starts_with("statement 1 of 2:"), "{err}");
+    }
+
+    #[test]
+    fn trailing_line_comment_does_not_break_wrapped_queries() {
+        let conn = Connection::open_in_memory().unwrap();
+        let sql = "SELECT 7 AS n -- a note";
+        let schema = query_schema(&conn, sql).expect("schema");
+        let (rows, _) = query_rows_with_limit(&conn, sql, &schema, 5).expect("rows");
+        assert_eq!(rows, vec![vec![Some("7".to_string())]]);
+        let dir = temp_dir("comment_export");
+        let out = dir.join("out.parquet").to_string_lossy().into_owned();
+        export_workspace_query_to_file(&conn, sql, &out, "parquet", None, None).expect("export");
+        assert!(Path::new(&out).exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn statement_splitter_respects_quotes_comments_and_dollar_strings() {
+        assert_eq!(split_sql_statements("SELECT 1; SELECT 2;"), vec!["SELECT 1", "SELECT 2"]);
+        assert_eq!(split_sql_statements("SELECT 'a;b', \"c;d\""), vec!["SELECT 'a;b', \"c;d\""]);
+        assert_eq!(split_sql_statements("SELECT 'it''s; fine'"), vec!["SELECT 'it''s; fine'"]);
+        assert_eq!(
+            split_sql_statements("SELECT 1 -- no; split\n; SELECT 2"),
+            vec!["SELECT 1 -- no; split", "SELECT 2"]
+        );
+        assert_eq!(split_sql_statements("SELECT /* a; b */ 1"), vec!["SELECT /* a; b */ 1"]);
+        assert_eq!(split_sql_statements("SELECT $$a;b$$, $x$c;d$x$"), vec!["SELECT $$a;b$$, $x$c;d$x$"]);
+        assert_eq!(split_sql_statements("SELECT $1; SELECT 2"), vec!["SELECT $1", "SELECT 2"]);
+        assert_eq!(split_sql_statements("SELECT 1; -- trailing note"), vec!["SELECT 1"]);
+        assert_eq!(split_sql_statements("  ;; -- only comments\n/* x */ "), Vec::<String>::new());
+        assert_eq!(split_sql_statements("SELECT 'unterminated; text"), vec!["SELECT 'unterminated; text"]);
+    }
+
+    #[test]
+    fn single_statement_normalization_is_quote_aware() {
+        assert_eq!(normalize_single_sql_statement("SELECT 'a;b';").unwrap(), "SELECT 'a;b'");
+        assert_eq!(normalize_single_sql_statement("SELECT 1; -- note").unwrap(), "SELECT 1");
+        assert!(normalize_single_sql_statement("SELECT 1; SELECT 2").is_err());
+        assert!(normalize_single_sql_statement("-- just a comment").is_err());
+    }
+
+    #[test]
+    fn partial_export_cleanup_keeps_files_that_existed_before() {
+        let dir = temp_dir("export_cleanup");
+        let out = dir.join("result.parquet");
+        let out_str = out.to_string_lossy().into_owned();
+        // A file the user already had next to the export target must survive.
+        let users_tmp = dir.join("tmp_result.parquet");
+        fs::write(&users_tmp, "mine").unwrap();
+        let before = existing_export_artifacts(&out_str);
+        assert_eq!(before, vec![users_tmp.clone()]);
+        fs::write(&out, "partial").unwrap();
+        fs::write(format!("{out_str}.tmp"), "staging").unwrap();
+        fs::write(dir.join("tmp_result.parquet.tmp"), "duckdb staging").unwrap();
+        remove_partial_export(&out_str, &before);
+        assert!(!out.exists());
+        assert!(!Path::new(&format!("{out_str}.tmp")).exists());
+        assert!(!dir.join("tmp_result.parquet.tmp").exists());
+        assert!(users_tmp.exists(), "pre-existing file was deleted");
+        // An output that existed before is left alone too.
+        fs::write(&out, "old export").unwrap();
+        remove_partial_export(&out_str, &existing_export_artifacts(&out_str));
+        assert!(out.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn completion_tables() -> Vec<CompletionTable> {
+        let col = |name: &str, ty: &str| CompletionColumn { name: name.into(), duckdb_type: ty.into() };
+        vec![
+            CompletionTable {
+                alias: "orders".into(),
+                columns: vec![col("o_orderkey", "BIGINT"), col("o_custkey", "BIGINT"), col("o_comment", "VARCHAR")],
+            },
+            CompletionTable {
+                alias: "odd table".into(),
+                columns: vec![col("my col", "STRUCT(a INTEGER, b VARCHAR)"), col("q\"uote", "INTEGER")],
+            },
+            CompletionTable {
+                alias: "bad_types".into(),
+                columns: vec![col("weird", "NOT_A_REAL_TYPE"), col("fine", "INTEGER")],
+            },
+            CompletionTable { alias: "empty".into(), columns: vec![] },
+        ]
+    }
+
+    fn suggestions(conn: &Connection, text: &str) -> Vec<(String, String)> {
+        sql_completions_for(conn, text, 200)
+            .expect("completions")
+            .into_iter()
+            .map(|c| (c.text.trim_end().to_string(), c.kind))
+            .collect()
+    }
+
+    #[test]
+    fn completion_engine_suggests_tables_functions_columns_and_keywords() {
+        install_autocomplete();
+        let engine = build_completion_engine(completion_tables()).expect("engine");
+        assert!(engine.ready, "autocomplete should load once installed");
+        let conn = engine.conn.as_ref().unwrap();
+
+        let from = suggestions(conn, "SELECT * FROM ord");
+        assert!(from.contains(&("orders".into(), "table".into())), "{from:?}");
+
+        let functions = suggestions(conn, "SELECT date_tr");
+        assert!(functions.iter().any(|(t, k)| t == "date_trunc" && k == "scalar_function"), "{functions:?}");
+
+        let columns = suggestions(conn, "SELECT * FROM orders WHERE o_c");
+        assert!(columns.iter().any(|(t, k)| t == "o_custkey" && k == "column"), "{columns:?}");
+
+        let keyword = suggestions(conn, "SELECT * FROM orders QUAL");
+        assert!(keyword.iter().any(|(t, _)| t.eq_ignore_ascii_case("QUALIFY")), "{keyword:?}");
+
+        // Mirror tables with odd names and nested types exist; bad types fall back to VARCHAR.
+        let tables: Vec<String> = conn
+            .prepare("SELECT table_name FROM duckdb_tables() ORDER BY 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(tables, vec!["bad_types", "odd table", "orders"]);
+        let bad_type: String = conn
+            .query_row(
+                "SELECT data_type FROM duckdb_columns() WHERE table_name = 'bad_types' AND column_name = 'weird'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bad_type, "VARCHAR");
+    }
+
+    #[test]
+    fn completion_start_is_a_utf16_offset() {
+        install_autocomplete();
+        let engine = build_completion_engine(completion_tables()).expect("engine");
+        let conn = engine.conn.as_ref().unwrap();
+        // 'é' is 2 bytes in UTF-8 but 1 UTF-16 unit; the emoji is 4 bytes and 2 units.
+        let text = "SELECT 'é\u{1F600}', date_tr";
+        let expected = text.encode_utf16().count() - "date_tr".len();
+        let got = sql_completions_for(conn, text, 50).unwrap();
+        let date_trunc = got.iter().find(|c| c.text == "date_trunc").expect("date_trunc suggested");
+        assert_eq!(date_trunc.start, expected);
+    }
+
+    #[test]
+    fn utf16_offsets_convert_from_bytes() {
+        assert_eq!(utf16_offset("abc", 2), 2);
+        assert_eq!(utf16_offset("é1", 2), 1);
+        assert_eq!(utf16_offset("\u{1F600}x", 4), 2);
+        assert_eq!(utf16_offset("é", 1), 0, "inside a character rounds down");
+        assert_eq!(utf16_offset("ab", 99), 2);
+    }
+
+    #[test]
+    fn statements_with_leading_comments_still_return_rows() {
+        assert!(is_select_like("-- first query\nSELECT 1"));
+        assert!(is_select_like("/* header */ WITH x AS (SELECT 1) SELECT * FROM x"));
+        assert!(!is_select_like("-- note\nCREATE TABLE t (x INT)"));
+        assert_eq!(skip_leading_comments("  -- a\n /* b */ SELECT 1"), "SELECT 1");
+        assert_eq!(split_sql_statements("SELECT 1; -- next\nSELECT 2"), vec!["SELECT 1", "SELECT 2"]);
+
+        let st = Arc::new(AppRuntimeState::new());
+        let conn = open_configured_duckdb(&st).unwrap();
+        let guard = track_query(&st, None, &conn).unwrap();
+        let result = run_statements(&st, &conn, &[], "-- title\nSELECT 5 AS five", &[], 10, &guard).unwrap();
+        assert!(result.returns_rows);
+        assert_eq!(result.rows, vec![vec![Some("5".to_string())]]);
+        let ddl = run_statements(&st, &conn, &[], "CREATE TEMP TABLE z (x INT)", &[], 10, &guard).unwrap();
+        assert!(!ddl.returns_rows);
+    }
+
+    #[test]
+    fn a_cancel_that_arrives_before_the_query_registers_still_applies() {
+        let st = Arc::new(AppRuntimeState::new());
+        assert!(!cancel_running_query(&st, "early").unwrap(), "not running yet");
+        let conn = open_configured_duckdb(&st).unwrap();
+        let guard = track_query(&st, Some("early".into()), &conn).unwrap();
+        // The setup statement must not run once the query is known to be cancelled.
+        let setup = vec!["CREATE TEMP TABLE must_not_exist AS SELECT 1".to_string()];
+        let outcome = run_statements(&st, &conn, &[], "SELECT 1", &setup, 10, &guard);
+        assert_eq!(guard.finish(outcome).unwrap_err(), QUERY_CANCELLED);
+        let exists: i64 = conn
+            .query_row("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'must_not_exist'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(exists, 0);
+        assert!(st.cancelled_early.lock().unwrap().is_empty(), "early cancel consumed");
+    }
+
+    #[test]
+    fn explain_and_stats_honour_an_early_cancel() {
+        // Mirrors the commands: register, then the first step checks the flag.
+        let st = Arc::new(AppRuntimeState::new());
+        cancel_running_query(&st, "stats-early").unwrap();
+        let conn = open_configured_duckdb(&st).unwrap();
+        let guard = track_query(&st, Some("stats-early".into()), &conn).unwrap();
+        assert_eq!(guard.check().unwrap_err(), QUERY_CANCELLED);
+    }
+
+    #[test]
+    fn early_cancels_are_bounded() {
+        let st = AppRuntimeState::new();
+        for i in 0..(CANCELLED_EARLY_MAX + 10) {
+            cancel_running_query(&st, &format!("gone-{i}")).unwrap();
+        }
+        assert_eq!(st.cancelled_early.lock().unwrap().len(), CANCELLED_EARLY_MAX);
+    }
+
+    #[test]
+    fn completion_engine_starts_empty_and_not_ready() {
+        let st = AppRuntimeState::new();
+        let engine = st.completion.lock().unwrap();
+        assert!(engine.conn.is_none());
+        assert!(!engine.ready);
+    }
 }

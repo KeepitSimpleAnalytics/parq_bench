@@ -137,9 +137,65 @@ export type ExtensionStatus = {
   size_bytes: number | null;
 };
 
+/** One parameter of a DuckDB function overload. */
+export type FunctionParam = {
+  name: string;
+  /** null for macros, whose parameters are untyped. */
+  duckdb_type: string | null;
+};
+
+export type FunctionSignature = {
+  params: FunctionParam[];
+  /** Type of the trailing variadic argument, if the function takes any number of them. */
+  varargs: string | null;
+  returns: string | null;
+};
+
+/** One function name and kind with all its overloads (backend `sql_function_docs`). */
+export type FunctionDoc = {
+  name: string;
+  /** scalar | aggregate | window | macro | table | table_macro */
+  kind: string;
+  description: string | null;
+  examples: string[];
+  signatures: FunctionSignature[];
+};
+
+/** One suggestion from DuckDB's sql_auto_complete (backend `sql_completions`). */
+export type SqlCompletion = {
+  text: string;
+  /** UTF-16 offset in the text sent, where the replaced word starts. */
+  start: number;
+  /** keyword | table | column | scalar_function | table_function | type | … */
+  kind: string;
+  /** Lower is better. */
+  score: number;
+  /** Text DuckDB suggests appending, e.g. a space after a keyword. */
+  extra: string | null;
+};
+
+/**
+ * State of DuckDB-powered completion. "basic" is the built-in list, used before
+ * the autocomplete extension is ready or when it can't be downloaded.
+ */
+export type SmartCompletionStatus =
+  | { state: "idle" }
+  | { state: "downloading" }
+  | { state: "ready" }
+  | { state: "unavailable"; reason: string };
+
+/** What the editor is running that the Cancel button can stop. */
+export type RunningOperation = {
+  id: string;
+  kind: "query" | "export" | "explain";
+  startedAt: number;
+};
+
 export type ExportFormat = "csv" | "parquet" | "xlsx";
 
 export type WorkspaceQueryResponse = {
+  /** False for DDL/DML/utility statements, whose single row is just a status message. */
+  returns_rows: boolean;
   sql: string;
   row_limit: number;
   row_count: number;
@@ -211,6 +267,14 @@ export type RecentFile = {
   sizeBytes: number | null;
   /** Epoch ms when last opened; null for entries saved by older versions. */
   openedAt: number | null;
+};
+
+/** A named query kept in the app data folder (backend `list_saved_queries`). */
+export type SavedQuery = {
+  name: string;
+  sql: string;
+  /** Milliseconds since the Unix epoch. */
+  updated_at_ms: number;
 };
 
 export type QueryHistoryEntry = {

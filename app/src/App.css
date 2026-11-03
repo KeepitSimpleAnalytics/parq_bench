@@ -660,9 +660,19 @@ th.num .th-button { align-items: flex-end; }
   font-size: 13px;
 }
 .menu-item:hover { background: var(--surface-hover); }
+.menu-item-nowrap { white-space: nowrap; }
 .history-item { flex-direction: column; align-items: stretch; gap: 2px; border-bottom: 1px solid var(--border-soft); border-radius: 0; }
 .history-sql { font-family: var(--mono); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .history-meta { font-size: 11px; color: var(--text-soft); }
+.saved-row { display: flex; align-items: stretch; border-bottom: 1px solid var(--border-soft); }
+.saved-row .saved-open { flex: 1; min-width: 0; border-bottom: 0; }
+.saved-row-open .saved-name::after { content: " · open"; font-weight: 400; color: var(--text-soft); }
+.saved-name { font-size: 13px; font-weight: 600; }
+.saved-delete { align-self: center; margin-right: 4px; }
+.menu-note { margin: 0; padding: 8px; font-size: 12px; color: var(--text-soft); }
+.menu-note-error { color: var(--danger-text); }
+.open-query-name { font-size: 12px; color: var(--text-soft); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 220px; }
+.open-query-name strong { color: var(--text); font-weight: 600; }
 
 /* ── Preview tab ────────────────────────────────────────────────────── */
 
@@ -936,6 +946,22 @@ th.num .th-button { align-items: flex-end; }
   border-bottom: 1px solid var(--border);
   flex-wrap: wrap;
 }
+/* Run + caret (Run all) joined into one control. */
+.split-btn { display: inline-flex; }
+.split-btn > .btn-primary:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.split-btn-caret {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left-color: rgba(255, 255, 255, 0.35);
+  padding-left: 7px;
+  padding-right: 7px;
+}
+.run-cancel { font-weight: 600; }
+.run-progress { font-variant-numeric: tabular-nums; min-width: 3ch; text-align: right; }
+.completion-status { display: inline-flex; align-items: center; gap: 6px; }
+/* The SQL that just started running, highlighted for a moment. */
+.ran-sql-flash { background: var(--accent-soft); }
+
 .workspace-editor {
   resize: vertical;
   overflow: hidden;
@@ -971,6 +997,17 @@ th.num .th-button { align-items: flex-end; }
 .result-tab:hover { color: var(--text); }
 .result-tab.is-active { color: var(--text); font-weight: 600; border-bottom-color: var(--accent); }
 .results-error { padding: 12px 12px 0; flex: none; }
+.results-notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 12px 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  font-size: 13px;
+  flex: none;
+}
 .results-scroll { flex: 1; min-height: 0; overflow: auto; }
 
 .chart-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }

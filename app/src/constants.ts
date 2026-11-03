@@ -40,12 +40,18 @@ export const MANAGED_EXTENSIONS: Array<{ name: string; label: string; purpose: s
   { name: "httpfs", label: "Web URLs", purpose: "Open Parquet and CSV files from https:// links" },
   { name: "delta", label: "Delta Lake", purpose: "Add Delta table folders" },
   { name: "icu", label: "Time zones", purpose: "AT TIME ZONE and local-time conversions in SQL" },
+  { name: "autocomplete", label: "SQL autocomplete", purpose: "Context-aware suggestions for keywords, functions, tables and columns" },
 ];
+
+/** Error text the backend returns for a query the user cancelled (QUERY_CANCELLED in lib.rs). */
+export const QUERY_CANCELLED = "Query cancelled.";
 
 export const UI_THEME_STORAGE_KEY = "parqbench.ui.theme_mode";
 export const UI_ACTIVE_TAB_STORAGE_KEY = "parqbench.ui.active_tab";
 export const UI_RECENT_FILES_STORAGE_KEY = "parqbench.ui.recent_files";
 export const UI_QUERY_HISTORY_STORAGE_KEY = "parqbench.ui.query_history";
+/** Editor text and the open saved query, restored at the next start. */
+export const UI_EDITOR_SESSION_STORAGE_KEY = "parqbench.ui.editor_session";
 export const UI_SETTINGS_STORAGE_KEY = "parqbench.ui.settings";
 export const RECENT_FILES_MAX = 15;
 /** Mirrors PANIC_RSS_RATIO in the backend: app RSS / total RAM that trips the memory guard. */

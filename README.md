@@ -32,10 +32,12 @@ Add files as named tables in the sidebar, then write SQL to query across them.
 - **Folders** — **Folder of files** mounts every file of one type in a folder as a single table (e.g. `exports\*.csv`) and shows how many files match. Choose **Delta Lake table (folder)** to add a Delta table folder.
 - **Tables sidebar** — Expand a table to see its columns and types. Each table has **Stats**, **Rename**, **Insert SELECT** and **Remove**; single-file Parquet tables also have **Preview**, which opens them in the Preview tab for full scrolling. Parquet tables show their row count. **Search columns** filters tables by column name.
 - **Compare schemas** — Compare two tables to see columns only in one side or with a changed type.
-- **SQL editor** — Monaco-powered editor with SQL highlighting and autocomplete (type `.` after a table name for its columns). Drag the bottom edge to resize it.
-- **Run a query** — Click **Run** or press `Ctrl+Enter`. A running query shows its elapsed time.
-- **Results / Chart / Plan** — Results show row count, time and column types. **Chart** draws a Bar, Column, Line, Treemap or Table chart and updates as you change the group-by column, value and summary. **Plan** shows `EXPLAIN ANALYZE` output (**Explain** or `Ctrl+Shift+Enter`).
-- **Export** — **Export ▾** saves all result rows (not just the displayed ones) as CSV, Parquet or Excel (`.xlsx`, up to 1,048,576 rows). `Ctrl+Shift+E` exports CSV directly.
+- **SQL editor** — Monaco-powered editor with SQL highlighting. Drag the bottom edge to resize it.
+- **Autocomplete** — Suggestions fit where you are typing: tables after `FROM`, the query's own columns in the `SELECT` list and `WHERE`, DuckDB's functions (`date_trunc`, `regexp_extract`, …) and keywords such as `QUALIFY`. Aliases you write work too: after `FROM orders o`, typing `o.` lists the orders columns. This uses DuckDB's autocomplete extension, downloaded the first time you click into the editor; until then, or if it can't be downloaded, you get a basic list of keywords, tables and columns.
+- **Run a query** — Click **Run** or press `Ctrl+Enter` to run the statement under the cursor, or the selected text if you have selected some (the button then reads **Run selection**). To run every statement in the editor, use **▾ → Run all statements** or `Ctrl+Alt+Enter`; the earlier statements run first, so a script can create a temporary table and then query it, and you see the last statement's result. The statement that runs is briefly highlighted.
+- **Cancel** — While a query, an export, Explain or an exact Stats scan runs, **Run** turns into **Cancel**, with DuckDB's progress estimate when it has one. Press **Cancel** or `Esc` to stop it. A cancelled export removes the partly written file.
+- **Results / Chart / Plan** — Results show row count, time and column types. **Chart** draws a Bar, Column, Line, Treemap or Table chart and updates as you change the group-by column, value and summary. **Plan** shows `EXPLAIN ANALYZE` output for the statement under the cursor (**Explain** or `Ctrl+Shift+Enter`).
+- **Export** — **Export ▾** saves all result rows of the query that produced them (not just the displayed ones) as CSV, Parquet or Excel (`.xlsx`, up to 1,048,576 rows). `Ctrl+Shift+E` exports CSV directly.
 - **Table statistics** — **Stats** reads column statistics from Parquet metadata (instant). Turn on **Exact table stats** in Settings for a full scan.
 - **History** — The last 50 queries, with row counts and timings.
 
@@ -46,7 +48,9 @@ Add files as named tables in the sidebar, then write SQL to query across them.
 | `Ctrl+O` | Open Parquet file |
 | `Ctrl+1` | Switch to Preview tab |
 | `Ctrl+2` | Switch to SQL tab |
-| `Ctrl+Enter` | Run SQL query |
+| `Ctrl+Enter` | Run the statement under the cursor (or the selection) |
+| `Ctrl+Alt+Enter` | Run all statements |
+| `Esc` | Cancel the running query |
 | `Ctrl+Shift+Enter` | Explain query plan |
 | `Ctrl+Shift+E` | Export results as CSV |
 | `Ctrl+,` | Open Settings |
@@ -69,7 +73,7 @@ Press `Ctrl+,` or click the gear icon. Configurable options:
 
 ### Extensions
 
-Parquet and JSON support is built in. Excel, SQLite, web URLs, Delta Lake and time zones (`AT TIME ZONE`) use DuckDB extensions that are **downloaded automatically the first time you use them** (about 45–80 MB each) and cached in `~/.duckdb/extensions`, after which they work offline. Nothing is downloaded or loaded at startup, and none of them ship with the installer.
+Parquet and JSON support is built in. Excel, SQLite, web URLs, Delta Lake, time zones (`AT TIME ZONE`) and SQL autocomplete use DuckDB extensions that are **downloaded automatically the first time you use them** (about 45–80 MB each) and cached in `~/.duckdb/extensions`, after which they work offline. Nothing is downloaded or loaded at startup, and none of them ship with the installer.
 
 **Settings → Extensions** shows which are downloaded and lets you download them ahead of time, for example before working offline. Other official DuckDB extensions also download automatically when a query uses one of their functions.
 
@@ -107,7 +111,7 @@ Installers are output to `app/src-tauri/target/release/bundle/`.
 | Layer | Technology | Role |
 |-------|-----------|------|
 | Frontend | React 19, TypeScript, Vite | UI, virtual-scroll table, Perspective viewer |
-| Editor | Monaco Editor | SQL workspace with autocomplete |
+| Editor | Monaco Editor | SQL workspace; DuckDB's autocomplete extension for suggestions |
 | Visualization | Perspective.js (FINOS) | Interactive grid, charts, pivoting |
 | Backend | Rust, Tauri 2 | File I/O, DuckDB queries, Arrow IPC transport |
 | Query Engine | DuckDB 2.0.0 (bundled, Parquet + JSON built in) | Parquet reading, SQL execution, exports |
@@ -140,7 +144,8 @@ npm run release:gate
 This runs:
 
 - TypeScript + Vite production build
-- `cargo test` (41 tests; it compiles the app and both helper binaries too, so there is no separate `cargo check`; the extension tests download Excel, SQLite and Delta extensions on their first run, so the first gate run needs internet)
+- Frontend unit tests (`npm test`, Vitest: SQL statement splitting and alias detection)
+- `cargo test` (58 tests; it compiles the app and both helper binaries too, so there is no separate `cargo check`; the extension tests download the Excel, SQLite, Delta and autocomplete extensions on their first run, so the first gate run needs internet)
 - Parquet fixture regeneration (5 synthetic files)
 - DuckDB compatibility matrix (5/5 must pass)
 

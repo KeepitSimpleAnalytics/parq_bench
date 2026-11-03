@@ -26,6 +26,11 @@ export interface ResultsPanelProps {
   showChartTab: boolean;
   result: WorkspaceQueryResponse | null;
   runningSince: number | null;
+  /** DuckDB's progress estimate for the running query (0–100), when it has one. */
+  runningProgress: number | null;
+  /** Non-error status, e.g. "Query cancelled after 4.2 s." */
+  notice: string | null;
+  onDismissNotice: () => void;
   explainRunning: boolean;
   explainPlan: string | null;
   error: string | null;
@@ -93,12 +98,20 @@ export function ResultsPanel(props: ResultsPanelProps) {
       </div>
 
       {error ? <div className="results-error"><InlineError message={error} onDismiss={props.onDismissError} /></div> : null}
+      {props.notice && !running ? (
+        <div className="results-notice" role="status">
+          <span>{props.notice}</span>
+          <button type="button" className="btn btn-link btn-xs" onClick={props.onDismissNotice}>Dismiss</button>
+        </div>
+      ) : null}
 
       {running ? (
         <div className="loading-state" role="status">
           <Icon name="spinner" size={28} className="spin accent" />
-          <span className="loading-title">Running query…</span>
-          <span className="muted small">{(elapsed / 1000).toFixed(1)} s elapsed</span>
+          <span className="loading-title">
+            Running query…{props.runningProgress !== null ? ` ${Math.round(props.runningProgress)}%` : ""}
+          </span>
+          <span className="muted small">{(elapsed / 1000).toFixed(1)} s elapsed · Esc to cancel</span>
         </div>
       ) : null}
 

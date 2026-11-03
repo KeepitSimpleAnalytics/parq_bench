@@ -10,6 +10,8 @@ const PATHS: Record<string, React.ReactNode> = {
   chevronDown: <path d="M6 9l6 6 6-6" />,
   chevronRight: <path d="M9 6l6 6-6 6" />,
   play: <path d="M7 4l13 8-13 8z" fill="currentColor" />,
+  stop: <rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor" />,
+  bookmark: <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />,
   history: (<><path d="M3 12a9 9 0 1 0 3-6.7L3 8" /><path d="M3 3v5h5M12 7v5l3 2" /></>),
   download: <path d="M12 3v12M7 10l5 5 5-5M5 21h14" />,
   close: <path d="M18 6L6 18M6 6l12 12" />,
